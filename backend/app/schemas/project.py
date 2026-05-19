@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class ProjectSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    purchaser: str | None
+    agency: str | None
+    budget_amount: Decimal | None
+    region_code: str | None
+    industry_code: str | None
+    status: str
+    bid_deadline_at: datetime | None
+    section_count: int
+    compliance_item_count: int
+    high_risk_count: int
+    pending_confirm_count: int
+
+
+class ProjectDetail(ProjectSummary):
+    notice_url: str | None
+    created_by: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=300)
+    purchaser: str | None = Field(default=None, max_length=300)
+    agency: str | None = Field(default=None, max_length=300)
+    budget_amount: Decimal | None = None
+    region_code: str | None = Field(default=None, max_length=64)
+    industry_code: str | None = Field(default=None, max_length=64)
+    notice_url: str | None = None
+    bid_deadline_at: datetime | None = None
+    section_code: str | None = Field(default=None, max_length=64)
+    section_name: str | None = Field(default=None, max_length=300)
+    section_budget_amount: Decimal | None = None
+
+
+class ProjectImportProjectDraft(BaseModel):
+    name: str = Field(min_length=1, max_length=300)
+    purchaser: str | None = Field(default=None, max_length=300)
+    agency: str | None = Field(default=None, max_length=300)
+    budget_amount: Decimal | None = None
+    region_code: str | None = Field(default=None, max_length=64)
+    industry_code: str | None = Field(default=None, max_length=64)
+    notice_url: str | None = None
+    bid_deadline_at: datetime | None = None
+
+
+class ProjectImportSectionDraft(BaseModel):
+    code: str | None = Field(default=None, max_length=64)
+    name: str = Field(min_length=1, max_length=300)
+    budget_amount: Decimal | None = None
+    bid_deadline_at: datetime | None = None
+
+
+class ProjectImportSourceRead(BaseModel):
+    draft_id: uuid.UUID
+    source_type: str
+    source_site: str | None
+    source_url: str | None
+    original_filename: str
+    content_type: str | None
+    file_ext: str | None
+    file_size: int
+    sha256: str
+    staged_object_key: str
+    acquired_at: datetime
+
+
+class ProjectImportDraftRead(BaseModel):
+    source: ProjectImportSourceRead
+    project: ProjectImportProjectDraft
+    sections: list[ProjectImportSectionDraft]
+    confidence: dict[str, float]
+    warnings: list[str]
+    preview_text: str
+
+
+class ProjectImportUrlRequest(BaseModel):
+    source_url: str = Field(min_length=1, max_length=4000)
+    source_site: str | None = Field(default=None, max_length=200)
+    title: str | None = Field(default=None, max_length=300)
+
+
+class ProjectImportConfirmRequest(BaseModel):
+    source: ProjectImportSourceRead
+    project: ProjectImportProjectDraft
+    sections: list[ProjectImportSectionDraft] = Field(min_length=1, max_length=20)
+    auto_parse: bool = True
+    auto_generate_matrix: bool = True
+
+
+class ProjectImportConfirmRead(BaseModel):
+    project: ProjectDetail
+    section_id: uuid.UUID
+    document_id: uuid.UUID
+    parse_task_id: uuid.UUID | None
+    matrix_task_id: uuid.UUID | None
+
+
+class SectionSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    code: str | None
+    name: str
+    budget_amount: Decimal | None
+    status: str
+    bid_deadline_at: datetime | None
+    document_count: int
+    compliance_item_count: int
+    high_risk_count: int
+    pending_confirm_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class SectionCreateRequest(BaseModel):
+    code: str | None = Field(default=None, max_length=64)
+    name: str = Field(min_length=1, max_length=300)
+    budget_amount: Decimal | None = None
+    bid_deadline_at: datetime | None = None
+
+
+class ComplianceItemRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    source_document_id: uuid.UUID
+    source_document_title: str | None
+    source_version_id: uuid.UUID
+    source_version_label: str | None
+    source_chunk_id: uuid.UUID | None
+    source_page_no: int | None
+    source_heading_path: str | None = None
+    source_chunk_index: int | None = None
+    source_content_text: str | None = None
+    source_bbox_json: dict[str, Any] | None = None
+    source_table_json: dict[str, Any] | None = None
+    item_type: str
+    requirement_text: str
+    normalized_requirement: str | None
+    response_suggestion: str | None
+    evidence_text: str | None
+    rule_explanation: dict[str, Any] | None = None
+    enterprise_evidence_count: int = 0
+    enterprise_evidence_summary: str | None = None
+    status: str
+    risk_level: str
+    is_mandatory: bool
+    is_batch_confirm_allowed: bool
+    owner_user_id: uuid.UUID | None
+    owner_name: str | None
+    confidence_score: Decimal | None
+    confirmed_by: uuid.UUID | None
+    confirmed_at: datetime | None
+    modified_by: uuid.UUID | None
+    modified_at: datetime | None
+    modify_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ComplianceMatrixGenerateRequest(BaseModel):
+    document_id: uuid.UUID | None = None
+    document_version_id: uuid.UUID | None = None
+    force: bool = False
+
+
+class ComplianceItemUpdateRequest(BaseModel):
+    requirement_text: str | None = Field(default=None, min_length=1)
+    response_suggestion: str | None = None
+    status: str | None = None
+    risk_level: str | None = None
+    is_mandatory: bool | None = None
+    owner_user_id: uuid.UUID | None = None
+    reason: str = Field(min_length=2, max_length=1000)
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        allowed = {"draft", "pending_confirm", "needs_material", "rejected", "superseded"}
+        if value not in allowed:
+            raise ValueError("状态只能通过编辑设置为草稿、待确认、缺材料、不适用或已替代")
+        return value
+
+    @field_validator("risk_level")
+    @classmethod
+    def validate_risk_level(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        allowed = {"low", "medium", "high"}
+        if value not in allowed:
+            raise ValueError("风险等级必须是 low、medium 或 high")
+        return value
+
+
+class ComplianceItemConfirmRequest(BaseModel):
+    reason: str = Field(default="人工逐条确认合规矩阵项", min_length=2, max_length=1000)
+
+
+class ComplianceItemAssignRequest(BaseModel):
+    owner_user_id: uuid.UUID | None = None
+    reason: str = Field(default="指派责任人", min_length=2, max_length=1000)
+
+
+class ComplianceItemsBulkAssignRequest(BaseModel):
+    item_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+    owner_user_id: uuid.UUID | None = None
+    reason: str = Field(default="批量指派责任人", min_length=2, max_length=1000)
+
+
+class ComplianceItemsBulkConfirmRequest(BaseModel):
+    item_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+    reason: str = Field(default="批量确认低风险合规矩阵项", min_length=2, max_length=1000)
+
+
+class ComplianceEvidenceBindingRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    compliance_item_id: uuid.UUID
+    enterprise_material_id: uuid.UUID
+    material_name: str | None
+    material_type: str | None
+    material_verification_status: str | None
+    evidence_text: str
+    confidence_score: Decimal | None
+    bind_reason: str
+    status: str
+    created_by: uuid.UUID
+    created_at: datetime
+    deleted_by: uuid.UUID | None
+    deleted_at: datetime | None
+
+
+class ComplianceEvidenceBindRequest(BaseModel):
+    enterprise_material_id: uuid.UUID
+    evidence_text: str | None = Field(default=None, max_length=4000)
+    confidence_score: Decimal | None = Field(default=None, ge=0, le=1)
+    reason: str = Field(default="绑定企业资料作为响应证据", min_length=2, max_length=1000)
+
+
+class ComplianceEvidenceUnbindRequest(BaseModel):
+    reason: str = Field(default="解除企业资料证据绑定", min_length=2, max_length=1000)
+
+
+class BusinessDraftEvidenceRefRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    chapter_id: uuid.UUID
+    compliance_item_id: uuid.UUID | None
+    evidence_binding_id: uuid.UUID | None
+    enterprise_material_id: uuid.UUID | None
+    source_type: str
+    source_snapshot: dict[str, Any]
+    quote_text: str | None
+    created_at: datetime
+
+
+class DraftFactCheckRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    chapter_id: uuid.UUID
+    fact_type: str
+    fact_text: str
+    check_status: str
+    risk_level: str
+    evidence_text: str | None
+    detail: str
+    created_at: datetime
+
+
+class BusinessDraftChapterRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    chapter_type: str
+    title: str
+    sort_order: int
+    content_text: str
+    outline_json: dict[str, Any] | None
+    evidence_summary_json: dict[str, Any] | None
+    fact_check_status: str
+    status: str
+    version_no: int
+    generated_from_json: dict[str, Any] | None
+    edit_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    evidence_refs: list[BusinessDraftEvidenceRefRead] = Field(default_factory=list)
+    fact_checks: list[DraftFactCheckRead] = Field(default_factory=list)
+
+
+class BusinessDraftGenerateRequest(BaseModel):
+    force: bool = True
+
+
+class BusinessDraftChapterUpdateRequest(BaseModel):
+    content_text: str = Field(min_length=1)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class QualificationDecisionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    recommendation: str
+    status: str
+    summary: str
+    satisfied_count: int
+    blocking_count: int
+    missing_count: int
+    pending_count: int
+    reasons_json: dict[str, Any] | None
+    confirmed_by: uuid.UUID | None
+    confirmed_at: datetime | None
+    confirm_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class QualificationDecisionConfirmRequest(BaseModel):
+    reason: str = Field(default="人工确认参标建议", min_length=2, max_length=1000)
+
+
+class ApprovalTaskRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID | None
+    task_type: str
+    title: str
+    description: str | None
+    status: str
+    related_object_type: str | None
+    related_object_id: uuid.UUID | None
+    assignee_user_id: uuid.UUID | None
+    evidence_snapshot_json: dict[str, Any] | None
+    decision_reason: str | None
+    decided_by: uuid.UUID | None
+    decided_at: datetime | None
+    due_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ApprovalTaskCreateRequest(BaseModel):
+    task_type: str = Field(max_length=64)
+    title: str = Field(min_length=1, max_length=300)
+    description: str | None = None
+    related_object_type: str | None = Field(default=None, max_length=100)
+    related_object_id: uuid.UUID | None = None
+    assignee_user_id: uuid.UUID | None = None
+    due_at: datetime | None = None
+
+
+class ApprovalTaskDecisionRequest(BaseModel):
+    action: str = Field(pattern="^(approve|reject)$")
+    reason: str = Field(min_length=2, max_length=1000)
+
+
+class QualificationEvaluationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    compliance_item_id: uuid.UUID
+    requirement_text: str
+    requirement_type: str
+    extracted_requirement: dict[str, Any] | None
+    evaluation_status: str
+    risk_level: str
+    is_blocking: bool
+    matched_material_id: uuid.UUID | None
+    matched_material_name: str | None
+    matched_rule_code: str
+    rule_version: str
+    reason: str
+    evidence_text: str | None
+    missing_materials: list[str] | None
+    confirmed_by: uuid.UUID | None
+    confirmed_at: datetime | None
+    confirm_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class QualificationEvaluationConfirmRequest(BaseModel):
+    reason: str = Field(default="人工确认资格预评估结果", min_length=2, max_length=1000)
+
+
+class AuditLogRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID | None
+    section_id: uuid.UUID | None
+    actor_user_id: uuid.UUID | None
+    actor_name: str | None
+    actor_type: str
+    action: str
+    object_type: str
+    object_id: uuid.UUID | None
+    before_json: dict[str, Any] | None
+    after_json: dict[str, Any] | None
+    reason: str | None
+    severity: str
+    created_at: datetime
+
+
+class ModelInvocationLogRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID | None
+    section_id: uuid.UUID | None
+    actor_user_id: uuid.UUID | None
+    actor_type: str
+    task_type: str
+    provider: str
+    model_name: str
+    complexity: str
+    prompt_version: str
+    input_summary: str
+    output_summary: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    duration_ms: int | None
+    status: str
+    error_code: str | None
+    error_message: str | None
+    evidence_refs_json: dict[str, Any] | None
+    created_at: datetime

@@ -1,0 +1,47 @@
+"""SQLAlchemy model package.
+
+Importing this module registers all models on the shared SQLAlchemy metadata.
+"""
+
+from app.models.approval import ApprovalTask
+from app.models.audit import AuditLog
+from app.models.compliance import ComplianceEvidenceBinding, ComplianceItem
+from app.models.decision import QualificationDecision
+from app.models.document import Document, DocumentChunk, DocumentVersion
+from app.models.draft import BusinessDraftChapter, BusinessDraftEvidenceRef, DraftFactCheck
+from app.models.enterprise import EnterpriseMaterial, EnterpriseProfile
+from app.models.export import ExportFile
+from app.models.identity import Tenant, User
+from app.models.model_invocation import ModelInvocationLog
+from app.models.project import BidSection, Project, ProjectMember
+from app.models.qualification import QualificationEvaluation
+from app.models.retrieval import EnterpriseMaterialChunk
+from app.models.task import AsyncTask, FileAcquisitionTask, ParseTask
+
+__all__ = [
+    "AsyncTask",
+    "ApprovalTask",
+    "AuditLog",
+    "BidSection",
+    "BusinessDraftChapter",
+    "BusinessDraftEvidenceRef",
+    "ComplianceEvidenceBinding",
+    "ComplianceItem",
+    "DraftFactCheck",
+    "Document",
+    "DocumentChunk",
+    "DocumentVersion",
+    "EnterpriseMaterial",
+    "EnterpriseMaterialChunk",
+    "EnterpriseProfile",
+    "ExportFile",
+    "FileAcquisitionTask",
+    "ModelInvocationLog",
+    "ParseTask",
+    "Project",
+    "ProjectMember",
+    "QualificationDecision",
+    "QualificationEvaluation",
+    "Tenant",
+    "User",
+]

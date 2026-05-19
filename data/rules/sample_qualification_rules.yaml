@@ -1,0 +1,15 @@
+version: "0.1"
+rules:
+  - id: qualification.business_license.required
+    name: 营业执照必备
+    category: qualification
+    severity: high
+    enabled: true
+    description: 投标主体应提供有效营业执照。
+  - id: qualification.certificate.expiry_date
+    name: 证照有效期检查
+    category: qualification
+    severity: high
+    enabled: true
+    description: 证照有效期应覆盖投标截止日期。
+
