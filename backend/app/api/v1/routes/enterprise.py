@@ -269,6 +269,9 @@ def search_enterprise_materials(
             confidence_score=hit.confidence_score,
             chunk_id=hit.chunk.id if hit.chunk else None,
             data_level_allowed=hit.material.data_level in allowed_data_levels,
+            recommend_reason=hit.recommend_reason,
+            matched_terms=hit.matched_terms or [],
+            material_status_hint=hit.material_status_hint,
         )
         for hit in hits
     ]

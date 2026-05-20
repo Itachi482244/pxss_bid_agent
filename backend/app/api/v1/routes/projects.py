@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import Select, case, func, select
 from sqlalchemy.orm import Session, aliased
@@ -47,6 +47,7 @@ from app.schemas.project import (
     BusinessDraftChapterRead,
     BusinessDraftChapterUpdateRequest,
     BusinessDraftEvidenceRefRead,
+    BusinessDraftExportRequest,
     BusinessDraftGenerateRequest,
     ComplianceItemAssignRequest,
     ComplianceEvidenceBindRequest,
@@ -60,6 +61,8 @@ from app.schemas.project import (
     ComplianceItemRead,
     ComplianceItemUpdateRequest,
     ModelInvocationLogRead,
+    PreflightCheckItem,
+    PreflightCheckRead,
     ProjectCreateRequest,
     ProjectDetail,
     ProjectImportConfirmRead,
@@ -69,6 +72,7 @@ from app.schemas.project import (
     ProjectImportSectionDraft,
     ProjectImportSourceRead,
     ProjectImportUrlRequest,
+    ProjectUpdateRequest,
     QualificationDecisionConfirmRequest,
     QualificationDecisionRead,
     QualificationEvaluationConfirmRequest,
@@ -76,6 +80,7 @@ from app.schemas.project import (
     ProjectSummary,
     SectionCreateRequest,
     SectionSummary,
+    SectionUpdateRequest,
 )
 from app.services.business_draft import (
     BusinessDraftError,
@@ -92,6 +97,7 @@ from app.services.project_import import (
     build_upload_import_draft,
     build_url_import_draft,
     confirm_import_draft,
+    execute_import_processing_background,
 )
 from app.services.qualification_evaluation import evaluation_snapshot, run_qualification_evaluation
 from app.services.storage import get_object_bytes
@@ -293,6 +299,78 @@ def enterprise_evidence_summary_for_item(
     return len(names), summary
 
 
+def compliance_priority_for_item(item: ComplianceItem, evidence_count: int) -> tuple[int, str, str]:
+    technical_signals = ("技术", "设备", "参数", "验收", "净化", "洁净")
+    text = f"{item.requirement_text}\n{item.response_suggestion or ''}"
+    if item.item_type in {"qualification", "mandatory_response", "deadline"} or (
+        item.risk_level == "high" and item.is_mandatory
+    ):
+        return 0, "P0-资格/强制阻断", "资格、强制或截止类条款需要优先确认，避免实质性响应遗漏"
+    if item.risk_level == "high" or item.status == "needs_material" or (
+        item.is_mandatory and evidence_count == 0
+    ):
+        return 1, "P1-高风险/缺证据", "该条款存在高风险或缺少企业资料证据，建议优先补齐"
+    if item.item_type in {"scoring", "technical_response"} or (
+        item.item_type == "other" and any(signal in text for signal in technical_signals)
+    ):
+        return 2, "P2-评分/技术待确认", "该条款涉及评分或技术响应，建议转交业务/技术人员复核"
+    return 3, "P3-一般响应", "普通响应项，按常规流程处理"
+
+
+def compliance_item_read_payload(
+    *,
+    item: ComplianceItem,
+    source_document_title: str | None,
+    source_version_label: str | None,
+    owner_name: str | None,
+    source_chunk: DocumentChunk | None,
+    evidence_count: int,
+    evidence_summary: str | None,
+) -> ComplianceItemRead:
+    priority_rank, priority_label, priority_reason = compliance_priority_for_item(item, evidence_count)
+    return ComplianceItemRead(
+        id=item.id,
+        project_id=item.project_id,
+        section_id=item.section_id,
+        source_document_id=item.source_document_id,
+        source_document_title=source_document_title,
+        source_version_id=item.source_version_id,
+        source_version_label=source_version_label,
+        source_chunk_id=item.source_chunk_id,
+        source_page_no=item.source_page_no,
+        source_heading_path=source_chunk.heading_path if source_chunk else None,
+        source_chunk_index=source_chunk.chunk_index if source_chunk else None,
+        source_content_text=source_chunk.content_text if source_chunk else None,
+        source_bbox_json=source_chunk.bbox_json if source_chunk else None,
+        source_table_json=source_chunk.table_json if source_chunk else None,
+        item_type=item.item_type,
+        requirement_text=item.requirement_text,
+        normalized_requirement=item.normalized_requirement,
+        response_suggestion=item.response_suggestion,
+        evidence_text=item.evidence_text,
+        rule_explanation=item.explanation_json,
+        enterprise_evidence_count=evidence_count,
+        enterprise_evidence_summary=evidence_summary,
+        priority_rank=priority_rank,
+        priority_label=priority_label,
+        priority_reason=priority_reason,
+        status=item.status,
+        risk_level=item.risk_level,
+        is_mandatory=item.is_mandatory,
+        is_batch_confirm_allowed=item.is_batch_confirm_allowed,
+        owner_user_id=item.owner_user_id,
+        owner_name=owner_name,
+        confidence_score=item.confidence_score,
+        confirmed_by=item.confirmed_by,
+        confirmed_at=item.confirmed_at,
+        modified_by=item.modified_by,
+        modified_at=item.modified_at,
+        modify_reason=item.modify_reason,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
 def refresh_batch_confirm_guard(item: ComplianceItem) -> None:
     item.is_batch_confirm_allowed = (
         item.risk_level != "high" and not item.is_mandatory and item.status != "needs_material"
@@ -343,43 +421,14 @@ def compliance_item_read_from_item(db: Session, item: ComplianceItem) -> Complia
         item.tenant_id,
         item.id,
     )
-    return ComplianceItemRead(
-        id=item.id,
-        project_id=item.project_id,
-        section_id=item.section_id,
-        source_document_id=item.source_document_id,
+    return compliance_item_read_payload(
+        item=item,
         source_document_title=document.title if document else None,
-        source_version_id=item.source_version_id,
         source_version_label=version.version_label if version else None,
-        source_chunk_id=item.source_chunk_id,
-        source_page_no=item.source_page_no,
-        source_heading_path=source_chunk.heading_path if source_chunk else None,
-        source_chunk_index=source_chunk.chunk_index if source_chunk else None,
-        source_content_text=source_chunk.content_text if source_chunk else None,
-        source_bbox_json=source_chunk.bbox_json if source_chunk else None,
-        source_table_json=source_chunk.table_json if source_chunk else None,
-        item_type=item.item_type,
-        requirement_text=item.requirement_text,
-        normalized_requirement=item.normalized_requirement,
-        response_suggestion=item.response_suggestion,
-        evidence_text=item.evidence_text,
-        rule_explanation=item.explanation_json,
-        enterprise_evidence_count=evidence_count,
-        enterprise_evidence_summary=evidence_summary,
-        status=item.status,
-        risk_level=item.risk_level,
-        is_mandatory=item.is_mandatory,
-        is_batch_confirm_allowed=item.is_batch_confirm_allowed,
-        owner_user_id=item.owner_user_id,
         owner_name=owner_name,
-        confidence_score=item.confidence_score,
-        confirmed_by=item.confirmed_by,
-        confirmed_at=item.confirmed_at,
-        modified_by=item.modified_by,
-        modified_at=item.modified_at,
-        modify_reason=item.modify_reason,
-        created_at=item.created_at,
-        updated_at=item.updated_at,
+        source_chunk=source_chunk,
+        evidence_count=evidence_count,
+        evidence_summary=evidence_summary,
     )
 
 
@@ -433,6 +482,63 @@ def project_summary_from_row(row) -> ProjectSummary:
     )
 
 
+def section_summary_for_section(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    section: BidSection,
+) -> SectionSummary:
+    document_count = db.scalar(
+        select(func.count(Document.id)).where(
+            Document.tenant_id == tenant_id,
+            Document.project_id == section.project_id,
+            Document.section_id == section.id,
+            Document.status != "deleted",
+        )
+    ) or 0
+    compliance_item_count = db.scalar(
+        select(func.count(ComplianceItem.id)).where(
+            ComplianceItem.tenant_id == tenant_id,
+            ComplianceItem.project_id == section.project_id,
+            ComplianceItem.section_id == section.id,
+            ComplianceItem.deleted_at.is_(None),
+        )
+    ) or 0
+    high_risk_count = db.scalar(
+        select(func.count(ComplianceItem.id)).where(
+            ComplianceItem.tenant_id == tenant_id,
+            ComplianceItem.project_id == section.project_id,
+            ComplianceItem.section_id == section.id,
+            ComplianceItem.risk_level == "high",
+            ComplianceItem.deleted_at.is_(None),
+        )
+    ) or 0
+    pending_confirm_count = db.scalar(
+        select(func.count(ComplianceItem.id)).where(
+            ComplianceItem.tenant_id == tenant_id,
+            ComplianceItem.project_id == section.project_id,
+            ComplianceItem.section_id == section.id,
+            ComplianceItem.status == "pending_confirm",
+            ComplianceItem.deleted_at.is_(None),
+        )
+    ) or 0
+    return SectionSummary(
+        id=section.id,
+        project_id=section.project_id,
+        code=section.code,
+        name=section.name,
+        budget_amount=section.budget_amount,
+        status=section.status,
+        bid_deadline_at=section.bid_deadline_at,
+        document_count=document_count,
+        compliance_item_count=compliance_item_count,
+        high_risk_count=high_risk_count,
+        pending_confirm_count=pending_confirm_count,
+        created_at=section.created_at,
+        updated_at=section.updated_at,
+    )
+
+
 def export_file_read(export_file: ExportFile) -> ExportFileRead:
     return ExportFileRead.model_validate(export_file)
 
@@ -458,6 +564,297 @@ def business_draft_chapter_read(db: Session, chapter: BusinessDraftChapter) -> B
     payload.evidence_refs = [BusinessDraftEvidenceRefRead.model_validate(ref) for ref in evidence_refs]
     payload.fact_checks = [DraftFactCheckRead.model_validate(check) for check in fact_checks]
     return payload
+
+
+def build_preflight_check(
+    db: Session,
+    *,
+    ctx: RequestContext,
+    project: Project,
+    section: BidSection,
+) -> PreflightCheckRead:
+    documents = db.scalars(
+        select(Document)
+        .where(
+            Document.tenant_id == ctx.tenant_id,
+            Document.project_id == project.id,
+            Document.section_id == section.id,
+            Document.status != "deleted",
+        )
+        .order_by(Document.acquired_at.desc(), Document.created_at.desc())
+    ).all()
+    current_version_ids = {document.id: document.current_version_id for document in documents if document.current_version_id}
+    current_versions = {
+        version.id: version
+        for version in db.scalars(
+            select(DocumentVersion).where(
+                DocumentVersion.tenant_id == ctx.tenant_id,
+                DocumentVersion.id.in_(list(current_version_ids.values()) or [uuid.uuid4()]),
+            )
+        ).all()
+    }
+    latest_document = next((document for document in documents if document.doc_type == "tender"), documents[0] if documents else None)
+    latest_version = current_versions.get(latest_document.current_version_id) if latest_document else None
+
+    items = db.scalars(
+        select(ComplianceItem)
+        .where(
+            ComplianceItem.tenant_id == ctx.tenant_id,
+            ComplianceItem.project_id == project.id,
+            ComplianceItem.section_id == section.id,
+            ComplianceItem.deleted_at.is_(None),
+        )
+        .order_by(ComplianceItem.created_at.asc())
+    ).all()
+    evidence_counts = {
+        row.compliance_item_id: row.count
+        for row in db.execute(
+            select(
+                ComplianceEvidenceBinding.compliance_item_id,
+                func.count(ComplianceEvidenceBinding.id).label("count"),
+            )
+            .where(
+                ComplianceEvidenceBinding.tenant_id == ctx.tenant_id,
+                ComplianceEvidenceBinding.project_id == project.id,
+                ComplianceEvidenceBinding.section_id == section.id,
+                ComplianceEvidenceBinding.status == "active",
+            )
+            .group_by(ComplianceEvidenceBinding.compliance_item_id)
+        ).all()
+    }
+
+    matrix_version_ids = sorted({item.source_version_id for item in items}, key=str)
+    version_labels = {
+        version.id: version.version_label
+        for version in db.scalars(
+            select(DocumentVersion).where(
+                DocumentVersion.tenant_id == ctx.tenant_id,
+                DocumentVersion.id.in_(matrix_version_ids or [uuid.uuid4()]),
+            )
+        ).all()
+    }
+    outdated_items = [
+        item
+        for item in items
+        if current_version_ids.get(item.source_document_id)
+        and current_version_ids[item.source_document_id] != item.source_version_id
+    ]
+    unresolved_statuses = {"draft", "pending_confirm", "needs_material", "rejected"}
+    pending_qualification_count = sum(
+        1 for item in items if item.item_type == "qualification" and item.status in unresolved_statuses
+    )
+    high_risk_unconfirmed_count = sum(
+        1 for item in items if item.risk_level == "high" and item.status != "confirmed"
+    )
+    mandatory_missing_evidence_count = sum(
+        1 for item in items if item.is_mandatory and evidence_counts.get(item.id, 0) == 0
+    )
+    missing_evidence_count = sum(
+        1
+        for item in items
+        if (item.is_mandatory or item.status == "needs_material") and evidence_counts.get(item.id, 0) == 0
+    )
+    technical_signals = ("技术", "设备", "参数", "验收", "净化", "洁净")
+    technical_pending_count = sum(
+        1
+        for item in items
+        if item.status != "confirmed"
+        and (
+            item.item_type in {"technical_response", "scoring"}
+            or (item.item_type == "other" and any(signal in item.requirement_text for signal in technical_signals))
+        )
+    )
+
+    chapters = db.scalars(
+        select(BusinessDraftChapter).where(
+            BusinessDraftChapter.tenant_id == ctx.tenant_id,
+            BusinessDraftChapter.project_id == project.id,
+            BusinessDraftChapter.section_id == section.id,
+            BusinessDraftChapter.status != "superseded",
+        )
+    ).all()
+    chapter_ids = [chapter.id for chapter in chapters]
+    fact_checks = db.scalars(
+        select(DraftFactCheck).where(
+            DraftFactCheck.tenant_id == ctx.tenant_id,
+            DraftFactCheck.chapter_id.in_(chapter_ids or [uuid.uuid4()]),
+        )
+    ).all()
+    unverified_fact_count = sum(1 for check in fact_checks if check.check_status == "unverified")
+    failed_fact_count = sum(1 for check in fact_checks if check.check_status == "warning")
+    pending_fact_check_chapter_count = sum(1 for chapter in chapters if chapter.fact_check_status == "pending")
+
+    approval_tasks = db.scalars(
+        select(ApprovalTask).where(
+            ApprovalTask.tenant_id == ctx.tenant_id,
+            ApprovalTask.project_id == project.id,
+            ApprovalTask.section_id == section.id,
+        )
+    ).all()
+    pending_approval_count = sum(1 for task in approval_tasks if task.status == "pending")
+    rejected_approval_count = sum(1 for task in approval_tasks if task.status == "rejected")
+
+    has_deadline_item = any(item.item_type == "deadline" for item in items)
+    missing_bid_deadline = not (section.bid_deadline_at or project.bid_deadline_at)
+    missing_deadline_item = bool(items) and not has_deadline_item
+
+    checks: list[PreflightCheckItem] = []
+
+    def add_check(
+        code: str,
+        title: str,
+        check_status: str,
+        count: int,
+        message: str,
+        action_label: str | None = None,
+        target: str | None = None,
+    ) -> None:
+        checks.append(
+            PreflightCheckItem(
+                code=code,
+                title=title,
+                status=check_status,
+                count=count,
+                message=message,
+                action_label=action_label,
+                target=target,
+            )
+        )
+
+    add_check(
+        "matrix_version",
+        "矩阵版本",
+        "block" if outdated_items else "pass",
+        len(outdated_items),
+        "矩阵已落后于最新解析版本，建议重新生成。" if outdated_items else "矩阵基于当前解析版本。",
+        "重新生成矩阵" if outdated_items else None,
+        "matrix",
+    )
+    add_check(
+        "high_risk",
+        "高风险项",
+        "block" if high_risk_unconfirmed_count else "pass",
+        high_risk_unconfirmed_count,
+        f"还有 {high_risk_unconfirmed_count} 条高风险项未确认。" if high_risk_unconfirmed_count else "高风险项已处理。",
+        "查看合规矩阵",
+        "matrix",
+    )
+    add_check(
+        "mandatory_evidence",
+        "强制项证据",
+        "block" if mandatory_missing_evidence_count else "pass",
+        mandatory_missing_evidence_count,
+        f"还有 {mandatory_missing_evidence_count} 条强制项缺少企业资料证据。"
+        if mandatory_missing_evidence_count
+        else "强制项证据已补齐。",
+        "绑定企业资料",
+        "evidence",
+    )
+    add_check(
+        "draft_facts",
+        "草稿事实",
+        "block" if unverified_fact_count else "warn" if failed_fact_count or pending_fact_check_chapter_count else "pass",
+        unverified_fact_count + failed_fact_count + pending_fact_check_chapter_count,
+        "草稿中存在无法验证或待校验事实。"
+        if unverified_fact_count or failed_fact_count or pending_fact_check_chapter_count
+        else "草稿事实校验通过。",
+        "查看商务草稿",
+        "chapter",
+    )
+    add_check(
+        "qualification",
+        "资格项确认",
+        "warn" if pending_qualification_count else "pass",
+        pending_qualification_count,
+        f"还有 {pending_qualification_count} 条资格项待确认。" if pending_qualification_count else "资格项已确认。",
+        "查看资格预评估",
+        "qualification",
+    )
+    add_check(
+        "technical",
+        "技术响应",
+        "warn" if technical_pending_count else "pass",
+        technical_pending_count,
+        f"还有 {technical_pending_count} 条技术/评分项待确认。" if technical_pending_count else "技术响应项无明显阻塞。",
+        "查看技术响应",
+        "technical",
+    )
+    add_check(
+        "deadline",
+        "关键日期",
+        "warn" if missing_bid_deadline or missing_deadline_item else "pass",
+        int(missing_bid_deadline) + int(missing_deadline_item),
+        "项目截止时间或招标文件关键日期缺失，建议人工补充。"
+        if missing_bid_deadline or missing_deadline_item
+        else "关键日期已有记录。",
+        "查看项目文件",
+        "documents",
+    )
+    add_check(
+        "approvals",
+        "审批任务",
+        "warn" if pending_approval_count or rejected_approval_count else "pass",
+        pending_approval_count + rejected_approval_count,
+        f"待处理审批 {pending_approval_count} 个，退回审批 {rejected_approval_count} 个。"
+        if pending_approval_count or rejected_approval_count
+        else "审批任务无阻塞。",
+        "查看审批",
+        "approval",
+    )
+
+    if not chapters:
+        add_check(
+            "draft_exists",
+            "商务草稿",
+            "warn",
+            1,
+            "尚未生成商务/资格草稿。",
+            "生成草稿",
+            "chapter",
+        )
+
+    if any(item.status == "block" for item in checks):
+        overall_status = "block"
+        summary = "存在阻塞项，建议先处理版本、风险、证据或事实校验问题。"
+    elif any(item.status == "warn" for item in checks):
+        overall_status = "warn"
+        summary = "主链路可继续推进，但仍有待确认事项需要人工复核。"
+    else:
+        overall_status = "pass"
+        summary = "提交前核验通过，当前无明显阻塞项。"
+
+    suggested_actions = [
+        item.message for item in checks if item.status in {"block", "warn"}
+    ][:5]
+    if not suggested_actions:
+        suggested_actions = ["可进入审批、导出和归档流程。"]
+
+    return PreflightCheckRead(
+        project_id=project.id,
+        section_id=section.id,
+        status=overall_status,
+        summary=summary,
+        latest_document_version_id=latest_version.id if latest_version else None,
+        latest_document_version_label=latest_version.version_label if latest_version else None,
+        matrix_version_ids=matrix_version_ids,
+        matrix_version_labels=[version_labels.get(version_id, str(version_id)) for version_id in matrix_version_ids],
+        matrix_outdated=bool(outdated_items),
+        outdated_item_count=len(outdated_items),
+        pending_qualification_count=pending_qualification_count,
+        high_risk_unconfirmed_count=high_risk_unconfirmed_count,
+        mandatory_missing_evidence_count=mandatory_missing_evidence_count,
+        technical_pending_count=technical_pending_count,
+        missing_evidence_count=missing_evidence_count,
+        unverified_fact_count=unverified_fact_count,
+        failed_fact_count=failed_fact_count,
+        pending_fact_check_chapter_count=pending_fact_check_chapter_count,
+        pending_approval_count=pending_approval_count,
+        rejected_approval_count=rejected_approval_count,
+        missing_bid_deadline=missing_bid_deadline,
+        missing_deadline_item=missing_deadline_item,
+        checks=checks,
+        suggested_actions=suggested_actions,
+    )
 
 
 def project_import_draft_read(draft: ImportDraft) -> ProjectImportDraftRead:
@@ -575,6 +972,58 @@ def create_project(
     return get_project(project.id, db, ctx)
 
 
+@router.patch("/{project_id}", response_model=ProjectDetail)
+def update_project(
+    project_id: uuid.UUID,
+    payload: ProjectUpdateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> ProjectDetail:
+    project = get_project_or_404(db, ctx, project_id)
+    before_json = {
+        "name": project.name,
+        "purchaser": project.purchaser,
+        "agency": project.agency,
+        "budget_amount": str(project.budget_amount) if project.budget_amount is not None else None,
+        "region_code": project.region_code,
+        "industry_code": project.industry_code,
+        "notice_url": project.notice_url,
+        "bid_deadline_at": project.bid_deadline_at.isoformat() if project.bid_deadline_at else None,
+    }
+    fields = payload.model_fields_set - {"reason"}
+    for field in fields:
+        value = getattr(payload, field)
+        if field == "name" and value is not None:
+            value = value.strip()
+        setattr(project, field, value)
+    db.flush()
+    after_json = {
+        "name": project.name,
+        "purchaser": project.purchaser,
+        "agency": project.agency,
+        "budget_amount": str(project.budget_amount) if project.budget_amount is not None else None,
+        "region_code": project.region_code,
+        "industry_code": project.industry_code,
+        "notice_url": project.notice_url,
+        "bid_deadline_at": project.bid_deadline_at.isoformat() if project.bid_deadline_at else None,
+        "updated_fields": sorted(fields),
+    }
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project.id,
+        section_id=None,
+        action="project.updated",
+        object_type="project",
+        object_id=project.id,
+        before_json=before_json,
+        after_json=after_json,
+        reason=payload.reason,
+    )
+    db.commit()
+    return get_project(project.id, db, ctx)
+
+
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 def archive_project(
     project_id: uuid.UUID,
@@ -678,6 +1127,7 @@ def create_project_import_draft_from_public_url(
 )
 def confirm_project_import(
     payload: ProjectImportConfirmRequest,
+    background_tasks: BackgroundTasks,
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ProjectImportConfirmRead:
@@ -690,9 +1140,16 @@ def confirm_project_import(
             source_payload=payload.source.model_dump(mode="json"),
             auto_parse=payload.auto_parse,
             auto_generate_matrix=payload.auto_generate_matrix,
+            async_processing=payload.async_processing,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if payload.async_processing and payload.auto_parse and result.parse_task_id is not None:
+        background_tasks.add_task(
+            execute_import_processing_background,
+            parse_task_id=result.parse_task_id,
+            matrix_task_id=result.matrix_task_id if payload.auto_generate_matrix else None,
+        )
     return ProjectImportConfirmRead(
         project=get_project(result.project_id, db, ctx),
         section_id=result.section_id,
@@ -874,21 +1331,53 @@ def create_section(
     )
     db.commit()
     db.refresh(section)
-    return SectionSummary(
-        id=section.id,
-        project_id=section.project_id,
-        code=section.code,
-        name=section.name,
-        budget_amount=section.budget_amount,
-        status=section.status,
-        bid_deadline_at=section.bid_deadline_at,
-        document_count=0,
-        compliance_item_count=0,
-        high_risk_count=0,
-        pending_confirm_count=0,
-        created_at=section.created_at,
-        updated_at=section.updated_at,
+    return section_summary_for_section(db, tenant_id=ctx.tenant_id, section=section)
+
+
+@router.patch("/{project_id}/sections/{section_id}", response_model=SectionSummary)
+def update_section(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: SectionUpdateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> SectionSummary:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    before_json = {
+        "code": section.code,
+        "name": section.name,
+        "budget_amount": str(section.budget_amount) if section.budget_amount is not None else None,
+        "bid_deadline_at": section.bid_deadline_at.isoformat() if section.bid_deadline_at else None,
+    }
+    fields = payload.model_fields_set - {"reason"}
+    for field in fields:
+        value = getattr(payload, field)
+        if field == "name" and value is not None:
+            value = value.strip()
+        setattr(section, field, value)
+    db.flush()
+    after_json = {
+        "code": section.code,
+        "name": section.name,
+        "budget_amount": str(section.budget_amount) if section.budget_amount is not None else None,
+        "bid_deadline_at": section.bid_deadline_at.isoformat() if section.bid_deadline_at else None,
+        "updated_fields": sorted(fields),
+    }
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section.id,
+        action="section.updated",
+        object_type="bid_section",
+        object_id=section.id,
+        before_json=before_json,
+        after_json=after_json,
+        reason=payload.reason,
     )
+    db.commit()
+    db.refresh(section)
+    return section_summary_for_section(db, tenant_id=ctx.tenant_id, section=section)
 
 
 @router.post(
@@ -1677,8 +2166,22 @@ def export_business_draft_word_file(
     section_id: uuid.UUID,
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
+    payload: BusinessDraftExportRequest | None = None,
 ) -> ExportFileRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    preflight = build_preflight_check(db, ctx=ctx, project=project, section=section)
+    risk_acceptance_reason = (payload.risk_acceptance_reason or "").strip() if payload else ""
+    if preflight.status == "block" and not risk_acceptance_reason:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="当前存在提交前核验阻塞项，导出内部草稿需填写风险接受说明",
+        )
+    blocking_summary = [
+        item.model_dump(mode="json")
+        for item in preflight.checks
+        if item.status in {"block", "warn"}
+    ][:8]
     try:
         export_file = export_business_draft_word(
             db,
@@ -1686,6 +2189,14 @@ def export_business_draft_word_file(
             project_id=project_id,
             section_id=section_id,
             actor_user_id=ctx.user_id,
+            extra_snapshot={
+                "preflight_status": preflight.status,
+                "preflight_summary": preflight.summary,
+                "blocking_summary": blocking_summary,
+                "risk_acceptance_reason": risk_acceptance_reason or None,
+                "captured_at": datetime.now(UTC).isoformat(),
+                "internal_draft": preflight.status == "block",
+            },
         )
     except BusinessDraftError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -1732,7 +2243,20 @@ def create_approval_task(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ApprovalTaskRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    preflight = build_preflight_check(db, ctx=ctx, project=project, section=section)
+    risk_acceptance_reason = (payload.risk_acceptance_reason or "").strip()
+    if payload.task_type == "submit_confirmation" and preflight.status == "block" and not risk_acceptance_reason:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="当前存在提交前核验阻塞项，创建提交确认审批需填写风险接受说明",
+        )
+    blocking_summary = [
+        item.model_dump(mode="json")
+        for item in preflight.checks
+        if item.status in {"block", "warn"}
+    ][:8]
     task = ApprovalTask(
         tenant_id=ctx.tenant_id,
         project_id=project_id,
@@ -1744,7 +2268,14 @@ def create_approval_task(
         related_object_type=payload.related_object_type,
         related_object_id=payload.related_object_id,
         assignee_user_id=payload.assignee_user_id or ctx.user_id,
-        evidence_snapshot_json=None,
+        evidence_snapshot_json={
+            "preflight_status": preflight.status,
+            "preflight_summary": preflight.summary,
+            "blocking_summary": blocking_summary,
+            "suggested_actions": preflight.suggested_actions,
+            "risk_acceptance_reason": risk_acceptance_reason or None,
+            "captured_at": datetime.now(UTC).isoformat(),
+        },
         created_by=ctx.user_id,
         due_at=payload.due_at,
     )
@@ -1761,6 +2292,19 @@ def create_approval_task(
         before_json=None,
         after_json=ApprovalTaskRead.model_validate(task).model_dump(mode="json"),
         reason="创建审批任务",
+    )
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="approval.blocking_snapshot_created",
+        object_type="approval_task",
+        object_id=task.id,
+        before_json=None,
+        after_json=task.evidence_snapshot_json,
+        reason="创建审批任务时记录提交前核验快照",
+        severity="warning" if preflight.status == "block" else "info",
     )
     db.commit()
     db.refresh(task)
@@ -1829,6 +2373,21 @@ def decide_approval_task(
 
 
 @router.get(
+    "/{project_id}/sections/{section_id}/preflight-check",
+    response_model=PreflightCheckRead,
+)
+def get_preflight_check(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> PreflightCheckRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    return build_preflight_check(db, ctx=ctx, project=project, section=section)
+
+
+@router.get(
     "/{project_id}/sections/{section_id}/compliance-items",
     response_model=list[ComplianceItemRead],
 )
@@ -1894,43 +2453,14 @@ def list_compliance_items(
             item.id,
         )
         results.append(
-            ComplianceItemRead(
-                id=item.id,
-                project_id=item.project_id,
-                section_id=item.section_id,
-                source_document_id=item.source_document_id,
+            compliance_item_read_payload(
+                item=item,
                 source_document_title=source_document_title,
-                source_version_id=item.source_version_id,
                 source_version_label=source_version_label,
-                source_chunk_id=item.source_chunk_id,
-                source_page_no=item.source_page_no,
-                source_heading_path=source_chunk.heading_path if source_chunk else None,
-                source_chunk_index=source_chunk.chunk_index if source_chunk else None,
-                source_content_text=source_chunk.content_text if source_chunk else None,
-                source_bbox_json=source_chunk.bbox_json if source_chunk else None,
-                source_table_json=source_chunk.table_json if source_chunk else None,
-                item_type=item.item_type,
-                requirement_text=item.requirement_text,
-                normalized_requirement=item.normalized_requirement,
-                response_suggestion=item.response_suggestion,
-                evidence_text=item.evidence_text,
-                rule_explanation=item.explanation_json,
-                enterprise_evidence_count=evidence_count,
-                enterprise_evidence_summary=evidence_summary,
-                status=item.status,
-                risk_level=item.risk_level,
-                is_mandatory=item.is_mandatory,
-                is_batch_confirm_allowed=item.is_batch_confirm_allowed,
-                owner_user_id=item.owner_user_id,
                 owner_name=owner_name,
-                confidence_score=item.confidence_score,
-                confirmed_by=item.confirmed_by,
-                confirmed_at=item.confirmed_at,
-                modified_by=item.modified_by,
-                modified_at=item.modified_at,
-                modify_reason=item.modify_reason,
-                created_at=item.created_at,
-                updated_at=item.updated_at,
+                source_chunk=source_chunk,
+                evidence_count=evidence_count,
+                evidence_summary=evidence_summary,
             )
         )
     return results

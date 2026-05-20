@@ -99,6 +99,9 @@ class EnterpriseMaterialSearchResult(EnterpriseMaterialRead):
     confidence_score: float
     chunk_id: uuid.UUID | None = None
     data_level_allowed: bool = True
+    recommend_reason: str | None = None
+    matched_terms: list[str] = Field(default_factory=list)
+    material_status_hint: str | None = None
 
 
 class EnterpriseMaterialChunkRead(BaseModel):

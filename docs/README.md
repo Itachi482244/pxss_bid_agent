@@ -19,3 +19,8 @@
 - 《投标Agent数据模型设计》
 - 《投标Agent MVP-v0.5完成度记录》
 - 《投标Agent MVP-v1.0需求规划与完成度》
+- 《投标Agent MVP-v1.0核心功能流程说明》
+- 《投标Agent MVP-v1.0 Hardening验收脚本》
+- 《投标Agent MVP-v1.0试用版优化范围》
+- 《投标Agent MVP-v1.1需求规划》
+- 《投标Agent AI能力版本路线图》

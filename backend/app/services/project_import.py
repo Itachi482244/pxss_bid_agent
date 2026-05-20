@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import RequestContext
 from app.core.config import settings
+from app.db.session import SessionLocal
 from app.models import (
     AsyncTask,
     AuditLog,
@@ -680,6 +681,7 @@ def confirm_import_draft(
     source_payload: dict,
     auto_parse: bool,
     auto_generate_matrix: bool,
+    async_processing: bool = True,
 ) -> ImportConfirmResult:
     section_payload = sections_payload[0] if sections_payload else {}
     project = Project(
@@ -773,6 +775,25 @@ def confirm_import_draft(
                 version=version,
             )
             parse_task_id = parse_task.id
+            if async_processing and auto_generate_matrix:
+                matrix_task = _create_matrix_task(
+                    db,
+                    ctx=ctx,
+                    project=project,
+                    section=section,
+                    document=document,
+                    version=version,
+                )
+                matrix_task_id = matrix_task.id
+            db.commit()
+            if async_processing:
+                return ImportConfirmResult(
+                    project_id=project.id,
+                    section_id=section.id,
+                    document_id=document.id,
+                    parse_task_id=parse_task_id,
+                    matrix_task_id=matrix_task_id,
+                )
             db.commit()
             execute_document_parse_task(db, parse_task.id)
             db.refresh(version)
@@ -806,3 +827,32 @@ def confirm_import_draft(
         parse_task_id=parse_task_id,
         matrix_task_id=matrix_task_id,
     )
+
+
+def execute_import_processing_background(
+    *,
+    parse_task_id: uuid.UUID | None,
+    matrix_task_id: uuid.UUID | None,
+) -> None:
+    if parse_task_id is None:
+        return
+    with SessionLocal() as db:
+        parse_result = execute_document_parse_task(db, parse_task_id)
+        task = db.get(AsyncTask, parse_task_id)
+        if task is None or task.project_id is None or task.section_id is None:
+            return
+        project = db.get(Project, task.project_id)
+        section = db.get(BidSection, task.section_id)
+        if project is None or section is None:
+            return
+
+        if parse_result.get("status") in {"succeeded", "already_succeeded"}:
+            project.status = "pending_confirm"
+            section.status = "pending_confirm"
+            db.commit()
+            if matrix_task_id is not None:
+                execute_compliance_matrix_generation_task(db, matrix_task_id)
+        else:
+            project.status = "pending_files"
+            section.status = "pending_files"
+            db.commit()

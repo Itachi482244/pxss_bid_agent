@@ -48,6 +48,18 @@ class ProjectCreateRequest(BaseModel):
     section_budget_amount: Decimal | None = None
 
 
+class ProjectUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=300)
+    purchaser: str | None = Field(default=None, max_length=300)
+    agency: str | None = Field(default=None, max_length=300)
+    budget_amount: Decimal | None = None
+    region_code: str | None = Field(default=None, max_length=64)
+    industry_code: str | None = Field(default=None, max_length=64)
+    notice_url: str | None = None
+    bid_deadline_at: datetime | None = None
+    reason: str = Field(default="更新项目关键信息", min_length=2, max_length=1000)
+
+
 class ProjectImportProjectDraft(BaseModel):
     name: str = Field(min_length=1, max_length=300)
     purchaser: str | None = Field(default=None, max_length=300)
@@ -101,6 +113,7 @@ class ProjectImportConfirmRequest(BaseModel):
     sections: list[ProjectImportSectionDraft] = Field(min_length=1, max_length=20)
     auto_parse: bool = True
     auto_generate_matrix: bool = True
+    async_processing: bool = False
 
 
 class ProjectImportConfirmRead(BaseModel):
@@ -136,6 +149,14 @@ class SectionCreateRequest(BaseModel):
     bid_deadline_at: datetime | None = None
 
 
+class SectionUpdateRequest(BaseModel):
+    code: str | None = Field(default=None, max_length=64)
+    name: str | None = Field(default=None, min_length=1, max_length=300)
+    budget_amount: Decimal | None = None
+    bid_deadline_at: datetime | None = None
+    reason: str = Field(default="更新标段关键信息", min_length=2, max_length=1000)
+
+
 class ComplianceItemRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -161,6 +182,9 @@ class ComplianceItemRead(BaseModel):
     rule_explanation: dict[str, Any] | None = None
     enterprise_evidence_count: int = 0
     enterprise_evidence_summary: str | None = None
+    priority_rank: int = 3
+    priority_label: str = "P3-一般响应"
+    priority_reason: str = "普通响应项，按常规流程处理"
     status: str
     risk_level: str
     is_mandatory: bool
@@ -181,6 +205,43 @@ class ComplianceMatrixGenerateRequest(BaseModel):
     document_id: uuid.UUID | None = None
     document_version_id: uuid.UUID | None = None
     force: bool = False
+
+
+class PreflightCheckItem(BaseModel):
+    code: str
+    title: str
+    status: str
+    count: int = 0
+    message: str
+    action_label: str | None = None
+    target: str | None = None
+
+
+class PreflightCheckRead(BaseModel):
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    status: str
+    summary: str
+    latest_document_version_id: uuid.UUID | None = None
+    latest_document_version_label: str | None = None
+    matrix_version_ids: list[uuid.UUID] = Field(default_factory=list)
+    matrix_version_labels: list[str] = Field(default_factory=list)
+    matrix_outdated: bool = False
+    outdated_item_count: int = 0
+    pending_qualification_count: int = 0
+    high_risk_unconfirmed_count: int = 0
+    mandatory_missing_evidence_count: int = 0
+    technical_pending_count: int = 0
+    missing_evidence_count: int = 0
+    unverified_fact_count: int = 0
+    failed_fact_count: int = 0
+    pending_fact_check_chapter_count: int = 0
+    pending_approval_count: int = 0
+    rejected_approval_count: int = 0
+    missing_bid_deadline: bool = False
+    missing_deadline_item: bool = False
+    checks: list[PreflightCheckItem] = Field(default_factory=list)
+    suggested_actions: list[str] = Field(default_factory=list)
 
 
 class ComplianceItemUpdateRequest(BaseModel):
@@ -320,6 +381,10 @@ class BusinessDraftGenerateRequest(BaseModel):
     force: bool = True
 
 
+class BusinessDraftExportRequest(BaseModel):
+    risk_acceptance_reason: str | None = Field(default=None, max_length=1000)
+
+
 class BusinessDraftChapterUpdateRequest(BaseModel):
     content_text: str = Field(min_length=1)
     reason: str = Field(min_length=2, max_length=1000)
@@ -380,6 +445,7 @@ class ApprovalTaskCreateRequest(BaseModel):
     related_object_id: uuid.UUID | None = None
     assignee_user_id: uuid.UUID | None = None
     due_at: datetime | None = None
+    risk_acceptance_reason: str | None = Field(default=None, max_length=1000)
 
 
 class ApprovalTaskDecisionRequest(BaseModel):

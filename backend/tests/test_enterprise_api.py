@@ -174,7 +174,10 @@ def test_cleanroom_presale_material_types_are_searchable() -> None:
         params={"query": f"{unique} 检测报告 技术方案 验收", "limit": 10},
     )
     assert search_response.status_code == 200
-    assert any(item["id"] == material["id"] for item in search_response.json())
+    search_hit = next(item for item in search_response.json() if item["id"] == material["id"])
+    assert search_hit["recommend_reason"]
+    assert search_hit["matched_terms"]
+    assert search_hit["material_status_hint"]
 
     chunks_response = client.get(f"/api/v1/enterprise/materials/{material['id']}/chunks")
     assert chunks_response.status_code == 200
@@ -253,7 +256,8 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
     )
     assert search_response.status_code == 200
     search_results = search_response.json()
-    assert any(item["id"] == material["id"] for item in search_results)
+    hit = next(item for item in search_results if item["id"] == material["id"])
+    assert "营业执照" in "".join(hit["matched_terms"]) or hit["recommend_reason"]
 
     projects = client.get("/api/v1/projects").json()
     project = next(item for item in projects if item["name"] == "智慧园区弱电工程投标")

@@ -18,6 +18,10 @@ TOP_NUMBERED_HEADING_RE = re.compile(r"^\s*(?P<number>[1-9]\d?)[.．、]\s*(?P<t
 SUB_NUMBERED_HEADING_RE = re.compile(
     r"^\s*(?P<number>[1-9]\d?(?:[.．]\d{1,2})+)\s*(?P<title>\S.*)$"
 )
+CHINESE_NUMBERED_HEADING_RE = re.compile(
+    r"^\s*(?P<number>[一二三四五六七八九十]+)[、.．]\s*(?P<title>\S.*)$"
+)
+SENTENCE_ENDINGS = ("。", "；", ";")
 
 
 @dataclass(frozen=True)
@@ -49,8 +53,18 @@ def _clean_text(text: str) -> str:
 
 
 def _numbered_heading_level(text: str) -> int | None:
+    chinese_match = CHINESE_NUMBERED_HEADING_RE.match(text)
+    if chinese_match is not None:
+        title = chinese_match.group("title").strip()
+        if len(title) <= 40 and not title.endswith(SENTENCE_ENDINGS):
+            return 1
+        return None
+
     match = SUB_NUMBERED_HEADING_RE.match(text) or TOP_NUMBERED_HEADING_RE.match(text)
     if match is None:
+        return None
+    title = match.group("title").strip()
+    if len(title) > 40 or title.endswith(SENTENCE_ENDINGS):
         return None
     number = match.group("number").replace("．", ".")
     return number.count(".") + 1

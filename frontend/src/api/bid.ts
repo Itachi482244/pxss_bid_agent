@@ -38,6 +38,18 @@ export type ProjectCreatePayload = {
   section_budget_amount?: string | null;
 };
 
+export type ProjectUpdatePayload = {
+  name?: string | null;
+  purchaser?: string | null;
+  agency?: string | null;
+  budget_amount?: string | null;
+  region_code?: string | null;
+  industry_code?: string | null;
+  notice_url?: string | null;
+  bid_deadline_at?: string | null;
+  reason: string;
+};
+
 export type ProjectImportProjectDraft = {
   name: string;
   purchaser: string | null;
@@ -85,6 +97,7 @@ export type ProjectImportConfirmPayload = {
   sections: ProjectImportSectionDraft[];
   auto_parse?: boolean;
   auto_generate_matrix?: boolean;
+  async_processing?: boolean;
 };
 
 export type ProjectImportConfirmResult = {
@@ -109,6 +122,14 @@ export type SectionSummary = {
   pending_confirm_count: number;
   created_at: string;
   updated_at: string;
+};
+
+export type SectionUpdatePayload = {
+  code?: string | null;
+  name?: string | null;
+  budget_amount?: string | null;
+  bid_deadline_at?: string | null;
+  reason: string;
 };
 
 export type DocumentVersion = {
@@ -204,6 +225,9 @@ export type ComplianceItem = {
   rule_explanation: Record<string, unknown> | null;
   enterprise_evidence_count: number;
   enterprise_evidence_summary: string | null;
+  priority_rank: number;
+  priority_label: string;
+  priority_reason: string;
   status: string;
   risk_level: string;
   is_mandatory: boolean;
@@ -387,6 +411,46 @@ export type EnterpriseMaterialSearchResult = EnterpriseMaterial & {
   confidence_score: number;
   chunk_id: string | null;
   data_level_allowed: boolean;
+  recommend_reason: string | null;
+  matched_terms: string[];
+  material_status_hint: string | null;
+};
+
+export type PreflightCheckItem = {
+  code: string;
+  title: string;
+  status: "pass" | "warn" | "block";
+  count: number;
+  message: string;
+  action_label: string | null;
+  target: string | null;
+};
+
+export type PreflightCheck = {
+  project_id: string;
+  section_id: string;
+  status: "pass" | "warn" | "block";
+  summary: string;
+  latest_document_version_id: string | null;
+  latest_document_version_label: string | null;
+  matrix_version_ids: string[];
+  matrix_version_labels: string[];
+  matrix_outdated: boolean;
+  outdated_item_count: number;
+  pending_qualification_count: number;
+  high_risk_unconfirmed_count: number;
+  mandatory_missing_evidence_count: number;
+  technical_pending_count: number;
+  missing_evidence_count: number;
+  unverified_fact_count: number;
+  failed_fact_count: number;
+  pending_fact_check_chapter_count: number;
+  pending_approval_count: number;
+  rejected_approval_count: number;
+  missing_bid_deadline: boolean;
+  missing_deadline_item: boolean;
+  checks: PreflightCheckItem[];
+  suggested_actions: string[];
 };
 
 export type ComplianceEvidenceBinding = {
@@ -535,6 +599,19 @@ export type EnterpriseMaterialPayload = {
 
 export async function createProject(payload: ProjectCreatePayload) {
   const response = await apiClient.post<ProjectDetail>("/projects", payload);
+  return response.data;
+}
+
+export async function updateProject(projectId: string, payload: ProjectUpdatePayload) {
+  const response = await apiClient.patch<ProjectDetail>(`/projects/${projectId}`, payload);
+  return response.data;
+}
+
+export async function updateSection(projectId: string, sectionId: string, payload: SectionUpdatePayload) {
+  const response = await apiClient.patch<SectionSummary>(
+    `/projects/${projectId}/sections/${sectionId}`,
+    payload
+  );
   return response.data;
 }
 
@@ -761,6 +838,13 @@ export async function listComplianceItems(
   return response.data;
 }
 
+export async function getPreflightCheck(projectId: string, sectionId: string) {
+  const response = await apiClient.get<PreflightCheck>(
+    `/projects/${projectId}/sections/${sectionId}/preflight-check`
+  );
+  return response.data;
+}
+
 export async function listQualificationEvaluations(projectId: string, sectionId: string) {
   const response = await apiClient.get<QualificationEvaluation[]>(
     `/projects/${projectId}/sections/${sectionId}/qualification-evaluations`
@@ -835,9 +919,16 @@ export async function runBusinessDraftFactChecks(projectId: string, sectionId: s
   return response.data;
 }
 
-export async function exportBusinessDraftWord(projectId: string, sectionId: string) {
+export async function exportBusinessDraftWord(
+  projectId: string,
+  sectionId: string,
+  payload?: {
+    risk_acceptance_reason?: string | null;
+  }
+) {
   const response = await apiClient.post<ExportFile>(
-    `/projects/${projectId}/sections/${sectionId}/business-draft/export-word`
+    `/projects/${projectId}/sections/${sectionId}/business-draft/export-word`,
+    payload ?? {}
   );
   return response.data;
 }
@@ -867,6 +958,7 @@ export async function createApprovalTask(
     related_object_id?: string | null;
     assignee_user_id?: string | null;
     due_at?: string | null;
+    risk_acceptance_reason?: string | null;
   }
 ) {
   const response = await apiClient.post<ApprovalTask>(

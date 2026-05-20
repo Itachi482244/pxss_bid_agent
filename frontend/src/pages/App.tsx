@@ -74,6 +74,7 @@ import {
   exportComplianceMatrixExcel,
   generateBusinessDraftChapters,
   generateComplianceMatrix,
+  getPreflightCheck,
   generateQualificationDecision,
   getEnterpriseProfile,
   getProject,
@@ -97,6 +98,8 @@ import {
   publishDocumentManualRevision,
   uploadEnterpriseMaterialFile,
   unbindComplianceEvidence,
+  updateProject,
+  updateSection,
   upsertEnterpriseProfile,
   uploadDocument,
   updateBusinessDraftChapter,
@@ -116,10 +119,12 @@ import type {
   ProjectImportDraft,
   ProjectDocument,
   ProjectDetail,
+  PreflightCheck,
   ProjectSummary,
   QualificationDecision,
   QualificationEvaluation,
-  SectionSummary
+  SectionSummary,
+  AsyncTask
 } from "../api/bid";
 import "./app.css";
 
@@ -175,6 +180,22 @@ type NewProjectDraft = {
   sectionName: string;
 };
 
+type KeyInfoDraft = {
+  projectName: string;
+  purchaser: string;
+  agency: string;
+  budgetAmount: string;
+  regionCode: string;
+  industryCode: string;
+  noticeUrl: string;
+  bidDeadlineAt: string | null;
+  sectionCode: string;
+  sectionName: string;
+  sectionBudgetAmount: string;
+  sectionBidDeadlineAt: string | null;
+  reason: string;
+};
+
 type ProjectCreateMode = "manual" | "file" | "url";
 type WorkflowStepKey = "documents" | "matrix" | "technical" | "evidence" | "qualification" | "chapter" | "approval";
 type WorkflowStepStatus = "not_started" | "todo" | "risk" | "done";
@@ -187,6 +208,8 @@ type WorkflowStep = {
   statusText: string;
   actionText: string;
   reason: string;
+  disabled: boolean;
+  disabledReason: string | null;
 };
 
 type NewMaterialDraft = {
@@ -201,6 +224,15 @@ type NewMaterialDraft = {
   dataLevel: string;
   verificationStatus: string;
   evidenceText: string;
+};
+
+type ImportProcessingState = {
+  projectId: string;
+  sectionId: string | null;
+  parseTaskId: string | null;
+  matrixTaskId: string | null;
+  parseTask: AsyncTask | null;
+  matrixTask: AsyncTask | null;
 };
 
 const quickPrompts = ["解释当前条款", "查看技术响应", "检查缺项", "整理审批意见"];
@@ -223,6 +255,24 @@ const projectStatusLabels: Record<string, string> = {
   confirmed: "已确认",
   exported: "已导出",
   archived: "已归档"
+};
+
+const asyncTaskStatusLabels: Record<string, string> = {
+  pending: "排队中",
+  running: "处理中",
+  retrying: "重试中",
+  succeeded: "已完成",
+  failed: "失败",
+  canceled: "已取消"
+};
+
+const asyncTaskStatusColors: Record<string, string> = {
+  pending: "default",
+  running: "processing",
+  retrying: "gold",
+  succeeded: "green",
+  failed: "red",
+  canceled: "default"
 };
 
 const riskLabels: Record<string, string> = {
@@ -352,6 +402,36 @@ function workflowStatusColor(value: WorkflowStepStatus) {
   return "default";
 }
 
+function preflightColor(value: string) {
+  if (value === "block") return "red";
+  if (value === "warn") return "gold";
+  return "green";
+}
+
+function preflightLabel(value: string) {
+  if (value === "block") return "存在阻塞";
+  if (value === "warn") return "需复核";
+  return "已通过";
+}
+
+function isAsyncTaskActive(task: AsyncTask | null, taskId: string | null) {
+  if (!taskId) return false;
+  if (!task) return true;
+  return ["pending", "running", "retrying"].includes(task.status);
+}
+
+function isAsyncTaskTerminal(task: AsyncTask | null, taskId: string | null) {
+  if (!taskId) return true;
+  return Boolean(task && ["succeeded", "failed", "canceled"].includes(task.status));
+}
+
+function asyncTaskProgress(task: AsyncTask | null, taskId: string | null) {
+  if (!taskId) return 0;
+  if (!task) return 5;
+  if (task.status === "pending") return Math.max(task.progress, 8);
+  return task.progress;
+}
+
 function formatDateTime(value: string | null) {
   if (!value) return "未设置";
   return dayjs(value).format("YYYY-MM-DD HH:mm");
@@ -372,6 +452,12 @@ function truncateText(value: string, length = 24) {
 function summaryNumber(source: Record<string, unknown> | null, key: string) {
   const value = source?.[key];
   return typeof value === "number" ? value : Number(value ?? 0) || 0;
+}
+
+function blockingSummary(source: Record<string, unknown> | null) {
+  const value = source?.blocking_summary;
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
 }
 
 function explanationText(source: Record<string, unknown> | null | undefined, key: string, fallback = "暂无记录") {
@@ -450,6 +536,7 @@ function auditActionText(log: AuditLog) {
 
 export function App() {
   const [assistantCollapsed, setAssistantCollapsed] = useState(false);
+  const [projectNavCollapsed, setProjectNavCollapsed] = useState(false);
   const [viewMode, setViewMode] = useState<"home" | "workspace" | "enterprise">("home");
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const [selectedSectionId, setSelectedSectionId] = useState<string>();
@@ -461,6 +548,7 @@ export function App() {
   const [ownerFilter, setOwnerFilter] = useState<string | undefined>();
   const [riskFilter, setRiskFilter] = useState<string | undefined>();
   const [mandatoryFilter, setMandatoryFilter] = useState<string | undefined>();
+  const [prioritySortEnabled, setPrioritySortEnabled] = useState(true);
   const [sourceDrawer, setSourceDrawer] = useState<MatrixRow | null>(null);
   const [evidenceDrawer, setEvidenceDrawer] = useState<MatrixRow | null>(null);
   const [evidenceBindings, setEvidenceBindings] = useState<ComplianceEvidenceBinding[]>([]);
@@ -487,6 +575,22 @@ export function App() {
     bidDeadlineAt: null,
     sectionName: "一标段"
   });
+  const [keyInfoModalOpen, setKeyInfoModalOpen] = useState(false);
+  const [keyInfoDraft, setKeyInfoDraft] = useState<KeyInfoDraft>({
+    projectName: "",
+    purchaser: "",
+    agency: "",
+    budgetAmount: "",
+    regionCode: "",
+    industryCode: "",
+    noticeUrl: "",
+    bidDeadlineAt: null,
+    sectionCode: "",
+    sectionName: "",
+    sectionBudgetAmount: "",
+    sectionBidDeadlineAt: null,
+    reason: "人工确认项目和标段关键信息"
+  });
   const [publicUrl, setPublicUrl] = useState("");
   const [publicUrlSite, setPublicUrlSite] = useState("");
   const [actionLogs, setActionLogs] = useState<string[]>([]);
@@ -498,6 +602,7 @@ export function App() {
   const [documents, setDocuments] = useState<ProjectDocument[]>([]);
   const [exportFiles, setExportFiles] = useState<ExportFile[]>([]);
   const [complianceItems, setComplianceItems] = useState<ComplianceItem[]>([]);
+  const [preflightCheck, setPreflightCheck] = useState<PreflightCheck | null>(null);
   const [qualificationEvaluations, setQualificationEvaluations] = useState<QualificationEvaluation[]>([]);
   const [qualificationDecision, setQualificationDecision] = useState<QualificationDecision | null>(null);
   const [businessDraftChapters, setBusinessDraftChapters] = useState<BusinessDraftChapter[]>([]);
@@ -516,11 +621,13 @@ export function App() {
   const [approvalBusyId, setApprovalBusyId] = useState("");
   const [savingProject, setSavingProject] = useState(false);
   const [deletingProjects, setDeletingProjects] = useState(false);
+  const [importProcessing, setImportProcessing] = useState<ImportProcessingState | null>(null);
   const [documentBusy, setDocumentBusy] = useState(false);
   const [revisionDrawerOpen, setRevisionDrawerOpen] = useState(false);
   const [revisionDocument, setRevisionDocument] = useState<ProjectDocument | null>(null);
   const [revisionChunks, setRevisionChunks] = useState<DocumentChunk[]>([]);
   const [revisionReason, setRevisionReason] = useState("");
+  const [revisionSearch, setRevisionSearch] = useState("");
   const [loadingRevisionChunks, setLoadingRevisionChunks] = useState(false);
   const [publishingRevision, setPublishingRevision] = useState(false);
   const [exportingExcel, setExportingExcel] = useState(false);
@@ -756,6 +863,21 @@ export function App() {
   }, [selectedProjectId, selectedSectionId]);
 
   useEffect(() => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    let active = true;
+    getPreflightCheck(selectedProjectId, selectedSectionId)
+      .then((data) => {
+        if (active) setPreflightCheck(data);
+      })
+      .catch(() => {
+        if (active) setPreflightCheck(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedProjectId, selectedSectionId, complianceItems, businessDraftChapters, approvalTasks, documents]);
+
+  useEffect(() => {
     if (selectedSectionId && !selectedTreeKey) {
       setSelectedTreeKey(`section:${selectedSectionId}`);
     }
@@ -778,6 +900,30 @@ export function App() {
     () => businessDraftChapters.find((chapter) => chapter.id === selectedDraftChapterId) ?? null,
     [businessDraftChapters, selectedDraftChapterId]
   );
+  const missingKeyInfo = useMemo(() => {
+    const missing: string[] = [];
+    if (!currentProject?.purchaser) missing.push("招标人");
+    if (!currentProject?.budget_amount && !currentSection?.budget_amount) missing.push("预算/限价");
+    if (!currentProject?.bid_deadline_at && !currentSection?.bid_deadline_at) missing.push("投标截止时间");
+    if (!currentSection?.name) missing.push("标段名称");
+    return missing;
+  }, [
+    currentProject?.bid_deadline_at,
+    currentProject?.budget_amount,
+    currentProject?.purchaser,
+    currentSection?.bid_deadline_at,
+    currentSection?.budget_amount,
+    currentSection?.name
+  ]);
+  const filteredRevisionChunks = useMemo(() => {
+    const keyword = revisionSearch.trim().toLowerCase();
+    if (!keyword) return revisionChunks;
+    return revisionChunks.filter((chunk) =>
+      [chunk.heading_path, chunk.content_text, chunk.page_no ? `p${chunk.page_no}` : ""]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(keyword))
+    );
+  }, [revisionChunks, revisionSearch]);
 
   useEffect(() => {
     setDraftEditorValue(selectedDraftChapter?.content_text ?? "");
@@ -819,6 +965,21 @@ export function App() {
       return true;
     });
   }, [mandatoryFilter, matrixRows, ownerFilter, riskFilter, statusFilter]);
+  const displayedMatrixRows = useMemo(() => {
+    if (!prioritySortEnabled) return filteredMatrixRows;
+    return [...filteredMatrixRows].sort((left, right) => {
+      if (left.raw.priority_rank !== right.raw.priority_rank) {
+        return left.raw.priority_rank - right.raw.priority_rank;
+      }
+      const riskOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+      return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
+    });
+  }, [filteredMatrixRows, prioritySortEnabled]);
+  const visiblePreflightChecks = useMemo(() => {
+    if (!preflightCheck) return [];
+    const problemChecks = preflightCheck.checks.filter((item) => item.status !== "pass");
+    return problemChecks.length ? problemChecks : preflightCheck.checks.slice(0, 3);
+  }, [preflightCheck]);
 
   const ownerOptions = useMemo(() => {
     const pairs = matrixRows
@@ -845,6 +1006,23 @@ export function App() {
     ? Math.round(((matrixRows.length - unresolvedMatrixRows.length) / matrixRows.length) * 100)
     : 0;
   const isMatrixComplete = matrixRows.length > 0 && unresolvedMatrixRows.length === 0;
+  const parseTaskActive = isAsyncTaskActive(importProcessing?.parseTask ?? null, importProcessing?.parseTaskId ?? null);
+  const matrixTaskActive = isAsyncTaskActive(importProcessing?.matrixTask ?? null, importProcessing?.matrixTaskId ?? null);
+  const importProcessingVisible = Boolean(
+    importProcessing &&
+      importProcessing.projectId === selectedProjectId &&
+      (!importProcessing.sectionId || importProcessing.sectionId === selectedSectionId) &&
+      (importProcessing.parseTaskId || importProcessing.matrixTaskId)
+  );
+  const importProcessingDone = Boolean(
+    importProcessing &&
+      isAsyncTaskTerminal(importProcessing.parseTask, importProcessing.parseTaskId) &&
+      isAsyncTaskTerminal(importProcessing.matrixTask, importProcessing.matrixTaskId)
+  );
+  const importProcessingFailed = Boolean(
+    importProcessing &&
+      [importProcessing.parseTask, importProcessing.matrixTask].some((task) => task?.status === "failed")
+  );
 
   const workflowSteps = useMemo<WorkflowStep[]>(() => {
     const parsedDocuments = documents.filter((document) => document.current_version?.parse_status === "succeeded");
@@ -856,26 +1034,38 @@ export function App() {
     const pendingApprovals = approvalTasks.filter((task) => task.status === "pending").length;
     const hasDecision = Boolean(qualificationDecision);
     const hasDraft = businessDraftChapters.length > 0;
+    const hasSelectedScope = Boolean(selectedProjectId && selectedSectionId);
+    const canOpenDocuments = hasSelectedScope;
+    const canOpenMatrix = parsedDocuments.length > 0;
+    const canOpenMatrixDerived = matrixRows.length > 0;
+    const canOpenChapter = hasDecision || hasDraft;
+    const canOpenApproval = hasDraft || approvalTasks.length > 0 || exportFiles.length > 0;
 
     return [
       {
         key: "documents",
         title: "文件解析",
         description: "上传或获取招标文件，并确认解析版本可用。",
-        status: parsedDocuments.length ? "done" : documents.length ? "todo" : "not_started",
-        statusText: parsedDocuments.length ? "已完成" : documents.length ? "待解析" : "未开始",
-        actionText: documents.length ? "查看文件解析" : "上传/获取文件",
-        reason: parsedDocuments.length
-          ? `已有 ${parsedDocuments.length} 份文件解析成功。`
-          : documents.length
-            ? "已有文件，但还没有可用的解析版本。"
-            : "先上传 Word/PDF 或从公开链接获取招标文件。"
-      },
+        status: parsedDocuments.length ? "done" : documents.length || parseTaskActive ? "todo" : "not_started",
+        statusText: parseTaskActive ? "解析中" : parsedDocuments.length ? "已完成" : documents.length ? "待解析" : "未开始",
+	        actionText: documents.length ? "查看文件解析" : "上传/获取文件",
+	        reason: parseTaskActive
+            ? "文件解析正在后台处理，完成后会自动刷新解析版本。"
+            : parsedDocuments.length
+	          ? `已有 ${parsedDocuments.length} 份文件解析成功。`
+	          : documents.length
+	            ? "已有文件，但还没有可用的解析版本。"
+	            : "先上传 Word/PDF 或从公开链接获取招标文件。",
+	        disabled: !canOpenDocuments,
+	        disabledReason: canOpenDocuments ? null : "请先选择项目和标段。"
+	      },
       {
         key: "matrix",
         title: "合规矩阵",
         description: "从招标文件中抽取资格项、强制响应项和风险点。",
-        status: matrixRows.length
+        status: matrixTaskActive
+          ? "todo"
+          : matrixRows.length
           ? unresolvedMatrixCount
             ? unresolvedHighRiskCount
               ? "risk"
@@ -884,7 +1074,9 @@ export function App() {
           : parsedDocuments.length
             ? "todo"
             : "not_started",
-        statusText: matrixRows.length
+        statusText: matrixTaskActive
+          ? "生成中"
+          : matrixRows.length
           ? unresolvedMatrixCount
             ? unresolvedHighRiskCount
               ? `${unresolvedHighRiskCount} 高风险待确认`
@@ -893,15 +1085,19 @@ export function App() {
               ? `已完成 · ${highRiskCount} 高风险已确认`
               : "已完成"
           : "未生成",
-        actionText: matrixRows.length ? "查看合规矩阵" : "生成合规矩阵",
-        reason: matrixRows.length
-          ? unresolvedMatrixCount
-            ? `当前有 ${matrixRows.length} 条矩阵项，${unresolvedMatrixCount} 条仍需确认或补材料。`
-            : "合规矩阵已全部人工确认，可以进入证据绑定和资格预评估。"
-          : parsedDocuments.length
-            ? "文件已解析，可以生成合规矩阵。"
-            : "需要先完成文件解析。"
-      },
+        actionText: matrixTaskActive ? "查看处理状态" : matrixRows.length ? "查看合规矩阵" : "生成合规矩阵",
+	        reason: matrixTaskActive
+            ? "合规矩阵正在后台生成，完成后会自动刷新矩阵和提交前核验。"
+            : matrixRows.length
+	          ? unresolvedMatrixCount
+	            ? `当前有 ${matrixRows.length} 条矩阵项，${unresolvedMatrixCount} 条仍需确认或补材料。`
+	            : "合规矩阵已全部人工确认，可以进入证据绑定和资格预评估。"
+	          : parsedDocuments.length
+	            ? "文件已解析，可以生成合规矩阵。"
+	            : "需要先完成文件解析。",
+	        disabled: !canOpenMatrix,
+	        disabledReason: canOpenMatrix ? null : "请先完成文件解析，形成可用解析版本。"
+	      },
       {
         key: "evidence",
         title: "证据绑定",
@@ -913,12 +1109,14 @@ export function App() {
           : "not_started",
         statusText: matrixRows.length ? (missingEvidenceCount ? `${missingEvidenceCount} 待处理` : "已完成") : "未开始",
         actionText: missingEvidenceCount ? "处理证据绑定" : "查看证据",
-        reason: matrixRows.length
-          ? missingEvidenceCount
-            ? `还有 ${missingEvidenceCount} 条矩阵项缺少企业资料证据。`
-            : "矩阵项已绑定企业资料证据。"
-          : "需要先生成合规矩阵。"
-      },
+	        reason: matrixRows.length
+	          ? missingEvidenceCount
+	            ? `还有 ${missingEvidenceCount} 条矩阵项缺少企业资料证据。`
+	            : "矩阵项已绑定企业资料证据。"
+	          : "需要先生成合规矩阵。",
+	        disabled: !canOpenMatrixDerived,
+	        disabledReason: canOpenMatrixDerived ? null : "请先生成合规矩阵。"
+	      },
       {
         key: "technical",
         title: "技术响应",
@@ -938,12 +1136,14 @@ export function App() {
             ? "已预留"
             : "未开始",
         actionText: "查看技术响应",
-        reason: technicalRows.length
-          ? `已识别 ${technicalRows.length} 条技术响应或评分相关要求。`
-          : matrixRows.length
-            ? "当前矩阵暂无明确技术响应项，产品选型和技术标生成将在 1.1 完成。"
-            : "需要先生成合规矩阵。"
-      },
+	        reason: technicalRows.length
+	          ? `已识别 ${technicalRows.length} 条技术响应或评分相关要求。`
+	          : matrixRows.length
+	            ? "当前矩阵暂无明确技术响应项，产品选型和技术标生成将在 1.1 完成。"
+	            : "需要先生成合规矩阵。",
+	        disabled: !canOpenMatrixDerived,
+	        disabledReason: canOpenMatrixDerived ? null : "请先生成合规矩阵。"
+	      },
       {
         key: "qualification",
         title: "资格预评估",
@@ -959,12 +1159,14 @@ export function App() {
           ? decisionLabels[qualificationDecision?.recommendation ?? ""] ?? "已生成"
           : "未评估",
         actionText: hasDecision ? "查看参标建议" : "运行资格预评估",
-        reason: hasDecision
-          ? qualificationDecision?.summary ?? "参标建议已生成。"
-          : matrixRows.length
-            ? "矩阵已有候选项，可以运行资格预评估并生成参标建议。"
-            : "需要先生成合规矩阵。"
-      },
+	        reason: hasDecision
+	          ? qualificationDecision?.summary ?? "参标建议已生成。"
+	          : matrixRows.length
+	            ? "矩阵已有候选项，可以运行资格预评估并生成参标建议。"
+	            : "需要先生成合规矩阵。",
+	        disabled: !canOpenMatrixDerived,
+	        disabledReason: canOpenMatrixDerived ? null : "请先生成合规矩阵。"
+	      },
       {
         key: "chapter",
         title: "商务草稿",
@@ -972,12 +1174,14 @@ export function App() {
         status: hasDraft ? "done" : hasDecision ? "todo" : "not_started",
         statusText: hasDraft ? `${businessDraftChapters.length} 章` : "未生成",
         actionText: hasDraft ? "编辑商务草稿" : "生成商务标草稿",
-        reason: hasDraft
-          ? "商务标章节草稿已生成，可继续事实校验和导出。"
-          : hasDecision
-            ? "参标建议已有结果，可以生成商务标草稿。"
-            : "需要先完成资格预评估。"
-      },
+	        reason: hasDraft
+	          ? "商务标章节草稿已生成，可继续事实校验和导出。"
+	          : hasDecision
+	            ? "参标建议已有结果，可以生成商务标草稿。"
+	            : "需要先完成资格预评估。",
+	        disabled: !canOpenChapter,
+	        disabledReason: canOpenChapter ? null : "请先完成资格预评估，生成参标建议。"
+	      },
       {
         key: "approval",
         title: "审批导出",
@@ -985,29 +1189,37 @@ export function App() {
         status: pendingApprovals ? "todo" : hasDraft ? "done" : "not_started",
         statusText: pendingApprovals ? `${pendingApprovals} 待审批` : hasDraft ? "可提交" : "未开始",
         actionText: pendingApprovals ? "处理审批任务" : "提交确认",
-        reason: pendingApprovals
-          ? `当前有 ${pendingApprovals} 个审批任务等待处理。`
-          : hasDraft
-            ? "草稿已生成，可以创建提交确认任务。"
-            : "需要先生成商务标草稿。"
-      }
-    ];
-  }, [
-    approvalTasks,
-    businessDraftChapters,
-    documents,
-    evidenceRows.length,
-    matrixRows,
-    technicalRows,
-    qualificationDecision,
-    unresolvedHighRiskRows.length,
-    unresolvedMatrixRows.length
-  ]);
+	        reason: pendingApprovals
+	          ? `当前有 ${pendingApprovals} 个审批任务等待处理。`
+	          : hasDraft
+	            ? "草稿已生成，可以创建提交确认任务。"
+	            : "需要先生成商务标草稿。",
+	        disabled: !canOpenApproval,
+	        disabledReason: canOpenApproval ? null : "请先生成商务标草稿或审批任务。"
+	      }
+	    ];
+	  }, [
+	    approvalTasks,
+	    businessDraftChapters,
+	    documents,
+	    evidenceRows.length,
+	    exportFiles.length,
+      matrixTaskActive,
+	    matrixRows,
+      parseTaskActive,
+	    technicalRows,
+	    qualificationDecision,
+	    selectedProjectId,
+	    selectedSectionId,
+	    unresolvedHighRiskRows.length,
+	    unresolvedMatrixRows.length
+	  ]);
 
   const recommendedStep = useMemo(() => {
     return (
-      workflowSteps.find((step) => step.status === "todo" || step.status === "risk") ??
-      workflowSteps.find((step) => step.status === "not_started") ??
+      workflowSteps.find((step) => !step.disabled && (step.status === "todo" || step.status === "risk")) ??
+      workflowSteps.find((step) => !step.disabled && step.status === "not_started") ??
+      workflowSteps.find((step) => !step.disabled) ??
       workflowSteps[workflowSteps.length - 1]
     );
   }, [workflowSteps]);
@@ -1154,6 +1366,12 @@ export function App() {
     setApprovalTasks(tasks);
   }, [selectedProjectId, selectedSectionId]);
 
+  const reloadPreflightCheck = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    const data = await getPreflightCheck(selectedProjectId, selectedSectionId);
+    setPreflightCheck(data);
+  }, [selectedProjectId, selectedSectionId]);
+
   const refreshAfterMatrixMutation = useCallback(async () => {
     await Promise.all([
       reloadMatrix(),
@@ -1163,7 +1381,8 @@ export function App() {
       reloadQualificationEvaluations(),
       reloadQualificationDecision(),
       reloadBusinessDraftChapters(),
-      reloadApprovalTasks()
+      reloadApprovalTasks(),
+      reloadPreflightCheck()
     ]);
   }, [
     reloadApprovalTasks,
@@ -1171,8 +1390,93 @@ export function App() {
     reloadBusinessDraftChapters,
     reloadDocumentsAndExports,
     reloadMatrix,
+    reloadPreflightCheck,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
+    reloadWorkspaceSummary
+  ]);
+
+  useEffect(() => {
+    if (!importProcessing) return;
+    let active = true;
+    let clearTimer: number | null = null;
+
+    const pollTasks = async () => {
+      const [parseTask, matrixTask] = await Promise.all([
+        importProcessing.parseTaskId ? getTask(importProcessing.parseTaskId) : Promise.resolve(null),
+        importProcessing.matrixTaskId ? getTask(importProcessing.matrixTaskId) : Promise.resolve(null)
+      ]);
+      if (!active) return;
+
+      setImportProcessing((current) => {
+        if (
+          !current ||
+          current.projectId !== importProcessing.projectId ||
+          current.sectionId !== importProcessing.sectionId ||
+          current.parseTaskId !== importProcessing.parseTaskId ||
+          current.matrixTaskId !== importProcessing.matrixTaskId
+        ) {
+          return current;
+        }
+        return {
+          ...current,
+          parseTask,
+          matrixTask
+        };
+      });
+
+      const parseTerminal = isAsyncTaskTerminal(parseTask, importProcessing.parseTaskId);
+      const matrixTerminal = isAsyncTaskTerminal(matrixTask, importProcessing.matrixTaskId);
+      if (parseTerminal || matrixTerminal) {
+        await Promise.all([
+          reloadWorkspaceSummary(),
+          reloadDocumentsAndExports(),
+          reloadMatrix(),
+          reloadPreflightCheck(),
+          reloadAuditLogs()
+        ]);
+      }
+
+      if (parseTerminal && matrixTerminal && !clearTimer) {
+        clearTimer = window.setTimeout(() => {
+          setImportProcessing((current) => {
+            if (
+              current?.projectId === importProcessing.projectId &&
+              current?.sectionId === importProcessing.sectionId &&
+              current?.parseTaskId === importProcessing.parseTaskId &&
+              current?.matrixTaskId === importProcessing.matrixTaskId
+            ) {
+              return null;
+            }
+            return current;
+          });
+        }, 8000);
+      }
+    };
+
+    void pollTasks().catch((error: unknown) => {
+      setApiError(error instanceof Error ? error.message : "后台任务状态刷新失败");
+    });
+    const intervalId = window.setInterval(() => {
+      void pollTasks().catch((error: unknown) => {
+        setApiError(error instanceof Error ? error.message : "后台任务状态刷新失败");
+      });
+    }, 1500);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+      if (clearTimer) window.clearTimeout(clearTimer);
+    };
+  }, [
+    importProcessing?.projectId,
+    importProcessing?.sectionId,
+    importProcessing?.parseTaskId,
+    importProcessing?.matrixTaskId,
+    reloadAuditLogs,
+    reloadDocumentsAndExports,
+    reloadMatrix,
+    reloadPreflightCheck,
     reloadWorkspaceSummary
   ]);
 
@@ -1312,12 +1616,24 @@ export function App() {
 
   const activateWorkflowStep = useCallback(
     (stepKey: WorkflowStepKey) => {
+      const targetStep = workflowSteps.find((step) => step.key === stepKey);
+      if (targetStep?.disabled) {
+        appendLog(targetStep.disabledReason ?? "请先完成前置步骤");
+        return;
+      }
       setViewMode("workspace");
       setActiveTab(stepKey);
       setWorkspaceNode(stepKey);
     },
-    [setWorkspaceNode]
+    [appendLog, setWorkspaceNode, workflowSteps]
   );
+
+  useEffect(() => {
+    const activeStep = workflowSteps.find((step) => step.key === activeTab);
+    if (!activeStep?.disabled || !recommendedStep || recommendedStep.key === activeTab) return;
+    setActiveTab(recommendedStep.key);
+    setWorkspaceNode(recommendedStep.key);
+  }, [activeTab, recommendedStep, setWorkspaceNode, workflowSteps]);
 
   const locateMatrixRow = useCallback(
     (rowKey?: string) => {
@@ -1376,21 +1692,107 @@ export function App() {
     });
   };
 
+  const openKeyInfoModal = () => {
+    setKeyInfoDraft({
+      projectName: currentProject?.name ?? "",
+      purchaser: currentProject?.purchaser ?? "",
+      agency: currentProject?.agency ?? "",
+      budgetAmount: currentProject?.budget_amount ?? "",
+      regionCode: currentProject?.region_code ?? "",
+      industryCode: currentProject?.industry_code ?? "",
+      noticeUrl: "notice_url" in (currentProject ?? {}) ? (currentProject as ProjectDetail).notice_url ?? "" : "",
+      bidDeadlineAt: currentProject?.bid_deadline_at ?? null,
+      sectionCode: currentSection?.code ?? "",
+      sectionName: currentSection?.name ?? "",
+      sectionBudgetAmount: currentSection?.budget_amount ?? "",
+      sectionBidDeadlineAt: currentSection?.bid_deadline_at ?? null,
+      reason: "人工确认项目和标段关键信息"
+    });
+    setKeyInfoModalOpen(true);
+  };
+
+  const handleSaveKeyInfo = async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    if (!keyInfoDraft.projectName.trim() || !keyInfoDraft.sectionName.trim() || !keyInfoDraft.reason.trim()) {
+      Modal.warning({ title: "请填写项目名称、标段名称和修改原因" });
+      return;
+    }
+    setSavingProject(true);
+    try {
+      const [updatedProject, updatedSection] = await Promise.all([
+        updateProject(selectedProjectId, {
+          name: keyInfoDraft.projectName.trim(),
+          purchaser: keyInfoDraft.purchaser.trim() || null,
+          agency: keyInfoDraft.agency.trim() || null,
+          budget_amount: keyInfoDraft.budgetAmount.trim() || null,
+          region_code: keyInfoDraft.regionCode.trim() || null,
+          industry_code: keyInfoDraft.industryCode.trim() || null,
+          notice_url: keyInfoDraft.noticeUrl.trim() || null,
+          bid_deadline_at: keyInfoDraft.bidDeadlineAt,
+          reason: keyInfoDraft.reason.trim()
+        }),
+        updateSection(selectedProjectId, selectedSectionId, {
+          code: keyInfoDraft.sectionCode.trim() || null,
+          name: keyInfoDraft.sectionName.trim(),
+          budget_amount: keyInfoDraft.sectionBudgetAmount.trim() || null,
+          bid_deadline_at: keyInfoDraft.sectionBidDeadlineAt,
+          reason: keyInfoDraft.reason.trim()
+        })
+      ]);
+      setProjectDetail(updatedProject);
+      setProjects((items) => items.map((item) => (item.id === updatedProject.id ? { ...item, ...updatedProject } : item)));
+      setSections((items) => items.map((item) => (item.id === updatedSection.id ? updatedSection : item)));
+      setKeyInfoModalOpen(false);
+      appendLog("更新项目和标段关键信息");
+      await Promise.all([reloadAuditLogs(), reloadPreflightCheck()]);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "项目关键信息保存失败");
+    } finally {
+      setSavingProject(false);
+    }
+  };
+
   const confirmSubmit = () => {
+    let riskAcceptanceReason = "";
+    const hasBlocker = preflightCheck?.status === "block";
     Modal.confirm({
-      title: "提交确认",
-      content: "该操作将触发审批流，不会直接提交投标文件。高风险缺项和未确认项仍需责任人处理。",
+      title: hasBlocker ? "存在阻塞项，创建提交确认？" : "提交确认",
+      content: hasBlocker ? (
+        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          <Alert
+            type="error"
+            showIcon
+            message="提交前核验存在阻塞项"
+            description={preflightCheck?.summary}
+          />
+          <Text type="secondary">该说明会写入审批快照和审计，用于标记本次仅进入内部复核。</Text>
+          <TextArea
+            placeholder="请填写风险接受说明，例如：仅创建内部复核任务，待补齐证据后再正式提交。"
+            autoSize={{ minRows: 3, maxRows: 5 }}
+            onChange={(event) => {
+              riskAcceptanceReason = event.target.value;
+            }}
+          />
+        </Space>
+      ) : (
+        "该操作将触发审批流，不会直接提交投标文件。高风险缺项和未确认项仍需责任人处理。"
+      ),
       okText: "触发审批流",
       cancelText: "取消",
       onOk: async () => {
         if (!selectedProjectId || !selectedSectionId) return;
+        if (hasBlocker && !riskAcceptanceReason.trim()) {
+          Modal.warning({ title: "需要填写风险接受说明" });
+          throw new Error("risk acceptance required");
+        }
         const task = await createApprovalTask(selectedProjectId, selectedSectionId, {
           task_type: "submit_confirmation",
           title: "提交前人工确认",
-          description: "确认参标建议、商务标草稿、证据绑定和导出快照均已完成复核。"
+          description: "确认参标建议、商务标草稿、证据绑定和导出快照均已完成复核。",
+          risk_acceptance_reason: riskAcceptanceReason.trim() || null
         });
         appendLog(`触发提交前审批流：${task.title}`);
-        await reloadApprovalTasks();
+        await Promise.all([reloadApprovalTasks(), reloadAuditLogs()]);
       }
     });
   };
@@ -1459,12 +1861,19 @@ export function App() {
   };
 
   const runWorkflowPrimaryAction = (stepKey: WorkflowStepKey) => {
+    const targetStep = workflowSteps.find((step) => step.key === stepKey);
+    if (targetStep?.disabled) {
+      appendLog(targetStep.disabledReason ?? "请先完成前置步骤");
+      return;
+    }
     if (stepKey === "documents") {
       activateWorkflowStep("documents");
       return;
     }
     if (stepKey === "matrix") {
-      if (matrixRows.length) {
+      if (matrixTaskActive) {
+        activateWorkflowStep("matrix");
+      } else if (matrixRows.length) {
         activateWorkflowStep("matrix");
       } else {
         handleGenerateMatrix();
@@ -1649,11 +2058,51 @@ export function App() {
 
   const handleExportBusinessWord = async () => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (preflightCheck && (preflightCheck.unverified_fact_count > 0 || preflightCheck.status === "block")) {
+      let riskAcceptanceReason = "";
+      Modal.confirm({
+        title: "提交前核验仍有风险",
+        content: (
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            <Alert
+              type={preflightCheck.status === "block" ? "error" : "warning"}
+              showIcon
+              message="导出将被标记为内部草稿"
+              description={`${preflightCheck.summary} 导出的 Word 需人工复核后使用。`}
+            />
+            <TextArea
+              placeholder="请填写风险接受说明，例如：导出内部草稿用于会议评审，待补齐证据后再形成正式版本。"
+              autoSize={{ minRows: 3, maxRows: 5 }}
+              onChange={(event) => {
+                riskAcceptanceReason = event.target.value;
+              }}
+            />
+          </Space>
+        ),
+        okText: "继续导出草稿",
+        cancelText: "先处理风险",
+        onOk: () => {
+          if (preflightCheck.status === "block" && !riskAcceptanceReason.trim()) {
+            Modal.warning({ title: "需要填写风险接受说明" });
+            throw new Error("risk acceptance required");
+          }
+          void handleExportBusinessWordConfirmed(riskAcceptanceReason.trim() || undefined);
+        }
+      });
+      return;
+    }
+    await handleExportBusinessWordConfirmed();
+  };
+
+  const handleExportBusinessWordConfirmed = async (riskAcceptanceReason?: string) => {
+    if (!selectedProjectId || !selectedSectionId) return;
     setExportingWord(true);
     try {
-      const exportFile = await exportBusinessDraftWord(selectedProjectId, selectedSectionId);
+      const exportFile = await exportBusinessDraftWord(selectedProjectId, selectedSectionId, {
+        risk_acceptance_reason: riskAcceptanceReason ?? null
+      });
       appendLog(`导出商务标 Word：${exportFile.file_name}`);
-      await Promise.all([reloadDocumentsAndExports(), reloadAuditLogs()]);
+      await Promise.all([reloadDocumentsAndExports(), reloadAuditLogs(), reloadPreflightCheck()]);
       window.open(`/api/v1/projects/${selectedProjectId}/export-files/${exportFile.id}/download`, "_blank");
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "商务标 Word 导出失败");
@@ -1665,11 +2114,20 @@ export function App() {
   const handleDecideApprovalTask = (task: ApprovalTask, action: "approve" | "reject") => {
     if (!selectedProjectId || !selectedSectionId) return;
     let reason = action === "approve" ? "人工复核通过" : "退回补充修改";
+    const blockers = blockingSummary(task.evidence_snapshot_json);
     Modal.confirm({
-      title: action === "approve" ? "通过审批任务" : "退回审批任务",
+      title: action === "approve" && blockers.some((item) => item.status === "block") ? "存在阻塞项，确认通过？" : action === "approve" ? "通过审批任务" : "退回审批任务",
       content: (
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
           <Text>{task.title}</Text>
+          {blockers.length > 0 && (
+            <Alert
+              type={blockers.some((item) => item.status === "block") ? "error" : "warning"}
+              showIcon
+              message="审批阻塞摘要"
+              description={blockers.slice(0, 4).map((item) => String(item.message)).join("；")}
+            />
+          )}
           <TextArea
             defaultValue={reason}
             autoSize={{ minRows: 2, maxRows: 4 }}
@@ -1697,7 +2155,8 @@ export function App() {
             reloadApprovalTasks(),
             reloadBusinessDraftChapters(),
             reloadQualificationDecision(),
-            reloadAuditLogs()
+            reloadAuditLogs(),
+            reloadPreflightCheck()
           ]);
         } catch (error) {
           setApiError(error instanceof Error ? error.message : "审批任务处理失败");
@@ -2050,6 +2509,7 @@ export function App() {
   };
 
   const handleCreateProject = async () => {
+    if (savingProject) return;
     if (projectCreateMode !== "manual" && !projectImportDraft) {
       Modal.warning({ title: projectCreateMode === "file" ? "请先上传招标文件并完成识别" : "请先完成导入识别" });
       return;
@@ -2066,12 +2526,36 @@ export function App() {
           project: projectImportDraft.project,
           sections: projectImportDraft.sections,
           auto_parse: true,
-          auto_generate_matrix: true
+          auto_generate_matrix: true,
+          async_processing: true
         });
-        appendLog(`导入创建项目：${result.project.name}`);
+        appendLog(
+          result.parse_task_id
+            ? `导入创建项目：${result.project.name}，后台解析任务 ${result.parse_task_id.slice(0, 8)} 已启动`
+            : `导入创建项目：${result.project.name}`
+        );
+        if (result.parse_task_id || result.matrix_task_id) {
+          setImportProcessing({
+            projectId: result.project.id,
+            sectionId: result.section_id,
+            parseTaskId: result.parse_task_id,
+            matrixTaskId: result.matrix_task_id,
+            parseTask: null,
+            matrixTask: null
+          });
+        }
         setNewProjectOpen(false);
         await activateProjectWorkspace(result.project.id, result.section_id);
-        await reloadAuditLogs();
+        Modal.info({
+          title: "项目已创建",
+          content: result.parse_task_id
+            ? "文件解析和合规矩阵生成已转入后台处理。工作台顶部会持续显示后台任务状态，完成后自动刷新。"
+            : "项目已创建完成。"
+        });
+        window.setTimeout(() => {
+          activateProjectWorkspace(result.project.id, result.section_id).catch(() => undefined);
+          reloadAuditLogs().catch(() => undefined);
+        }, 1800);
         return;
       }
 
@@ -2223,6 +2707,7 @@ export function App() {
     setRevisionDrawerOpen(true);
     setRevisionDocument(document);
     setRevisionReason("");
+    setRevisionSearch("");
     setLoadingRevisionChunks(true);
     try {
       const chunks = await listDocumentChunks(
@@ -2884,50 +3369,88 @@ export function App() {
             </section>
           </Content>
         ) : (
-          <Layout className="workspace-layout">
-            <aside className="project-nav">
+          <Layout className={projectNavCollapsed ? "workspace-layout project-nav-collapsed" : "workspace-layout"}>
+            <aside className={projectNavCollapsed ? "project-nav collapsed" : "project-nav"}>
               <div className="pane-title-row">
-                <Text strong>项目导航</Text>
-                <Tooltip title="新建项目">
-                  <Button type="text" size="small" icon={<PlusOutlined />} onClick={() => openCreateProjectModal("manual")} />
-                </Tooltip>
+                {!projectNavCollapsed && <Text strong>项目导航</Text>}
+                <Space size={4}>
+                  <Tooltip title={projectNavCollapsed ? "展开项目导航" : "收起项目导航"}>
+                    <Button
+                      type="text"
+                      size="small"
+                      aria-label={projectNavCollapsed ? "展开项目导航" : "收起项目导航"}
+                      icon={projectNavCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                      onClick={() => setProjectNavCollapsed((value) => !value)}
+                    />
+                  </Tooltip>
+                  {!projectNavCollapsed && (
+                    <Tooltip title="新建项目">
+                      <Button
+                        type="text"
+                        size="small"
+                        aria-label="新建项目"
+                        icon={<PlusOutlined />}
+                        onClick={() => openCreateProjectModal("manual")}
+                      />
+                    </Tooltip>
+                  )}
+                </Space>
               </div>
-              <div className="todo-summary">
-                <div>
-                  <Text strong>全局待办</Text>
-                  <p>
-                    {homeTodoRows.length
-                      ? `${homeTodoRows.length} 项待办；${matrixRows.filter((row) => row.riskCode === "high").length} 条高风险缺项。`
-                      : "当前项目暂无待办。"}
-                  </p>
+              {projectNavCollapsed ? (
+                <div className="project-nav-rail">
+                  <Tooltip title="新建项目">
+                    <Button
+                      type="text"
+                      size="small"
+                      aria-label="新建项目"
+                      icon={<PlusOutlined />}
+                      onClick={() => openCreateProjectModal("manual")}
+                    />
+                  </Tooltip>
+                  <Tooltip title="项目导航已收起">
+                    <FolderOpenOutlined />
+                  </Tooltip>
                 </div>
-                <Button size="small" onClick={() => locateMatrixRow(matrixRows[0]?.key)} disabled={!matrixRows.length}>
-                  查看
-                </Button>
-              </div>
-              <Spin spinning={loadingWorkspace}>
-                <Tree
-                  showIcon
-                  defaultExpandAll
-                  selectedKeys={[selectedSectionId ? `section:${selectedSectionId}` : selectedProjectId ? `project:${selectedProjectId}` : ""]}
-                  treeData={projectTreeData}
-                  onSelect={(keys) => {
-                    const key = keys[0] ? String(keys[0]) : "";
-                    const [scope, id] = key.split(":");
-                    if (scope === "project" && id) {
-                      setSelectedProjectId(id);
-                      setSelectedSectionId(undefined);
-                      setSelectedTreeKey("");
-                      return;
-                    }
-                    if (scope === "section" && id) {
-                      setSelectedSectionId(id);
-                      setSelectedTreeKey(`section:${id}:${recommendedStep?.key ?? "documents"}`);
-                      setActiveTab(recommendedStep?.key ?? "documents");
-                    }
-                  }}
-                />
-              </Spin>
+              ) : (
+                <>
+                  <div className="todo-summary">
+                    <div>
+                      <Text strong>全局待办</Text>
+                      <p>
+                        {homeTodoRows.length
+                          ? `${homeTodoRows.length} 项待办；${matrixRows.filter((row) => row.riskCode === "high").length} 条高风险缺项。`
+                          : "当前项目暂无待办。"}
+                      </p>
+                    </div>
+                    <Button size="small" onClick={() => locateMatrixRow(matrixRows[0]?.key)} disabled={!matrixRows.length}>
+                      查看
+                    </Button>
+                  </div>
+                  <Spin spinning={loadingWorkspace}>
+                    <Tree
+                      showIcon
+                      defaultExpandAll
+                      selectedKeys={[selectedSectionId ? `section:${selectedSectionId}` : selectedProjectId ? `project:${selectedProjectId}` : ""]}
+                      treeData={projectTreeData}
+                      onSelect={(keys) => {
+                        const key = keys[0] ? String(keys[0]) : "";
+                        const [scope, id] = key.split(":");
+                        if (scope === "project" && id) {
+                          setSelectedProjectId(id);
+                          setSelectedSectionId(undefined);
+                          setSelectedTreeKey("");
+                          return;
+                        }
+                        if (scope === "section" && id) {
+                          setSelectedSectionId(id);
+                          setSelectedTreeKey(`section:${id}:${recommendedStep?.key ?? "documents"}`);
+                          setActiveTab(recommendedStep?.key ?? "documents");
+                        }
+                      }}
+                    />
+                  </Spin>
+                </>
+              )}
             </aside>
 
             <Content className="work-area">
@@ -2951,41 +3474,168 @@ export function App() {
                 </Space>
               </section>
 
+              {importProcessingVisible && importProcessing && (
+                <section className="background-task-panel">
+                  <Alert
+                    showIcon
+                    type={importProcessingFailed ? "error" : importProcessingDone ? "success" : "info"}
+                    message={importProcessingDone ? "后台处理已完成" : "后台正在处理导入项目"}
+                    description={
+                      importProcessingFailed
+                        ? "解析或矩阵生成失败，请查看下方任务状态后重新解析或重新生成矩阵。"
+                        : importProcessingDone
+                          ? "文件解析和合规矩阵已刷新，可继续处理风险、证据和确认项。"
+                          : "项目已创建成功，文件解析和合规矩阵生成正在后台执行，请勿重复创建项目。"
+                    }
+                  />
+                  <div className="background-task-grid">
+                    {importProcessing.parseTaskId && (
+                      <div className="background-task-card">
+                        <div className="background-task-title">
+                          <Text strong>文件解析</Text>
+                          <Tag color={asyncTaskStatusColors[importProcessing.parseTask?.status ?? "pending"]}>
+                            {asyncTaskStatusLabels[importProcessing.parseTask?.status ?? "pending"] ?? "处理中"}
+                          </Tag>
+                        </div>
+                        <Progress
+                          percent={asyncTaskProgress(importProcessing.parseTask, importProcessing.parseTaskId)}
+                          size="small"
+                          status={importProcessing.parseTask?.status === "failed" ? "exception" : undefined}
+                        />
+                        <Text type="secondary">
+                          {importProcessing.parseTask?.error_message ??
+                            (parseTaskActive ? "正在读取文件并切分条款..." : "解析版本已生成。")}
+                        </Text>
+                      </div>
+                    )}
+                    {importProcessing.matrixTaskId && (
+                      <div className="background-task-card">
+                        <div className="background-task-title">
+                          <Text strong>合规矩阵</Text>
+                          <Tag color={asyncTaskStatusColors[importProcessing.matrixTask?.status ?? "pending"]}>
+                            {asyncTaskStatusLabels[importProcessing.matrixTask?.status ?? "pending"] ?? "处理中"}
+                          </Tag>
+                        </div>
+                        <Progress
+                          percent={asyncTaskProgress(importProcessing.matrixTask, importProcessing.matrixTaskId)}
+                          size="small"
+                          status={importProcessing.matrixTask?.status === "failed" ? "exception" : undefined}
+                        />
+                        <Text type="secondary">
+                          {importProcessing.matrixTask?.error_message ??
+                            (matrixTaskActive ? "正在抽取资格项、强制响应项和风险点..." : "矩阵已生成并刷新。")}
+                        </Text>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
+
               <section className="workflow-guide">
-                <div className="workflow-steps">
-                  {workflowSteps.map((step, index) => (
-                    <button
-                      key={step.key}
-                      className={[
-                        "workflow-step",
-                        step.key === activeTab ? "active" : "",
-                        step.key === recommendedStep?.key ? "recommended" : ""
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                      onClick={() => activateWorkflowStep(step.key)}
-                    >
-                      <span className="workflow-index">{index + 1}</span>
-                      <span className="workflow-copy">
-                        <strong>{step.title}</strong>
-                        <small>{step.description}</small>
-                      </span>
-                      <Tag color={workflowStatusColor(step.status)}>{step.statusText}</Tag>
-                    </button>
-                  ))}
-                </div>
-                {recommendedStep && (
-                  <div className="next-action-card">
-                    <div>
-                      <Text strong>下一步：{recommendedStep.title}</Text>
-                      <p>{recommendedStep.reason}</p>
-                    </div>
-                    <Button type="primary" onClick={() => runWorkflowPrimaryAction(recommendedStep.key)}>
-                      {recommendedStep.actionText}
+	                <div className="workflow-steps">
+	                  {workflowSteps.map((step, index) => (
+	                    <Tooltip key={step.key} title={step.disabled ? step.disabledReason : step.reason}>
+	                      <button
+	                        className={[
+	                          "workflow-step",
+	                          step.key === activeTab ? "active" : "",
+	                          step.key === recommendedStep?.key ? "recommended" : "",
+	                          step.disabled ? "disabled" : ""
+	                        ]
+	                          .filter(Boolean)
+	                          .join(" ")}
+	                        disabled={step.disabled}
+	                        onClick={() => activateWorkflowStep(step.key)}
+	                      >
+	                        <span className="workflow-index">{index + 1}</span>
+	                        <strong>{step.title}</strong>
+	                        {step.disabled ? (
+	                          <Tag>待前置</Tag>
+	                        ) : step.key === recommendedStep?.key ? (
+	                          <Tag color={workflowStatusColor(step.status)}>下一步</Tag>
+	                        ) : null}
+	                      </button>
+	                    </Tooltip>
+	                  ))}
+	                </div>
+	                {recommendedStep && (
+	                  <div className="next-action-card">
+	                    <div className="next-action-copy">
+	                      <Text strong>下一步：{recommendedStep.title}</Text>
+	                      <Text type="secondary">{recommendedStep.reason}</Text>
+	                    </div>
+	                    <Button type="primary" onClick={() => runWorkflowPrimaryAction(recommendedStep.key)}>
+	                      {recommendedStep.actionText}
                     </Button>
                   </div>
                 )}
               </section>
+
+              {preflightCheck && (
+                <section className="preflight-panel">
+                  <div className="preflight-header">
+                    <Space wrap>
+                      <Text strong>提交前核验</Text>
+                      <Tag color={preflightColor(preflightCheck.status)}>{preflightLabel(preflightCheck.status)}</Tag>
+                      {preflightCheck.matrix_outdated && <Tag color="red">矩阵已过期</Tag>}
+	                    </Space>
+	                    <Text type="secondary">
+	                      {visiblePreflightChecks.some((item) => item.status !== "pass")
+	                        ? "优先展示阻塞和待复核项；已通过项已收起。"
+	                        : preflightCheck.summary}
+	                    </Text>
+	                  </div>
+	                  <div className="preflight-checks">
+	                    {visiblePreflightChecks.map((item) => (
+	                      <button
+	                        key={item.code}
+	                        className={`preflight-check ${item.status}`}
+	                        onClick={() => item.target && activateWorkflowStep(item.target as WorkflowStepKey)}
+	                      >
+	                        <Tag color={preflightColor(item.status)}>{item.title}</Tag>
+	                        <strong>{item.status === "pass" ? "已通过" : item.count}</strong>
+	                        <span>{item.message}</span>
+	                      </button>
+	                    ))}
+                  </div>
+                </section>
+              )}
+
+              {currentProject && currentSection && (
+                <section className="key-info-panel">
+                  <div className="key-info-header">
+                    <Space wrap>
+                      <Text strong>项目关键信息</Text>
+                      {missingKeyInfo.length ? (
+                        <Tag color="orange">缺失 {missingKeyInfo.join("、")}</Tag>
+                      ) : (
+                        <Tag color="green">关键字段已填写</Tag>
+                      )}
+                    </Space>
+                    <Button size="small" onClick={openKeyInfoModal}>
+                      编辑/确认
+                    </Button>
+                  </div>
+                  <div className="key-info-grid">
+                    <div>
+                      <Text type="secondary">招标人</Text>
+                      <strong>{currentProject.purchaser || "未填写"}</strong>
+                    </div>
+                    <div>
+                      <Text type="secondary">预算/限价</Text>
+                      <strong>{currentSection.budget_amount || currentProject.budget_amount || "未填写"}</strong>
+                    </div>
+                    <div>
+                      <Text type="secondary">投标截止</Text>
+                      <strong>{formatDateTime(currentSection.bid_deadline_at ?? currentProject.bid_deadline_at)}</strong>
+                    </div>
+                    <div>
+                      <Text type="secondary">地区/行业</Text>
+                      <strong>{[currentProject.region_code, currentProject.industry_code].filter(Boolean).join(" / ") || "未填写"}</strong>
+                    </div>
+                  </div>
+                </section>
+              )}
 
               <section className="status-grid">
                 <div className="metric-item">
@@ -3036,8 +3686,7 @@ export function App() {
                 activeKey={activeTab}
                 renderTabBar={() => <></>}
                 onChange={(key) => {
-                  setActiveTab(key);
-                  setWorkspaceNode(key);
+                  activateWorkflowStep(key as WorkflowStepKey);
                 }}
                 items={[
                   {
@@ -3059,7 +3708,7 @@ export function App() {
                           <Input
                             className="public-url-input"
                             prefix={<LinkOutlined />}
-                            placeholder="公开附件链接，例如公共资源交易平台文件地址"
+                            placeholder="公开附件链接（外部内容按非可信输入处理）"
                             value={publicUrl}
                             onChange={(event) => setPublicUrl(event.target.value)}
                           />
@@ -3428,6 +4077,12 @@ export function App() {
                               ]}
                               className="toolbar-select"
                             />
+                            <Switch
+                              checked={prioritySortEnabled}
+                              onChange={setPrioritySortEnabled}
+                              checkedChildren="推荐处理"
+                              unCheckedChildren="原顺序"
+                            />
                           </Space>
                           <Space wrap>
                             <Button icon={<RobotOutlined />} loading={loadingMatrix} onClick={() => handleGenerateMatrix()}>
@@ -3449,6 +4104,20 @@ export function App() {
                             </Tooltip>
                           </Space>
                         </div>
+                        {preflightCheck?.matrix_outdated && (
+                          <Alert
+                            className="matrix-completion-alert"
+                            type="error"
+                            showIcon
+                            message="矩阵已过期，建议基于最新解析版本重新生成"
+                            description={`当前最新解析版本：${preflightCheck.latest_document_version_label ?? "未识别"}；矩阵使用版本：${preflightCheck.matrix_version_labels.join("、") || "未生成"}`}
+                            action={
+                              <Button size="small" type="primary" onClick={() => handleGenerateMatrix()}>
+                                重新生成矩阵
+                              </Button>
+                            }
+                          />
+                        )}
                         {isMatrixComplete && (
                           <Alert
                             className="matrix-completion-alert"
@@ -3481,7 +4150,7 @@ export function App() {
                           }}
                           rowClassName={(record) => (record.key === highlightedRowKey ? "highlighted-row" : "")}
                           scroll={{ x: 1840 }}
-                          dataSource={filteredMatrixRows}
+                          dataSource={displayedMatrixRows}
                           locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无合规矩阵项" /> }}
                           columns={[
                             {
@@ -3518,6 +4187,19 @@ export function App() {
                               dataIndex: "chapter",
                               width: 120,
                               sorter: (a, b) => a.chapter.localeCompare(b.chapter)
+                            },
+                            {
+                              title: "推荐处理",
+                              dataIndex: ["raw", "priority_label"],
+                              width: 150,
+                              sorter: (a, b) => a.raw.priority_rank - b.raw.priority_rank,
+                              render: (_: unknown, record) => (
+                                <Tooltip title={record.raw.priority_reason}>
+                                  <Tag color={record.raw.priority_rank <= 1 ? "red" : record.raw.priority_rank === 2 ? "blue" : "default"}>
+                                    {record.raw.priority_label}
+                                  </Tag>
+                                </Tooltip>
+                              )
                             },
                             {
                               title: "强制项",
@@ -3781,6 +4463,15 @@ export function App() {
                                   </Tag>
                                 </Space>
                               </div>
+                              {selectedDraftChapter.fact_checks.some((check) => check.check_status !== "verified") && (
+                                <Alert
+                                  type="warning"
+                                  showIcon
+                                  className="draft-fact-alert"
+                                  message="草稿存在待确认事实"
+                                  description={`无法验证 ${selectedDraftChapter.fact_checks.filter((check) => check.check_status === "unverified").length} 项，风险提示 ${selectedDraftChapter.fact_checks.filter((check) => check.check_status === "warning").length} 项。导出前请人工复核。`}
+                                />
+                              )}
                               <TextArea
                                 value={draftEditorValue}
                                 onChange={(event) => setDraftEditorValue(event.target.value)}
@@ -3843,6 +4534,15 @@ export function App() {
                                 <p>
                                   {task.description ?? "等待责任人处理"}；创建时间：{formatDateTime(task.created_at)}
                                 </p>
+                                {blockingSummary(task.evidence_snapshot_json).length > 0 && (
+                                  <div className="approval-blockers">
+                                    {blockingSummary(task.evidence_snapshot_json).slice(0, 3).map((item) => (
+                                      <Tag key={`${task.id}-${String(item.code)}`} color={preflightColor(String(item.status))}>
+                                        {String(item.title)}：{String(item.message)}
+                                      </Tag>
+                                    ))}
+                                  </div>
+                                )}
                               </div>
                               <Space>
                                 <Button
@@ -3991,17 +4691,29 @@ export function App() {
         title="新建投标项目"
         open={newProjectOpen}
         width={760}
-        okText={projectCreateMode === "manual" ? "创建项目" : "确认导入并创建"}
+        okText={savingProject ? "创建中..." : projectCreateMode === "manual" ? "创建项目" : "确认导入并创建"}
         cancelText="取消"
         confirmLoading={savingProject}
-        okButtonProps={{ disabled: projectCreateMode !== "manual" && !projectImportDraft }}
+        okButtonProps={{ disabled: savingProject || importingProjectDraft || (projectCreateMode !== "manual" && !projectImportDraft) }}
         onOk={handleCreateProject}
-        onCancel={() => setNewProjectOpen(false)}
+        onCancel={() => {
+          if (!savingProject) setNewProjectOpen(false);
+        }}
       >
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          {savingProject && projectCreateMode !== "manual" && (
+            <Alert
+              type="info"
+              showIcon
+              message="正在创建项目"
+              description="请勿重复点击。项目创建成功后会自动进入工作台，文件解析和矩阵生成将在后台继续处理。"
+            />
+          )}
           <Tabs
             activeKey={projectCreateMode}
+            tabBarExtraContent={savingProject ? <Tag color="processing">创建中</Tag> : null}
             onChange={(key) => {
+              if (savingProject) return;
               setProjectCreateMode(key as ProjectCreateMode);
               setProjectImportDraft(null);
             }}
@@ -4020,14 +4732,15 @@ export function App() {
                       maxCount={1}
                       showUploadList={false}
                       accept=".doc,.docx,.pdf,.html,.htm"
+                      disabled={savingProject}
                       beforeUpload={handleImportDraftFile}
                     >
-                      <Button type="primary" icon={<CloudUploadOutlined />} loading={importingProjectDraft}>
+                      <Button type="primary" icon={<CloudUploadOutlined />} loading={importingProjectDraft} disabled={savingProject}>
                         导入招标文件
                       </Button>
                     </Upload>
                     <Text type="secondary">
-                      支持 Word、可复制 PDF 和网页 HTML。上传后自动识别项目、标段、预算和截止时间。
+                      支持 Word、可复制 PDF 和网页 HTML。外部文件按非可信输入处理，识别结果必须人工确认。
                     </Text>
                   </Space>
                 )
@@ -4039,13 +4752,15 @@ export function App() {
                   <Space direction="vertical" size={10} style={{ width: "100%" }}>
                     <Space.Compact style={{ width: "100%" }}>
                       <Input
-                        placeholder="公告网页或附件 URL"
+                        placeholder="公告网页或附件 URL（按非可信输入处理）"
                         value={importUrl}
+                        disabled={savingProject}
                         onChange={(event) => setImportUrl(event.target.value)}
                       />
                       <Input
                         placeholder="资源站点"
                         value={importUrlSite}
+                        disabled={savingProject}
                         onChange={(event) => setImportUrlSite(event.target.value)}
                         style={{ width: 160 }}
                       />
@@ -4053,6 +4768,7 @@ export function App() {
                         type="primary"
                         icon={<LinkOutlined />}
                         loading={importingProjectDraft}
+                        disabled={savingProject}
                         onClick={handleImportDraftUrl}
                       >
                         识别
@@ -4190,6 +4906,114 @@ export function App() {
               />
             </>
           )}
+        </Space>
+      </Modal>
+      <Modal
+        title="项目关键信息"
+        open={keyInfoModalOpen}
+        width={760}
+        okText="保存并确认"
+        cancelText="取消"
+        confirmLoading={savingProject}
+        onOk={handleSaveKeyInfo}
+        onCancel={() => setKeyInfoModalOpen(false)}
+      >
+        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          <Alert
+            type={missingKeyInfo.length ? "warning" : "info"}
+            showIcon
+            message={missingKeyInfo.length ? `仍缺少：${missingKeyInfo.join("、")}` : "关键字段已填写"}
+            description="这些字段会进入提交前核验、审批说明和导出复盘。复杂的保证金、工期、质量标准等字段暂由合规矩阵承载。"
+          />
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              placeholder="项目名称"
+              value={keyInfoDraft.projectName}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, projectName: event.target.value }))}
+            />
+            <Input
+              placeholder="标段名称"
+              value={keyInfoDraft.sectionName}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, sectionName: event.target.value }))}
+            />
+          </Space.Compact>
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              placeholder="招标人/采购人"
+              value={keyInfoDraft.purchaser}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, purchaser: event.target.value }))}
+            />
+            <Input
+              placeholder="代理机构"
+              value={keyInfoDraft.agency}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, agency: event.target.value }))}
+            />
+          </Space.Compact>
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              placeholder="项目预算/限价"
+              value={keyInfoDraft.budgetAmount}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, budgetAmount: event.target.value }))}
+            />
+            <Input
+              placeholder="标段预算/限价"
+              value={keyInfoDraft.sectionBudgetAmount}
+              onChange={(event) =>
+                setKeyInfoDraft((draft) => ({ ...draft, sectionBudgetAmount: event.target.value }))
+              }
+            />
+          </Space.Compact>
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              placeholder="地区编码"
+              value={keyInfoDraft.regionCode}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, regionCode: event.target.value }))}
+            />
+            <Input
+              placeholder="行业编码"
+              value={keyInfoDraft.industryCode}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, industryCode: event.target.value }))}
+            />
+            <Input
+              placeholder="标段编号"
+              value={keyInfoDraft.sectionCode}
+              onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, sectionCode: event.target.value }))}
+            />
+          </Space.Compact>
+          <Input
+            placeholder="公告链接"
+            value={keyInfoDraft.noticeUrl}
+            onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, noticeUrl: event.target.value }))}
+          />
+          <Space.Compact style={{ width: "100%" }}>
+            <DatePicker
+              showTime
+              style={{ width: "50%" }}
+              placeholder="项目投标截止时间"
+              value={keyInfoDraft.bidDeadlineAt ? dayjs(keyInfoDraft.bidDeadlineAt) : null}
+              onChange={(value) =>
+                setKeyInfoDraft((draft) => ({ ...draft, bidDeadlineAt: value ? value.toISOString() : null }))
+              }
+            />
+            <DatePicker
+              showTime
+              style={{ width: "50%" }}
+              placeholder="标段投标截止时间"
+              value={keyInfoDraft.sectionBidDeadlineAt ? dayjs(keyInfoDraft.sectionBidDeadlineAt) : null}
+              onChange={(value) =>
+                setKeyInfoDraft((draft) => ({
+                  ...draft,
+                  sectionBidDeadlineAt: value ? value.toISOString() : null
+                }))
+              }
+            />
+          </Space.Compact>
+          <TextArea
+            placeholder="修改/确认原因"
+            value={keyInfoDraft.reason}
+            autoSize={{ minRows: 2, maxRows: 4 }}
+            onChange={(event) => setKeyInfoDraft((draft) => ({ ...draft, reason: event.target.value }))}
+          />
         </Space>
       </Modal>
       <Modal
@@ -4361,6 +5185,7 @@ export function App() {
           setRevisionDocument(null);
           setRevisionChunks([]);
           setRevisionReason("");
+          setRevisionSearch("");
         }}
         extra={
           <Space>
@@ -4387,13 +5212,19 @@ export function App() {
               showIcon
               message="发布后会生成新的解析版本，不会自动覆盖合规矩阵；需要在文件列表中手动重新生成矩阵。"
             />
+            <Input
+              prefix={<SearchOutlined />}
+              placeholder="搜索解析分块、章节路径或页码，例如：资格、检测报告、P12"
+              value={revisionSearch}
+              onChange={(event) => setRevisionSearch(event.target.value)}
+            />
             <TextArea
               placeholder="修正原因，例如：人工补正 OCR 漏字和章节识别"
               value={revisionReason}
               autoSize={{ minRows: 2, maxRows: 4 }}
               onChange={(event) => setRevisionReason(event.target.value)}
             />
-            {revisionChunks.map((chunk) => (
+            {filteredRevisionChunks.map((chunk) => (
               <div className="revision-chunk" key={chunk.id}>
                 <Space.Compact style={{ width: "100%" }}>
                   <Input
@@ -4424,6 +5255,9 @@ export function App() {
                 )}
               </div>
             ))}
+            {!!revisionChunks.length && !filteredRevisionChunks.length && !loadingRevisionChunks && (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的解析分块" />
+            )}
             {!revisionChunks.length && !loadingRevisionChunks && (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前版本暂无解析分块" />
             )}
@@ -4545,6 +5379,21 @@ export function App() {
                     <Space direction="vertical" size={4}>
                       <Text className="evidence-snippet">{value ?? record.evidence_text ?? record.name}</Text>
                       <Text type="secondary">匹配度 {Math.round(record.confidence_score * 100)}%</Text>
+                      {record.recommend_reason && (
+                        <Text type="secondary" className="recommend-reason">
+                          推荐原因：{record.recommend_reason}
+                        </Text>
+                      )}
+                      {record.material_status_hint && <Tag>{record.material_status_hint}</Tag>}
+                      {record.matched_terms?.length ? (
+                        <Space size={4} wrap>
+                          {record.matched_terms.slice(0, 4).map((term) => (
+                            <Tag key={term} color="blue">
+                              {term}
+                            </Tag>
+                          ))}
+                        </Space>
+                      ) : null}
                     </Space>
                   )
                 },

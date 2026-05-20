@@ -50,6 +50,9 @@ class MaterialSearchHit:
     chunk: EnterpriseMaterialChunk | None
     snippet: str | None
     confidence_score: float
+    recommend_reason: str | None = None
+    matched_terms: list[str] | None = None
+    material_status_hint: str | None = None
 
 
 def search_terms(query: str) -> list[str]:
@@ -57,6 +60,11 @@ def search_terms(query: str) -> list[str]:
     terms = [item for item in re.split(r"\s+", normalized) if len(item) >= 2]
     terms.extend(keyword.lower() for keyword in SEARCH_KEYWORDS if keyword in query)
     return list(dict.fromkeys(terms))
+
+
+def matched_search_terms(query: str, text: str) -> list[str]:
+    haystack = text.lower()
+    return [term for term in search_terms(query) if term in haystack]
 
 
 def material_text(material: EnterpriseMaterial) -> str:
@@ -73,6 +81,65 @@ def material_text(material: EnterpriseMaterial) -> str:
         structured,
     ]
     return "\n".join(value for value in values if value)
+
+
+def material_status_hint(material: EnterpriseMaterial) -> str:
+    labels = {
+        "confirmed": "资料已确认，可作为优先候选证据",
+        "pending_confirm": "资料待确认，绑定前建议人工复核",
+        "draft": "资料仍为草稿，不能直接替代正式证明",
+        "expired": "资料已过期，不建议作为响应证据",
+        "conflict": "资料存在冲突，不建议作为响应证据",
+        "missing_evidence": "资料缺少原始佐证，需补充后再使用",
+    }
+    return labels.get(material.verification_status, f"资料状态：{material.verification_status}")
+
+
+def material_type_hint(material: EnterpriseMaterial, query: str) -> str | None:
+    query_text = query.lower()
+    type_labels = {
+        "license": "证照类资料",
+        "qualification": "资质类资料",
+        "personnel": "人员类资料",
+        "performance": "业绩类资料",
+        "business_template": "商务模板",
+        "commitment": "承诺材料",
+        "product_catalog": "产品目录",
+        "test_report": "检测报告",
+        "product_image": "产品图片",
+        "technical_proposal": "技术方案",
+    }
+    material_label = type_labels.get(material.material_type)
+    if not material_label:
+        return None
+    if material.material_type in {"license", "qualification"} and any(
+        term in query for term in ("营业执照", "资质", "许可证", "资格")
+    ):
+        return f"{material_label}与资格/证照要求匹配"
+    if material.material_type == "personnel" and any(term in query for term in ("项目经理", "人员", "建造师", "职称")):
+        return f"{material_label}与人员要求匹配"
+    if material.material_type == "performance" and any(term in query for term in ("业绩", "合同", "类似项目")):
+        return f"{material_label}与业绩要求匹配"
+    if material.material_type in {"product_catalog", "test_report", "technical_proposal"} and any(
+        term in query_text for term in ("技术", "设备", "洁净", "净化", "检测报告", "验收", "安装调试")
+    ):
+        return f"{material_label}与技术响应要求匹配"
+    return f"资料类型为{material_label}"
+
+
+def recommendation_reason(query: str, material: EnterpriseMaterial, content: str) -> tuple[str, list[str], str]:
+    terms = matched_search_terms(query, content)
+    status_hint = material_status_hint(material)
+    if terms:
+        keyword_text = "、".join(terms[:6])
+        reason = f"命中“{keyword_text}”等关键词"
+    else:
+        reason = "与当前要求存在语义相近内容"
+    type_hint = material_type_hint(material, query)
+    if type_hint:
+        reason = f"{reason}；{type_hint}"
+    reason = f"{reason}；{status_hint}"
+    return reason, terms, status_hint
 
 
 def pseudo_embedding(text: str) -> list[float]:
@@ -229,11 +296,15 @@ def search_material_hits(
             if material.verification_status == "confirmed":
                 score = min(0.99, score + 0.08)
             snippet = chunk.content_text[:220]
+            reason, matched_terms, status_hint = recommendation_reason(query, material, chunk.content_text)
             hit = MaterialSearchHit(
                 material=material,
                 chunk=chunk if chunks else None,
                 snippet=snippet,
                 confidence_score=round(score, 4),
+                recommend_reason=reason,
+                matched_terms=matched_terms,
+                material_status_hint=status_hint,
             )
             if best_hit is None or hit.confidence_score > best_hit.confidence_score:
                 best_hit = hit

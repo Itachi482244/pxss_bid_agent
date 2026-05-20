@@ -11,7 +11,7 @@ from alembic.config import Config
 from docx import Document as DocxDocument
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.config import settings
 from app.db.session import SessionLocal
@@ -72,6 +72,8 @@ def test_project_read_api_returns_seeded_workspace() -> None:
     seed_item = next(item for item in items if item["source_page_no"] == 12)
     assert seed_item["source_version_label"] == "v0.1"
     assert seed_item["owner_name"] == "演示管理员"
+    assert seed_item["priority_rank"] in {0, 1, 2, 3}
+    assert seed_item["priority_label"].startswith("P")
 
     audit_response = client.get(
         f"/api/v1/projects/{project_id}/audit-logs",
@@ -81,6 +83,117 @@ def test_project_read_api_returns_seeded_workspace() -> None:
     audit_logs = audit_response.json()
     assert len(audit_logs) >= 1
     assert any(item["action"] == "seed.dev_data_created" for item in audit_logs)
+
+
+def test_cleanroom_demo_sample_is_seeded_for_mvp1_hardening() -> None:
+    client = TestClient(app)
+
+    projects_response = client.get("/api/v1/projects", params={"limit": 200})
+    assert projects_response.status_code == 200
+    project = next(
+        item for item in projects_response.json() if item["name"] == "洁净车间净化设备采购与安装项目"
+    )
+    sections_response = client.get(f"/api/v1/projects/{project['id']}/sections")
+    assert sections_response.status_code == 200
+    section = sections_response.json()[0]
+
+    items_response = client.get(f"/api/v1/projects/{project['id']}/sections/{section['id']}/compliance-items")
+    assert items_response.status_code == 200
+    item_types = {item["item_type"] for item in items_response.json()}
+    assert {"qualification", "mandatory_response", "technical_response", "scoring", "deadline"}.issubset(item_types)
+
+    preflight_response = client.get(f"/api/v1/projects/{project['id']}/sections/{section['id']}/preflight-check")
+    assert preflight_response.status_code == 200
+    preflight = preflight_response.json()
+    assert preflight["status"] == "block"
+    assert preflight["mandatory_missing_evidence_count"] >= 1
+    assert preflight["technical_pending_count"] >= 1
+
+    search_response = client.get(
+        "/api/v1/enterprise/materials/search",
+        params={"query": "高效过滤器 检测报告 过滤效率 洁净等级", "limit": 50},
+    )
+    assert search_response.status_code == 200
+    results = search_response.json()
+    assert any(item["material_type"] == "test_report" and item["recommend_reason"] for item in results)
+
+
+def test_preflight_check_detects_outdated_matrix_version() -> None:
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+
+    initial_response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/preflight-check")
+    assert initial_response.status_code == 200
+
+    with SessionLocal() as db:
+        seed_matrix_item = db.scalar(
+            select(ComplianceItem).where(
+                ComplianceItem.project_id == UUID(project_id),
+                ComplianceItem.section_id == UUID(section_id),
+                ComplianceItem.normalized_requirement == "provide_valid_business_license",
+                ComplianceItem.deleted_at.is_(None),
+            )
+        )
+        assert seed_matrix_item is not None
+        document = db.get(Document, seed_matrix_item.source_document_id)
+        assert document is not None
+        assert document.current_version_id is not None
+        current = db.get(DocumentVersion, document.current_version_id)
+        assert current is not None
+        source_version = db.scalar(
+            select(DocumentVersion)
+            .join(DocumentChunk, DocumentChunk.document_version_id == DocumentVersion.id)
+            .where(DocumentVersion.document_id == document.id)
+            .order_by(DocumentVersion.version_no.asc())
+        )
+        assert source_version is not None
+        max_version_no = db.scalar(
+            select(func.max(DocumentVersion.version_no)).where(DocumentVersion.document_id == document.id)
+        ) or current.version_no
+        new_version = DocumentVersion(
+            tenant_id=document.tenant_id,
+            document_id=document.id,
+            version_no=max_version_no + 1,
+            version_label=f"v0.outdated-test-{max_version_no + 1}",
+            object_key=current.object_key,
+            sha256=current.sha256,
+            parse_status="succeeded",
+            parser_name="manual-editor",
+            parser_version="1.0",
+            created_by=document.created_by,
+            change_reason="测试矩阵过期提醒",
+        )
+        db.add(new_version)
+        db.flush()
+        chunks = db.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_version_id == source_version.id)
+        ).all()
+        for chunk in chunks:
+            db.add(
+                DocumentChunk(
+                    tenant_id=chunk.tenant_id,
+                    document_id=chunk.document_id,
+                    document_version_id=new_version.id,
+                    section_id=chunk.section_id,
+                    chunk_index=chunk.chunk_index,
+                    page_no=chunk.page_no,
+                    heading_path=chunk.heading_path,
+                    content_text=chunk.content_text,
+                    content_hash=chunk.content_hash,
+                    bbox_json=chunk.bbox_json,
+                    table_json=chunk.table_json,
+                )
+            )
+        document.current_version_id = new_version.id
+        db.commit()
+
+    response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/preflight-check")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "block"
+    assert payload["matrix_outdated"] is True
+    assert payload["outdated_item_count"] >= 1
+    assert any(item["code"] == "matrix_version" and item["status"] == "block" for item in payload["checks"])
 
 
 def test_project_read_api_enforces_tenant_context() -> None:
@@ -122,6 +235,56 @@ def test_create_project_and_section_api() -> None:
 
     sections = client.get(f"/api/v1/projects/{project['id']}/sections").json()
     assert len(sections) == 2
+
+
+def test_update_project_and_section_key_fields_writes_audit_log() -> None:
+    client = TestClient(app)
+    create_response = client.post(
+        "/api/v1/projects",
+        json={
+            "name": f"关键字段更新项目 {uuid4().hex}",
+            "section_name": "一标段：待更新",
+        },
+    )
+    assert create_response.status_code == 201
+    created_project = create_response.json()
+    project_id = created_project["id"]
+    sections = client.get(f"/api/v1/projects/{project_id}/sections").json()
+    section_id = sections[0]["id"]
+
+    project_response = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={
+            "purchaser": "更新后的采购人",
+            "budget_amount": "1880000.00",
+            "bid_deadline_at": "2026-01-08T09:30:00+08:00",
+            "reason": "测试更新项目关键信息",
+        },
+    )
+    assert project_response.status_code == 200
+    project = project_response.json()
+    assert project["purchaser"] == "更新后的采购人"
+    assert project["budget_amount"] == "1880000.00"
+
+    section_response = client.patch(
+        f"/api/v1/projects/{project_id}/sections/{section_id}",
+        json={
+            "code": "cleanroom-001",
+            "name": "更新后的标段",
+            "budget_amount": "988000.00",
+            "reason": "测试更新标段关键信息",
+        },
+    )
+    assert section_response.status_code == 200
+    section = section_response.json()
+    assert section["code"] == "cleanroom-001"
+    assert section["name"] == "更新后的标段"
+
+    audit_response = client.get(f"/api/v1/projects/{project_id}/audit-logs")
+    assert audit_response.status_code == 200
+    actions = [item["action"] for item in audit_response.json()]
+    assert "project.updated" in actions
+    assert "section.updated" in actions
 
 
 def test_delete_project_archives_and_hides_from_default_list() -> None:
@@ -226,6 +389,37 @@ def test_project_import_from_uploaded_document_creates_project_document_and_matr
     assert any("营业执照" in item["requirement_text"] for item in items)
 
 
+def test_project_import_confirm_accepts_async_processing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "llm_provider", "mock")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_name = f"异步导入文件项目 {uuid4().hex}"
+
+    draft_response = client.post(
+        "/api/v1/projects/import-drafts/upload",
+        files={
+            "file": (
+                f"{project_name}.docx",
+                build_import_docx_bytes(project_name),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert draft_response.status_code == 201
+    draft = draft_response.json()
+    draft["async_processing"] = True
+
+    confirm_response = client.post("/api/v1/projects/import-drafts/confirm", json=draft)
+    assert confirm_response.status_code == 201
+    result = confirm_response.json()
+    assert result["project"]["name"] == project_name
+    assert result["parse_task_id"]
+    assert result["matrix_task_id"]
+
+
 def test_project_import_from_public_url_html_creates_parsed_project(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -309,14 +503,14 @@ def create_api_test_compliance_item(
             )
         )
         assert document is not None
-        version = db.get(DocumentVersion, document.current_version_id)
-        assert version is not None
         chunk = db.scalar(
-            select(DocumentChunk).where(
-                DocumentChunk.document_version_id == version.id,
-            )
+            select(DocumentChunk)
+            .where(DocumentChunk.document_id == document.id)
+            .order_by(DocumentChunk.created_at.asc())
         )
         assert chunk is not None
+        version = db.get(DocumentVersion, chunk.document_version_id)
+        assert version is not None
         user = db.scalar(select(User).where(User.external_id == "demo-admin"))
         assert user is not None
         item = ComplianceItem(

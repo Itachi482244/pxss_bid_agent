@@ -116,6 +116,31 @@ REQUIREMENT_SIGNALS = (
     "标段划分",
     "CA",
 )
+TECHNICAL_SIGNALS = (
+    "技术要求",
+    "技术响应",
+    "技术参数",
+    "设备",
+    "型号",
+    "净化",
+    "洁净",
+    "洁净等级",
+    "风量",
+    "过滤",
+    "噪声",
+    "压差",
+    "材质",
+    "安装调试",
+    "调试",
+    "验收",
+    "售后",
+)
+STRUCTURAL_HEADING_RE = re.compile(
+    r"^(?:[一二三四五六七八九十]+[、.．]|[1-9]\d?(?:[.．]\d{1,2})*[.．、])\s*[^。；;]{2,40}[:：]?$"
+)
+LIST_MARKER_RE = re.compile(
+    r"(?<![\w./])(?:[（(]\d+[）)]|[1-9]\d?(?:[.．]\d{1,2})+[.．]?|[1-9]\d?[.．])"
+)
 
 
 class ComplianceGenerationError(Exception):
@@ -199,12 +224,14 @@ def _is_reference_info(text: str, heading_path: str | None) -> bool:
 def _is_pure_heading(text: str) -> bool:
     if any(mark in text for mark in ("：", ":", "；", ";", "，", ",", "。")):
         return False
-    return len(text) <= 28 and bool(PURE_HEADING_RE.match(text))
+    return len(text) <= 28 and (
+        bool(PURE_HEADING_RE.match(text)) or bool(STRUCTURAL_HEADING_RE.match(text))
+    )
 
 
 def _contextual_requirement_text(text: str, heading_path: str | None) -> str:
     leaf = _heading_leaf(heading_path)
-    if leaf and len(text) <= 20 and text not in leaf:
+    if leaf and len(text) <= 20 and text not in leaf and not STRUCTURAL_HEADING_RE.match(leaf):
         return f"{leaf.rstrip(':：')}：{text}"
     return text
 
@@ -212,6 +239,21 @@ def _contextual_requirement_text(text: str, heading_path: str | None) -> str:
 def _normalized_key(text: str) -> str:
     cleaned = re.sub(r"\s+", "", text.lower())
     return "auto:" + hashlib.sha1(cleaned.encode("utf-8")).hexdigest()
+
+
+def _semantic_key(text: str, item_type: str) -> str:
+    if item_type == "deadline":
+        date_match = re.search(
+            r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2})?\s*[点:：时]?\s*(\d{1,2})?",
+            text,
+        )
+        if date_match:
+            year, month, day, hour, minute = date_match.groups()
+            return f"auto:deadline:{year}-{int(month):02d}-{int(day):02d}-{int(hour or 0):02d}-{int(minute or 0):02d}"
+    if item_type == "format" and "下载招标文件" in text:
+        return "auto:format:download-tender-file"
+    cleaned = re.sub(r"^[（(]?\d+(?:[.．]\d+)*[）).．、]?\s*", "", text)
+    return _normalized_key(cleaned)
 
 
 def _confidence(value: float) -> Decimal:
@@ -453,44 +495,21 @@ def _call_llm(
 
 
 def _rule_item_type(text: str, heading_path: str | None) -> str:
-    combined = f"{heading_path or ''} {text}"
+    heading_leaf = _heading_leaf(heading_path) or ""
+    qualification_context = "资格" in heading_leaf and len(heading_leaf) <= 40
+    technical_context = any(signal in heading_leaf for signal in ("技术要求", "技术响应", "技术参数", "采购需求"))
     if _is_reference_info(text, heading_path):
         return "reference_info"
-    if any(keyword in combined for keyword in ("评标办法", "综合评估法")):
+    if any(keyword in text for keyword in ("评标办法", "综合评估法")):
         return "scoring"
-    if any(
-        keyword in combined
-        for keyword in (
-            "技术要求",
-            "技术响应",
-            "技术参数",
-            "设备",
-            "型号",
-            "净化",
-            "洁净",
-            "洁净等级",
-            "风量",
-            "过滤",
-            "噪声",
-            "压差",
-            "材质",
-            "安装调试",
-            "调试",
-            "验收",
-            "售后",
-        )
-    ):
-        return "technical_response"
-    if any(keyword in combined for keyword in ("截止时间", "开标时间", "解密", "递交")):
+    if any(keyword in text for keyword in ("截止时间", "开标时间", "解密", "递交")):
         return "deadline"
-    if ("请于" in combined and "至" in combined) or re.search(
-        r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", combined
+    if ("请于" in text and "至" in text) or re.search(
+        r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", text
     ):
         return "deadline"
-    if any(keyword in combined for keyword in ("电子", "CA", "格式", "制作工具", "下载")):
-        return "format"
     if any(
-        keyword in combined
+        keyword in text
         for keyword in (
             "资格",
             "资质",
@@ -506,9 +525,118 @@ def _rule_item_type(text: str, heading_path: str | None) -> str:
             "资格后审",
             "牵头人单位",
         )
-    ):
+    ) or qualification_context:
         return "qualification"
+    if any(keyword in text for keyword in ("电子", "CA", "格式", "制作工具", "下载", "公共资源交易平台")):
+        return "format"
+    if any(keyword in text for keyword in TECHNICAL_SIGNALS) or technical_context:
+        return "technical_response"
     return "mandatory_response"
+
+
+def _should_skip_rule_text(text: str, heading_path: str | None) -> bool:
+    heading_leaf = _heading_leaf(heading_path)
+    if heading_leaf and text == heading_leaf:
+        return True
+    if _is_contact_text(text, heading_path):
+        return True
+    if _is_pure_heading(text):
+        return True
+    if STRUCTURAL_HEADING_RE.match(text):
+        return True
+    if text.endswith(("：", ":")) and "类似工程业绩要求" in text:
+        return True
+    if text.endswith(("：", ":")) and not any(signal in text for signal in REQUIREMENT_SIGNALS):
+        return True
+    if text == "不要求" and "类似工程业绩要求" not in (heading_path or ""):
+        return True
+    if "由招标人根据招标项目具体情况" in text:
+        return True
+    if re.match(r"^(项目编号|项目名称|预算金额|售价|方式)[:：]", text):
+        return True
+    if "其他落实政府采购政策的资格要求" in text and "无" in text and len(text) <= 40:
+        return True
+    if text.startswith(("名 称：", "地 址：", "电 话：", "项目联系人：", "来源：")):
+        return True
+    if "【打印】" in text or "【显示公告概要】" in text:
+        return True
+    return False
+
+
+def _split_by_markers(text: str) -> list[str]:
+    matches = list(LIST_MARKER_RE.finditer(text))
+    if len(matches) <= 1:
+        return [text]
+    parts: list[str] = []
+    prefix = text[: matches[0].start()].strip()
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        part = text[start:end].strip()
+        if prefix and not re.match(r"^[（(]?\d+", prefix):
+            part = f"{prefix.rstrip(':：')}：{part}"
+        parts.append(part)
+    return [part for part in parts if part]
+
+
+def _split_qualification_series(text: str) -> list[str]:
+    if "资质" not in text or "须具备" not in text:
+        return [text]
+
+    project_manager_split = re.split(r"[；;]\s*|[（(]2[）)]", text, maxsplit=1)
+    supplier_text = project_manager_split[0].strip()
+    tail_parts = [part.strip() for part in project_manager_split[1:] if part.strip()]
+
+    requirements: list[str] = []
+    prefix_match = re.search(r"(?:供应商|投标人)[^，；;]*须具备", supplier_text)
+    prefix = prefix_match.group(0) if prefix_match else "供应商须具备"
+    for material in re.split(r"[、，,]\s*", supplier_text):
+        material = material.strip(" ；;。")
+        if not material:
+            continue
+        if "资质" in material and material != prefix:
+            cleaned = re.sub(r"^.*?须具备", "", material).strip()
+            cleaned = re.sub(r"且具备有效的?安全生产许可证", "", cleaned).strip(" 、，,；;。")
+            requirements.append(f"{prefix}{cleaned}。")
+        if "安全生产许可证" in material:
+            requirements.append("供应商须具备有效的安全生产许可证。")
+
+    for tail in tail_parts:
+        if "项目经理" in tail and "建造师" in tail:
+            requirements.append(f"供应商拟派项目经理须具备{re.sub(r'^供应商拟派项目经理须具备', '', tail).strip(' 。；;')}。")
+        else:
+            requirements.append(tail if tail.endswith("。") else f"{tail}。")
+
+    return requirements or [text]
+
+
+def _split_project_overview(text: str) -> list[str]:
+    if "获取招标文件" not in text or "前递交投标文件" not in text:
+        return [text]
+
+    requirements: list[str] = []
+    download_match = re.search(r"潜在投标人应在(?P<download>.+?)获取招标文件", text)
+    if download_match:
+        requirements.append(f"潜在投标人应在{download_match.group('download').strip()}获取招标文件。")
+
+    deadline_match = re.search(
+        r"并于(?P<deadline>\d{4}年\d{2}月\d{2}日\s*\d{2}点\d{2}分（北京时间）)前递交投标文件",
+        text,
+    )
+    if deadline_match:
+        requirements.append(f"投标文件递交截止时间为{deadline_match.group('deadline')}。")
+
+    return requirements or [text]
+
+
+def _atomic_requirement_texts(text: str) -> list[str]:
+    overview_parts = _split_project_overview(text)
+    atomic: list[str] = []
+    for overview_part in overview_parts:
+        marker_parts = _split_by_markers(overview_part)
+        for part in marker_parts:
+            atomic.extend(_split_qualification_series(part))
+    return [item.strip() for item in atomic if item.strip()]
 
 
 def _risk_level(item_type: str, text: str) -> str:
@@ -589,80 +717,76 @@ def _rule_extract(chunks: list[DocumentChunk]) -> list[ComplianceCandidate]:
     candidates: list[ComplianceCandidate] = []
     seen: set[str] = set()
     for chunk in chunks:
-        text = _clean_requirement_text(chunk.content_text)
+        original_text = _clean_requirement_text(chunk.content_text)
         is_similar_performance_not_required = (
-            text == "不要求" and "类似工程业绩要求" in (chunk.heading_path or "")
+            original_text == "不要求" and "类似工程业绩要求" in (chunk.heading_path or "")
         )
-        if not text or (len(text) < 4 and not is_similar_performance_not_required):
+        if not original_text or (len(original_text) < 4 and not is_similar_performance_not_required):
             continue
         if chunk.content_text.lstrip().startswith("□"):
             continue
         if "□" in chunk.content_text and "？" not in chunk.content_text and "?" not in chunk.content_text:
             continue
-        if _is_contact_text(text, chunk.heading_path):
-            continue
-        if _is_pure_heading(text):
-            continue
-        if text.endswith(("：", ":")) and "类似工程业绩要求" in text:
-            continue
-        if text.endswith(("：", ":")) and not any(signal in text for signal in REQUIREMENT_SIGNALS):
-            continue
-        if text == "不要求" and "类似工程业绩要求" not in (chunk.heading_path or ""):
-            continue
-        if text == "采用资格后审方式":
-            text = _contextual_requirement_text(text, chunk.heading_path)
-        elif text == "不要求":
-            text = _contextual_requirement_text(text, chunk.heading_path)
-        elif "不得参加投标" == text and "项目建议书" in (chunk.heading_path or ""):
-            text = _contextual_requirement_text(text, chunk.heading_path)
-        elif "由招标人根据招标项目具体情况" in text:
-            continue
-        else:
-            text = _contextual_requirement_text(text, chunk.heading_path)
-
-        item_type = _rule_item_type(text, chunk.heading_path)
-        if item_type == "mandatory_response" and not any(
-            keyword in text
-            for keyword in (
-                "须",
-                "必须",
-                "不得",
-                "最高投标限价",
-                "质量",
-                "工期",
-                "保修",
-                "缺陷责任期",
-                "招标范围",
-            )
-        ):
+        if _should_skip_rule_text(original_text, chunk.heading_path):
             continue
 
-        normalized = _normalized_key(text)
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        risk_level = _risk_level(item_type, text)
-        candidates.append(
-            ComplianceCandidate(
-                source_chunk_index=chunk.chunk_index,
-                item_type=item_type,
-                requirement_text=text,
-                normalized_requirement=normalized,
-                response_suggestion=_response_suggestion(item_type, text),
-                risk_level=risk_level,
-                is_mandatory=risk_level == "high" or item_type in {"qualification", "deadline"},
-                confidence_score=Decimal("0.6500"),
-                explanation_json=_candidate_explanation(
+        for text in _atomic_requirement_texts(original_text):
+            if _should_skip_rule_text(text, chunk.heading_path):
+                continue
+            if text == "采用资格后审方式":
+                text = _contextual_requirement_text(text, chunk.heading_path)
+            elif text == "不要求":
+                text = _contextual_requirement_text(text, chunk.heading_path)
+            elif "不得参加投标" == text and "项目建议书" in (chunk.heading_path or ""):
+                text = _contextual_requirement_text(text, chunk.heading_path)
+            else:
+                text = _contextual_requirement_text(text, chunk.heading_path)
+
+            item_type = _rule_item_type(text, chunk.heading_path)
+            if item_type == "mandatory_response" and not any(
+                keyword in text
+                for keyword in (
+                    "须",
+                    "必须",
+                    "不得",
+                    "最高投标限价",
+                    "质量",
+                    "工期",
+                    "保修",
+                    "缺陷责任期",
+                    "招标范围",
+                    "合同履行期限",
+                )
+            ):
+                continue
+
+            normalized = _semantic_key(text, item_type)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            risk_level = _risk_level(item_type, text)
+            is_mandatory = risk_level == "high" or item_type in {"qualification", "deadline"}
+            candidates.append(
+                ComplianceCandidate(
+                    source_chunk_index=chunk.chunk_index,
                     item_type=item_type,
-                    text=text,
-                    heading_path=chunk.heading_path,
+                    requirement_text=text,
+                    normalized_requirement=normalized,
+                    response_suggestion=_response_suggestion(item_type, text),
                     risk_level=risk_level,
-                    is_mandatory=risk_level == "high" or item_type in {"qualification", "deadline"},
-                    extraction_provider="rules",
-                ),
+                    is_mandatory=is_mandatory,
+                    confidence_score=Decimal("0.6500"),
+                    explanation_json=_candidate_explanation(
+                        item_type=item_type,
+                        text=text,
+                        heading_path=chunk.heading_path,
+                        risk_level=risk_level,
+                        is_mandatory=is_mandatory,
+                        extraction_provider="rules",
+                    ),
+                )
             )
-        )
-        candidates.extend(_extra_candidates_for_chunk(chunk, text, seen))
+            candidates.extend(_extra_candidates_for_chunk(chunk, text, seen))
     return candidates
 
 
@@ -777,6 +901,24 @@ def execute_compliance_matrix_generation_task(
         created_count = 0
         updated_count = 0
         skipped_count = 0
+        superseded_count = 0
+
+        if (task.input_json or {}).get("force"):
+            stale_items = db.scalars(
+                select(ComplianceItem).where(
+                    ComplianceItem.tenant_id == task.tenant_id,
+                    ComplianceItem.project_id == task.project_id,
+                    ComplianceItem.section_id == task.section_id,
+                    ComplianceItem.deleted_at.is_(None),
+                )
+            ).all()
+            for item in stale_items:
+                item.status = "superseded"
+                item.deleted_at = now
+                item.modified_by = task.created_by
+                item.modified_at = now
+                item.modify_reason = "强制重新生成合规矩阵，旧候选项自动淘汰"
+                superseded_count += 1
 
         for candidate in candidates:
             chunk = chunk_by_index.get(candidate.source_chunk_index)
@@ -849,6 +991,7 @@ def execute_compliance_matrix_generation_task(
             "created_count": created_count,
             "updated_count": updated_count,
             "skipped_count": skipped_count,
+            "superseded_count": superseded_count,
         }
         task.finished_at = datetime.now(UTC)
         _add_generation_audit(
@@ -864,6 +1007,7 @@ def execute_compliance_matrix_generation_task(
             "created_count": created_count,
             "updated_count": updated_count,
             "skipped_count": skipped_count,
+            "superseded_count": superseded_count,
         }
     except Exception as exc:
         error_code = exc.code if isinstance(exc, ComplianceGenerationError) else "COMPLIANCE_GENERATION_FAILED"

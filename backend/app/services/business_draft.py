@@ -478,6 +478,7 @@ def export_business_draft_word(
     project_id: uuid.UUID,
     section_id: uuid.UUID,
     actor_user_id: uuid.UUID,
+    extra_snapshot: dict[str, object] | None = None,
 ) -> ExportFile:
     project = db.get(Project, project_id)
     section = db.get(BidSection, section_id)
@@ -533,6 +534,15 @@ def export_business_draft_word(
         data=data,
         content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+    source_snapshot = {
+        "chapter_ids": [str(chapter.id) for chapter in chapters],
+        "chapter_count": len(chapters),
+        "exported_at": now.isoformat(),
+        "snapshot_note": "商务标章节草稿，需人工复核后使用",
+    }
+    if extra_snapshot:
+        source_snapshot.update(extra_snapshot)
+
     export_file = ExportFile(
         id=export_id,
         tenant_id=tenant_id,
@@ -545,12 +555,7 @@ def export_business_draft_word(
         object_key=object_key,
         sha256=content_hash,
         filter_json=None,
-        source_snapshot_json={
-            "chapter_ids": [str(chapter.id) for chapter in chapters],
-            "chapter_count": len(chapters),
-            "exported_at": now.isoformat(),
-            "snapshot_note": "商务标章节草稿，需人工复核后使用",
-        },
+        source_snapshot_json=source_snapshot,
         status="available",
         created_by=actor_user_id,
     )
@@ -565,9 +570,9 @@ def export_business_draft_word(
             action="business_draft.word_exported",
             object_type="export_file",
             object_id=export_file.id,
-            after_json={"file_name": file_name, "sha256": content_hash},
+            after_json={"file_name": file_name, "sha256": content_hash, "source_snapshot": source_snapshot},
             reason="导出商务标章节草稿 Word 文件",
-            severity="info",
+            severity="warning" if source_snapshot.get("preflight_status") == "block" else "info",
         )
     )
     return export_file

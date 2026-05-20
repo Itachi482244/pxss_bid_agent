@@ -192,13 +192,27 @@ def test_business_draft_decision_fact_check_export_and_approval(
     assert "[请人工确认]" in updated_chapter["content_text"]
     assert any(check["check_status"] == "unverified" for check in updated_chapter["fact_checks"])
 
-    export_response = client.post(
+    preflight_response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/preflight-check")
+    assert preflight_response.status_code == 200
+    preflight = preflight_response.json()
+    assert preflight["unverified_fact_count"] >= 1
+    assert preflight["status"] == "block"
+
+    blocked_export_response = client.post(
         f"/api/v1/projects/{project_id}/sections/{section_id}/business-draft/export-word"
+    )
+    assert blocked_export_response.status_code == 409
+
+    export_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/business-draft/export-word",
+        json={"risk_acceptance_reason": "作为内部草稿导出，待项目经理复核无法验证事实"},
     )
     assert export_response.status_code == 200
     export_file = export_response.json()
     assert export_file["export_type"] == "business_draft_word"
     assert export_file["file_name"].endswith(".docx")
+    assert export_file["source_snapshot_json"]["preflight_status"] == "block"
+    assert "内部草稿" in export_file["source_snapshot_json"]["risk_acceptance_reason"]
     assert stored_objects
 
     download_response = client.get(
@@ -240,7 +254,7 @@ def test_business_draft_decision_fact_check_export_and_approval(
     approved_chapter = next(item for item in refreshed_chapters if item["id"] == qualification_chapter["id"])
     assert approved_chapter["status"] == "approved"
 
-    submit_task_response = client.post(
+    blocked_submit_task_response = client.post(
         f"/api/v1/projects/{project_id}/sections/{section_id}/approval-tasks",
         json={
             "task_type": "submit_confirmation",
@@ -248,5 +262,20 @@ def test_business_draft_decision_fact_check_export_and_approval(
             "description": "确认商务标草稿、资格建议和导出文件均已复核。",
         },
     )
+    assert blocked_submit_task_response.status_code == 409
+
+    submit_task_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/approval-tasks",
+        json={
+            "task_type": "submit_confirmation",
+            "title": "提交前人工确认",
+            "description": "确认商务标草稿、资格建议和导出文件均已复核。",
+            "risk_acceptance_reason": "审批人知悉仍有阻塞项，本次仅进入内部复核。",
+        },
+    )
     assert submit_task_response.status_code == 201
-    assert submit_task_response.json()["status"] == "pending"
+    submit_task = submit_task_response.json()
+    assert submit_task["status"] == "pending"
+    assert submit_task["evidence_snapshot_json"]["preflight_status"] in {"block", "warn", "pass"}
+    assert submit_task["evidence_snapshot_json"]["blocking_summary"]
+    assert "内部复核" in submit_task["evidence_snapshot_json"]["risk_acceptance_reason"]
