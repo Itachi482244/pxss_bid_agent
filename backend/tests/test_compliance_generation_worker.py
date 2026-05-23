@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import re
 from uuid import UUID, uuid4
 
 import pytest
@@ -106,6 +107,10 @@ def build_cleanroom_public_notice_docx_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def normalized_requirement_key(text: str) -> str:
+    return re.sub(r"[\s，。；;：:（）()、]+", "", text)
+
+
 def test_cleanroom_notice_rule_fallback_atomizes_and_deduplicates_requirements() -> None:
     chunks = parse_docx_bytes(build_cleanroom_public_notice_docx_bytes())
     heading_by_text = {chunk.content_text: chunk.heading_path for chunk in chunks}
@@ -115,11 +120,15 @@ def test_cleanroom_notice_rule_fallback_atomizes_and_deduplicates_requirements()
     candidates = _rule_extract(chunks)  # type: ignore[arg-type]
     texts = [item.requirement_text for item in candidates]
     joined = "\n".join(texts)
+    normalized_texts = [normalized_requirement_key(text) for text in texts]
 
     assert "净化运维服务托管项目公开招标公告" not in texts
     assert "3.本项目的特定资格要求" not in joined.replace("\n", "")
     assert not any("三、获取招标文件" in text and "特定资格要求" in text for text in texts)
     assert not any("2.2其他落实政府采购政策" in text for text in texts)
+    assert not any("邢台市公共资源交易网" in text and item.item_type != "deadline" for item, text in zip(candidates, texts))
+    assert len(normalized_texts) == len(set(normalized_texts))
+    assert all(len(text) <= 180 for text in texts)
 
     assert any("建筑装修装饰工程专业承包贰级及以上资质" in text for text in texts)
     electronic_qualification = next(
@@ -129,11 +138,19 @@ def test_cleanroom_notice_rule_fallback_atomizes_and_deduplicates_requirements()
     assert any("建筑机电安装工程专业承包叁级及以上资质" in text for text in texts)
     assert any("有效的安全生产许可证" in text for text in texts)
     assert any("拟派项目经理" in text and "注册建造师" in text for text in texts)
+    assert any("安全生产考核" in text and "B 类" in text for text in texts)
+    assert any("未担任其他在施建设工程项目" in text for text in texts)
+    assert any("小微企业" in text for text in texts)
+    assert any("不接受联合体投标" in text for text in texts)
+    assert any("信用中国" in text and "没有资格参加" in text for text in texts)
 
     submit_deadlines = [
         item for item in candidates if item.item_type == "deadline" and "2026年06月12日" in item.requirement_text
     ]
     assert len(submit_deadlines) == 1
+
+    qualification_count = sum(1 for item in candidates if item.item_type == "qualification")
+    assert qualification_count >= 8
 
 
 def test_compliance_matrix_generation_creates_items_from_word_chunks(monkeypatch) -> None:

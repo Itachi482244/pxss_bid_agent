@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models import AuditLog, ModelInvocationLog
+from app.services.model_config import RuntimeChatModelConfig, resolve_chat_model_config
 
 Complexity = Literal["simple", "complex"]
 ComplexityInput = Literal["simple", "complex", "auto"]
@@ -73,7 +74,9 @@ def choose_complexity(
     return "simple"
 
 
-def choose_model(complexity: Complexity) -> str:
+def choose_model(complexity: Complexity, config: RuntimeChatModelConfig | None = None) -> str:
+    if config is not None:
+        return config.model_for_complexity(complexity)
     if complexity == "complex":
         return settings.llm_complex_model or settings.llm_model
     return settings.llm_simple_model or settings.llm_model
@@ -155,8 +158,9 @@ def chat_completion(
         messages=messages,
         complexity=complexity,
     )
-    model_name = choose_model(resolved_complexity)
-    provider = settings.llm_provider or "mock"
+    runtime_config = resolve_chat_model_config(db, tenant_id)
+    model_name = choose_model(resolved_complexity, runtime_config)
+    provider = runtime_config.provider or "mock"
     prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
     estimated_tokens = _estimate_tokens(prompt_text)
 
@@ -184,13 +188,14 @@ def chat_completion(
             "message_count": len(messages),
             "message_roles": [message.get("role") for message in messages],
             "prompt_char_count": len(prompt_text),
+            "model_config_source": runtime_config.source,
         },
         evidence_refs_json=evidence_refs,
     )
     db.add(log)
     db.flush()
 
-    if provider != "deepseek" or not settings.llm_api_key:
+    if provider not in {"deepseek", "openai_compatible"} or not runtime_config.api_key or not runtime_config.base_url:
         log.status = "skipped"
         log.error_code = "LLM_NOT_CONFIGURED"
         log.error_message = "远程模型未配置，已跳过调用。"
@@ -216,11 +221,11 @@ def chat_completion(
 
     started_at = time.perf_counter()
     try:
-        with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
+        with httpx.Client(timeout=runtime_config.timeout_seconds) as client:
             response = client.post(
-                f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+                f"{runtime_config.base_url.rstrip('/')}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {settings.llm_api_key}",
+                    "Authorization": f"Bearer {runtime_config.api_key}",
                     "Content-Type": "application/json",
                 },
                 json=payload,

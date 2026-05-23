@@ -20,6 +20,7 @@ import {
   SafetyCertificateOutlined,
   SearchOutlined,
   SendOutlined,
+  SettingOutlined,
   TeamOutlined,
   WarningOutlined
 } from "@ant-design/icons";
@@ -96,10 +97,13 @@ import {
   runQualificationEvaluation,
   searchEnterpriseMaterials,
   publishDocumentManualRevision,
+  getChatModelConfig,
   uploadEnterpriseMaterialFile,
   unbindComplianceEvidence,
   updateProject,
   updateSection,
+  saveChatModelConfig,
+  testChatModelConfig,
   upsertEnterpriseProfile,
   uploadDocument,
   updateBusinessDraftChapter,
@@ -109,6 +113,9 @@ import type {
   AuditLog,
   ApprovalTask,
   BusinessDraftChapter,
+  ChatModelConfig,
+  ChatModelConfigPayload,
+  ChatModelConfigTestResult,
   ComplianceEvidenceBinding,
   ComplianceItem,
   DocumentChunk,
@@ -224,6 +231,17 @@ type NewMaterialDraft = {
   dataLevel: string;
   verificationStatus: string;
   evidenceText: string;
+};
+
+type ModelConfigDraft = {
+  provider: string;
+  baseUrl: string;
+  apiKey: string;
+  simpleModel: string;
+  complexModel: string;
+  timeoutSeconds: number;
+  enabled: boolean;
+  clearApiKey: boolean;
 };
 
 type ImportProcessingState = {
@@ -425,6 +443,10 @@ function isAsyncTaskTerminal(task: AsyncTask | null, taskId: string | null) {
   return Boolean(task && ["succeeded", "failed", "canceled"].includes(task.status));
 }
 
+function isUsableParseStatus(value: string | null | undefined) {
+  return value === "succeeded" || value === "frozen";
+}
+
 function asyncTaskProgress(task: AsyncTask | null, taskId: string | null) {
   if (!taskId) return 0;
   if (!task) return 5;
@@ -527,6 +549,8 @@ function auditActionText(log: AuditLog) {
     "model.invocation_succeeded": "模型调用成功",
     "model.invocation_failed": "模型调用失败",
     "model.invocation_skipped": "模型调用跳过",
+    "model_config.updated": "更新模型配置",
+    "model_config.tested": "测试模型连接",
     "approval.task_created": "创建审批任务",
     "approval.task_approved": "审批通过",
     "approval.task_rejected": "审批退回"
@@ -537,7 +561,7 @@ function auditActionText(log: AuditLog) {
 export function App() {
   const [assistantCollapsed, setAssistantCollapsed] = useState(false);
   const [projectNavCollapsed, setProjectNavCollapsed] = useState(false);
-  const [viewMode, setViewMode] = useState<"home" | "workspace" | "enterprise">("home");
+  const [viewMode, setViewMode] = useState<"home" | "workspace" | "enterprise" | "settings">("home");
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const [selectedSectionId, setSelectedSectionId] = useState<string>();
   const [selectedTreeKey, setSelectedTreeKey] = useState("");
@@ -661,6 +685,21 @@ export function App() {
     verificationStatus: "pending_confirm",
     evidenceText: ""
   });
+  const [chatModelConfig, setChatModelConfig] = useState<ChatModelConfig | null>(null);
+  const [modelConfigDraft, setModelConfigDraft] = useState<ModelConfigDraft>({
+    provider: "mock",
+    baseUrl: "",
+    apiKey: "",
+    simpleModel: "deepseek-v4-flash",
+    complexModel: "deepseek-v4-pro",
+    timeoutSeconds: 30,
+    enabled: true,
+    clearApiKey: false
+  });
+  const [loadingModelConfig, setLoadingModelConfig] = useState(false);
+  const [savingModelConfig, setSavingModelConfig] = useState(false);
+  const [testingModelConfig, setTestingModelConfig] = useState(false);
+  const [modelConfigTestResult, setModelConfigTestResult] = useState<ChatModelConfigTestResult | null>(null);
 
   const applyProjectList = useCallback((data: ProjectSummary[]) => {
     setProjects(data);
@@ -728,10 +767,44 @@ export function App() {
     }
   }, []);
 
+  const applyChatModelConfig = useCallback((config: ChatModelConfig) => {
+    setChatModelConfig(config);
+    setModelConfigDraft((draft) => ({
+      ...draft,
+      provider: config.provider || "mock",
+      baseUrl: config.base_url ?? "",
+      apiKey: "",
+      simpleModel: config.simple_model ?? "deepseek-v4-flash",
+      complexModel: config.complex_model ?? "deepseek-v4-pro",
+      timeoutSeconds: Number(config.timeout_seconds || 30),
+      enabled: config.enabled,
+      clearApiKey: false
+    }));
+  }, []);
+
+  const reloadChatModelConfig = useCallback(async () => {
+    setLoadingModelConfig(true);
+    try {
+      const config = await getChatModelConfig();
+      applyChatModelConfig(config);
+      return config;
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "模型配置加载失败");
+      return null;
+    } finally {
+      setLoadingModelConfig(false);
+    }
+  }, [applyChatModelConfig]);
+
   useEffect(() => {
     if (viewMode !== "enterprise") return;
     void reloadEnterprise();
   }, [reloadEnterprise, viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== "settings") return;
+    void reloadChatModelConfig();
+  }, [reloadChatModelConfig, viewMode]);
 
   useEffect(() => {
     if (!selectedProjectId) return;
@@ -1025,7 +1098,7 @@ export function App() {
   );
 
   const workflowSteps = useMemo<WorkflowStep[]>(() => {
-    const parsedDocuments = documents.filter((document) => document.current_version?.parse_status === "succeeded");
+    const parsedDocuments = documents.filter((document) => isUsableParseStatus(document.current_version?.parse_status));
     const missingEvidenceCount = evidenceRows.length;
     const unresolvedMatrixCount = unresolvedMatrixRows.length;
     const unresolvedTechnicalCount = technicalRows.filter((row) => !isMatrixItemResolved(row)).length;
@@ -2879,6 +2952,48 @@ export function App() {
     }
   };
 
+  const modelConfigPayload = (includeEmptyKey = false): ChatModelConfigPayload => ({
+    provider: modelConfigDraft.provider,
+    base_url: modelConfigDraft.baseUrl.trim() || null,
+    simple_model: modelConfigDraft.simpleModel.trim() || null,
+    complex_model: modelConfigDraft.complexModel.trim() || null,
+    timeout_seconds: Number(modelConfigDraft.timeoutSeconds || 30),
+    enabled: modelConfigDraft.enabled,
+    api_key: modelConfigDraft.apiKey.trim() || (includeEmptyKey ? "" : null),
+    clear_api_key: modelConfigDraft.clearApiKey
+  });
+
+  const handleSaveModelConfig = async () => {
+    setSavingModelConfig(true);
+    try {
+      const config = await saveChatModelConfig(modelConfigPayload());
+      applyChatModelConfig(config);
+      setModelConfigTestResult(null);
+      appendLog("更新 Chat 模型配置");
+      Modal.success({ title: "模型配置已保存" });
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "模型配置保存失败");
+    } finally {
+      setSavingModelConfig(false);
+    }
+  };
+
+  const handleTestModelConfig = async () => {
+    setTestingModelConfig(true);
+    try {
+      const result = await testChatModelConfig(modelConfigPayload(true));
+      setModelConfigTestResult(result);
+      appendLog(`测试 Chat 模型配置：${result.status === "success" ? "成功" : "失败"}`);
+      if (result.status === "success") {
+        await reloadChatModelConfig();
+      }
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "模型连接测试失败");
+    } finally {
+      setTestingModelConfig(false);
+    }
+  };
+
   const makeMaterialFileUploadRequest =
     (material: EnterpriseMaterial): UploadProps["customRequest"] =>
     async (options) => {
@@ -2916,6 +3031,13 @@ export function App() {
               onClick={() => setViewMode("enterprise")}
             >
               企业资料库
+            </Button>
+            <Button
+              icon={<SettingOutlined />}
+              type={viewMode === "settings" ? "primary" : "default"}
+              onClick={() => setViewMode("settings")}
+            >
+              模型设置
             </Button>
             <Select
               className="project-switcher"
@@ -2959,7 +3081,195 @@ export function App() {
           />
         )}
 
-        {viewMode === "enterprise" ? (
+        {viewMode === "settings" ? (
+          <Content className="settings-page">
+            <section className="home-heading">
+              <div>
+                <Text type="secondary">系统设置</Text>
+                <Title level={2}>模型设置</Title>
+                <Text type="secondary">
+                  MVP1.1 先接入 Chat/LLM 配置；Embedding 与 Rerank 会在 MVP1.2 接入检索链路。
+                </Text>
+              </div>
+              <Space wrap>
+                <Button onClick={reloadChatModelConfig} loading={loadingModelConfig}>
+                  刷新
+                </Button>
+                <Button onClick={handleTestModelConfig} loading={testingModelConfig}>
+                  测试连接
+                </Button>
+                <Button type="primary" onClick={handleSaveModelConfig} loading={savingModelConfig}>
+                  保存配置
+                </Button>
+              </Space>
+            </section>
+
+            <section className="settings-grid">
+              <div className="home-panel settings-main-panel">
+                <div className="panel-title-row">
+                  <div>
+                    <Text strong>Chat 模型配置</Text>
+                    <p>模型调用会优先读取数据库配置；禁用或不完整时回退环境变量和本地规则兜底。</p>
+                  </div>
+                  <Space wrap>
+                    <Tag color={chatModelConfig?.source === "db" ? "blue" : chatModelConfig?.source === "env" ? "green" : "default"}>
+                      来源：{chatModelConfig?.source === "db" ? "数据库" : chatModelConfig?.source === "env" ? "环境变量" : "本地兜底"}
+                    </Tag>
+                    <Tag color={modelConfigDraft.enabled ? "green" : "default"}>
+                      {modelConfigDraft.enabled ? "已启用" : "已禁用"}
+                    </Tag>
+                  </Space>
+                </div>
+
+                <Spin spinning={loadingModelConfig}>
+                  <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                    <Space.Compact style={{ width: "100%" }}>
+                      <Select
+                        className="provider-select"
+                        value={modelConfigDraft.provider}
+                        onChange={(value) => setModelConfigDraft((draft) => ({ ...draft, provider: value }))}
+                        options={[
+                          { value: "mock", label: "Mock / 本地兜底" },
+                          { value: "deepseek", label: "DeepSeek" },
+                          { value: "openai_compatible", label: "OpenAI Compatible" }
+                        ]}
+                      />
+                      <Input
+                        placeholder="Base URL，例如 https://api.deepseek.com/v1"
+                        value={modelConfigDraft.baseUrl}
+                        onChange={(event) =>
+                          setModelConfigDraft((draft) => ({ ...draft, baseUrl: event.target.value }))
+                        }
+                      />
+                    </Space.Compact>
+
+                    <Space.Compact style={{ width: "100%" }}>
+                      <Input
+                        placeholder="Simple Model"
+                        value={modelConfigDraft.simpleModel}
+                        onChange={(event) =>
+                          setModelConfigDraft((draft) => ({ ...draft, simpleModel: event.target.value }))
+                        }
+                      />
+                      <Input
+                        placeholder="Complex Model"
+                        value={modelConfigDraft.complexModel}
+                        onChange={(event) =>
+                          setModelConfigDraft((draft) => ({ ...draft, complexModel: event.target.value }))
+                        }
+                      />
+                    </Space.Compact>
+
+                    <Space.Compact style={{ width: "100%" }}>
+                      <Input.Password
+                        placeholder={
+                          chatModelConfig?.api_key_masked
+                            ? `已保存：${chatModelConfig.api_key_masked}；输入新 Key 会覆盖`
+                            : "API Key"
+                        }
+                        value={modelConfigDraft.apiKey}
+                        onChange={(event) =>
+                          setModelConfigDraft((draft) => ({
+                            ...draft,
+                            apiKey: event.target.value,
+                            clearApiKey: false
+                          }))
+                        }
+                      />
+                      <Input
+                        type="number"
+                        min={1}
+                        max={300}
+                        placeholder="超时秒数"
+                        className="timeout-input"
+                        value={modelConfigDraft.timeoutSeconds}
+                        onChange={(event) =>
+                          setModelConfigDraft((draft) => ({
+                            ...draft,
+                            timeoutSeconds: Number(event.target.value || 30)
+                          }))
+                        }
+                      />
+                    </Space.Compact>
+
+                    <div className="settings-toggle-row">
+                      <Space wrap>
+                        <Switch
+                          checked={modelConfigDraft.enabled}
+                          onChange={(checked) => setModelConfigDraft((draft) => ({ ...draft, enabled: checked }))}
+                          checkedChildren="启用"
+                          unCheckedChildren="禁用"
+                        />
+                        <Switch
+                          checked={modelConfigDraft.clearApiKey}
+                          disabled={!chatModelConfig?.has_api_key}
+                          onChange={(checked) =>
+                            setModelConfigDraft((draft) => ({ ...draft, clearApiKey: checked, apiKey: "" }))
+                          }
+                          checkedChildren="清除 Key"
+                          unCheckedChildren="保留 Key"
+                        />
+                      </Space>
+                      <Text type="secondary">
+                        明文 API Key 不会返回前端；保存新 Key 需要后端配置 MODEL_CONFIG_ENCRYPTION_KEY。
+                      </Text>
+                    </div>
+
+                    {chatModelConfig?.last_test_status && (
+                      <Alert
+                        type={chatModelConfig.last_test_status === "success" ? "success" : "warning"}
+                        showIcon
+                        message={`最近测试：${chatModelConfig.last_test_status === "success" ? "成功" : "失败"}`}
+                        description={`${chatModelConfig.last_test_message ?? "无详情"}${
+                          chatModelConfig.last_tested_at ? ` · ${formatDateTime(chatModelConfig.last_tested_at)}` : ""
+                        }`}
+                      />
+                    )}
+                    {modelConfigTestResult && (
+                      <Alert
+                        type={modelConfigTestResult.status === "success" ? "success" : "error"}
+                        showIcon
+                        message={modelConfigTestResult.status === "success" ? "本次测试成功" : "本次测试失败"}
+                        description={`${modelConfigTestResult.message} · 模型：${
+                          modelConfigTestResult.model_name || "未识别"
+                        } · 来源：${modelConfigTestResult.source}`}
+                      />
+                    )}
+                  </Space>
+                </Spin>
+              </div>
+
+              <div className="home-panel settings-side-panel">
+                <div className="panel-title-row">
+                  <div>
+                    <Text strong>后续能力预留</Text>
+                    <p>检索增强会单独接入向量化和重排，不混进 Chat 配置。</p>
+                  </div>
+                </div>
+                <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="Embedding：MVP1.2 预留"
+                    description="计划使用 BAAI/bge-large-zh-v1.5，将企业资料切片写入 pgvector。"
+                  />
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="Rerank：MVP1.2 预留"
+                    description="计划使用 BAAI/bge-reranker-large，对候选证据做二次排序和解释。"
+                  />
+                  <Alert
+                    type="warning"
+                    showIcon
+                    message="安全边界"
+                    description="外部文件和网页均视为非可信输入；MVP1.1 不允许模型自动审批、自动提交或覆盖人工确认状态。"
+                  />
+                </Space>
+              </div>
+            </section>
+          </Content>
+        ) : viewMode === "enterprise" ? (
           <Content className="enterprise-page">
             <section className="home-heading">
               <div>
@@ -3479,7 +3789,13 @@ export function App() {
                   <Alert
                     showIcon
                     type={importProcessingFailed ? "error" : importProcessingDone ? "success" : "info"}
-                    message={importProcessingDone ? "后台处理已完成" : "后台正在处理导入项目"}
+                    message={
+                      importProcessingFailed
+                        ? "后台处理失败"
+                        : importProcessingDone
+                          ? "后台处理已完成"
+                          : "后台正在处理导入项目"
+                    }
                     description={
                       importProcessingFailed
                         ? "解析或矩阵生成失败，请查看下方任务状态后重新解析或重新生成矩阵。"
@@ -3755,7 +4071,7 @@ export function App() {
                               dataIndex: "current_version",
                               width: 130,
                               render: (_, record) => (
-                                <Tag color={record.current_version?.parse_status === "succeeded" ? "green" : "orange"}>
+                                <Tag color={isUsableParseStatus(record.current_version?.parse_status) ? "green" : "orange"}>
                                   {record.current_version?.parse_status ?? "待解析"}
                                 </Tag>
                               )
@@ -4151,7 +4467,18 @@ export function App() {
                           rowClassName={(record) => (record.key === highlightedRowKey ? "highlighted-row" : "")}
                           scroll={{ x: 1840 }}
                           dataSource={displayedMatrixRows}
-                          locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无合规矩阵项" /> }}
+                          locale={{
+                            emptyText: (
+                              <Empty
+                                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                                description={
+                                  documents.some((document) => isUsableParseStatus(document.current_version?.parse_status))
+                                    ? "暂无合规矩阵项；请先点击生成合规矩阵"
+                                    : "暂无合规矩阵项；请先完成文件解析"
+                                }
+                              />
+                            )
+                          }}
                           columns={[
                             {
                               title: "招标要求",
@@ -5354,7 +5681,14 @@ export function App() {
               pagination={false}
               loading={loadingMaterialSearch}
               dataSource={materialSearchResults}
-              locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无匹配资料" /> }}
+              locale={{
+                emptyText: (
+                  <Empty
+                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                    description="暂无匹配资料；请更换关键词或先到企业资料库补充资料"
+                  />
+                )
+              }}
               columns={[
                 {
                   title: "候选资料",

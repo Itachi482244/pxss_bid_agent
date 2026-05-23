@@ -5,6 +5,7 @@ Importing this module registers all models on the shared SQLAlchemy metadata.
 
 from app.models.approval import ApprovalTask
 from app.models.audit import AuditLog
+from app.models.ai_config import AIModelConfig
 from app.models.compliance import ComplianceEvidenceBinding, ComplianceItem
 from app.models.decision import QualificationDecision
 from app.models.document import Document, DocumentChunk, DocumentVersion
@@ -22,6 +23,7 @@ __all__ = [
     "AsyncTask",
     "ApprovalTask",
     "AuditLog",
+    "AIModelConfig",
     "BidSection",
     "BusinessDraftChapter",
     "BusinessDraftEvidenceRef",
