@@ -179,7 +179,6 @@ def test_cleanroom_notice_rule_fallback_atomizes_and_deduplicates_requirements()
     qualification_count = sum(1 for item in candidates if item.item_type == "qualification")
     assert qualification_count >= 8
 
-
 def test_model_compliance_extract_uses_prompt_registry_and_filters_pollution(monkeypatch) -> None:
     client = TestClient(app)
     project_id, section_id = get_seed_project_and_section(client)
@@ -262,7 +261,6 @@ def test_model_compliance_extract_missing_source_falls_back_to_rules(monkeypatch
 
     assert provider == "rules"
     assert any("营业执照" in item.requirement_text for item in candidates)
-
 
 def test_compliance_matrix_generation_creates_items_from_word_chunks(monkeypatch) -> None:
     settings.run_tasks_inline = False
