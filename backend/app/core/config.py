@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     llm_simple_model: str = Field(default="deepseek-v4-flash", alias="LLM_SIMPLE_MODEL")
     llm_complex_model: str = Field(default="deepseek-v4-pro", alias="LLM_COMPLEX_MODEL")
     llm_timeout_seconds: float = Field(default=30.0, alias="LLM_TIMEOUT_SECONDS")
+    model_config_encryption_key: str = Field(default="", alias="MODEL_CONFIG_ENCRYPTION_KEY")
+    model_config_encryption_key_version: str = Field(default="v1", alias="MODEL_CONFIG_ENCRYPTION_KEY_VERSION")
     run_tasks_inline: bool = Field(default=True, alias="RUN_TASKS_INLINE")
 
     frontend_dist_dir: str = Field(default="", alias="FRONTEND_DIST_DIR")

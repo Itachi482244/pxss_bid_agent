@@ -554,6 +554,8 @@ def _should_skip_rule_text(text: str, heading_path: str | None) -> bool:
         return True
     if re.match(r"^(项目编号|项目名称|预算金额|售价|方式)[:：]", text):
         return True
+    if text.startswith("地点：") and "下载招标文件" in text:
+        return True
     if "其他落实政府采购政策的资格要求" in text and "无" in text and len(text) <= 40:
         return True
     if text.startswith(("名 称：", "地 址：", "电 话：", "项目联系人：", "来源：")):
@@ -615,10 +617,6 @@ def _split_project_overview(text: str) -> list[str]:
         return [text]
 
     requirements: list[str] = []
-    download_match = re.search(r"潜在投标人应在(?P<download>.+?)获取招标文件", text)
-    if download_match:
-        requirements.append(f"潜在投标人应在{download_match.group('download').strip()}获取招标文件。")
-
     deadline_match = re.search(
         r"并于(?P<deadline>\d{4}年\d{2}月\d{2}日\s*\d{2}点\d{2}分（北京时间）)前递交投标文件",
         text,

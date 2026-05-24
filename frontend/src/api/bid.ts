@@ -597,6 +597,64 @@ export type EnterpriseMaterialPayload = {
   evidence_text?: string | null;
 };
 
+export type ChatModelConfig = {
+  id: string | null;
+  capability: string;
+  provider: string;
+  base_url: string | null;
+  simple_model: string | null;
+  complex_model: string | null;
+  timeout_seconds: number;
+  enabled: boolean;
+  api_key_masked: string | null;
+  has_api_key: boolean;
+  source: string;
+  last_test_status: string | null;
+  last_test_message: string | null;
+  last_tested_at: string | null;
+  updated_at: string | null;
+};
+
+export type ChatModelConfigPayload = {
+  provider: string;
+  base_url?: string | null;
+  simple_model?: string | null;
+  complex_model?: string | null;
+  timeout_seconds: number;
+  enabled: boolean;
+  api_key?: string | null;
+  clear_api_key?: boolean;
+};
+
+export type ChatModelConfigTestPayload = Partial<ChatModelConfigPayload>;
+
+export type ChatModelConfigTestResult = {
+  status: "success" | "failed";
+  message: string;
+  provider: string;
+  model_name: string | null;
+  duration_ms: number | null;
+  source: string;
+};
+
+export async function getChatModelConfig() {
+  const response = await apiClient.get<ChatModelConfig>("/system/model-configs/chat");
+  return response.data;
+}
+
+export async function saveChatModelConfig(payload: ChatModelConfigPayload) {
+  const response = await apiClient.put<ChatModelConfig>("/system/model-configs/chat", payload);
+  return response.data;
+}
+
+export async function testChatModelConfig(payload?: ChatModelConfigTestPayload) {
+  const response = await apiClient.post<ChatModelConfigTestResult>(
+    "/system/model-configs/chat/test",
+    payload ?? {}
+  );
+  return response.data;
+}
+
 export async function createProject(payload: ProjectCreatePayload) {
   const response = await apiClient.post<ProjectDetail>("/projects", payload);
   return response.data;

@@ -61,6 +61,13 @@
   background: #f4f6f9;
 }
 
+.settings-page {
+  min-height: calc(100vh - 56px);
+  padding: 22px;
+  overflow: auto;
+  background: #f4f6f9;
+}
+
 .home-heading {
   display: flex;
   align-items: center;
@@ -118,9 +125,36 @@
   gap: 14px;
 }
 
+.settings-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(300px, 0.75fr);
+  gap: 14px;
+}
+
 .profile-panel,
 .materials-panel {
   min-height: 520px;
+}
+
+.settings-main-panel,
+.settings-side-panel {
+  min-height: 360px;
+}
+
+.provider-select {
+  width: 220px;
+}
+
+.timeout-input {
+  max-width: 220px;
+}
+
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
 }
 
 .materials-panel .ant-table-cell {
