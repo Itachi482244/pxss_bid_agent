@@ -28,3 +28,4 @@ data/storage/
 .DS_Store
 .idea/
 .vscode/
+.gstack/
