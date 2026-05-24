@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,9 +16,10 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.main import app
-from app.models import AsyncTask, ComplianceItem
+from app.models import AsyncTask, BidSection, ComplianceItem, Project
 from app.parsers.word import parse_docx_bytes
-from app.services.compliance_generation import _rule_extract, execute_compliance_matrix_generation_task
+from app.services.compliance_generation import _rule_extract, execute_compliance_matrix_generation_task, extract_compliance_candidates
+from app.services.llm_gateway import LLMResult
 from app.services.document_parse import execute_document_parse_task
 from scripts.seed_dev_data import seed
 
@@ -111,6 +113,31 @@ def normalized_requirement_key(text: str) -> str:
     return re.sub(r"[\s，。；;：:（）()、]+", "", text)
 
 
+def build_fake_task(db, project_id: str, section_id: str) -> AsyncTask:
+    project = db.get(Project, UUID(project_id))
+    section = db.get(BidSection, UUID(section_id))
+    assert project is not None
+    assert section is not None
+    return AsyncTask(
+        tenant_id=project.tenant_id,
+        project_id=project.id,
+        section_id=section.id,
+        task_type="matrix_generate",
+        idempotency_key=f"test-{uuid4().hex}",
+    )
+
+
+def fake_chunk(index: int, text: str, heading_path: str = "测试文件/资格要求"):
+    return SimpleNamespace(
+        id=uuid4(),
+        document_version_id=uuid4(),
+        chunk_index=index,
+        heading_path=heading_path,
+        content_text=text,
+        page_no=None,
+    )
+
+
 def test_cleanroom_notice_rule_fallback_atomizes_and_deduplicates_requirements() -> None:
     chunks = parse_docx_bytes(build_cleanroom_public_notice_docx_bytes())
     heading_by_text = {chunk.content_text: chunk.heading_path for chunk in chunks}
@@ -151,6 +178,90 @@ def test_cleanroom_notice_rule_fallback_atomizes_and_deduplicates_requirements()
 
     qualification_count = sum(1 for item in candidates if item.item_type == "qualification")
     assert qualification_count >= 8
+
+
+def test_model_compliance_extract_uses_prompt_registry_and_filters_pollution(monkeypatch) -> None:
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    captured: dict[str, object] = {}
+
+    def fake_chat_completion(*_args, **kwargs) -> LLMResult:
+        captured["prompt_version"] = kwargs["prompt_version"]
+        captured["messages"] = kwargs["messages"]
+        return LLMResult(
+            content=(
+                "{"
+                '"items":['
+                '{"source_chunk_index":1,"item_type":"qualification","requirement_text":"投标人须具备建筑机电安装工程专业承包叁级及以上资质。",'
+                '"normalized_requirement":"机电安装资质","response_suggestion":"绑定企业资质证书。","risk_level":"medium",'
+                '"is_mandatory":true,"classification_reason":"资质准入要求。","split_reason":"从复合资格条款拆出单项资质。",'
+                '"source_quote":"投标人须具备建筑机电安装工程专业承包叁级及以上资质。","review_hint":"规则复核后人工确认。",'
+                '"needs_human_review":false,"confidence_score":0.42},'
+                '{"source_chunk_index":2,"item_type":"technical_response","requirement_text":"净化空调系统应提供过滤效率检测报告和安装调试方案。",'
+                '"normalized_requirement":"净化设备检测报告和调试方案","response_suggestion":"绑定检测报告和技术方案。","risk_level":"high",'
+                '"is_mandatory":true,"classification_reason":"技术响应硬要求。","split_reason":"技术资料要求独立成项。",'
+                '"source_quote":"净化空调系统应提供过滤效率检测报告和安装调试方案。","review_hint":"技术人员复核。",'
+                '"needs_human_review":true,"confidence_score":0.86},'
+                '{"source_chunk_index":3,"item_type":"reference_info","requirement_text":"采购人：某医院，联系方式：0319-1234567。",'
+                '"risk_level":"low","is_mandatory":false,"confidence_score":0.9}'
+                "]}"
+            ),
+            provider="deepseek",
+            model_name="fake-chat",
+            complexity="simple",
+            prompt_version=kwargs["prompt_version"],
+            log_id=uuid4(),
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    monkeypatch.setattr("app.services.compliance_generation.chat_completion", fake_chat_completion)
+    chunks = [
+        fake_chunk(1, "投标人须具备建筑机电安装工程专业承包叁级及以上资质。"),
+        fake_chunk(2, "净化空调系统应提供过滤效率检测报告和安装调试方案。", "测试文件/技术要求"),
+        fake_chunk(3, "采购人：某医院，联系方式：0319-1234567。", "测试文件/公告信息"),
+    ]
+
+    with SessionLocal() as db:
+        task = build_fake_task(db, project_id, section_id)
+        provider, candidates = extract_compliance_candidates(db, task, chunks)  # type: ignore[arg-type]
+
+    assert provider == "deepseek:fake-chat"
+    assert captured["prompt_version"] == "compliance_extract@1.1.0"
+    assert "source_chunk_index" in captured["messages"][1]["content"]  # type: ignore[index]
+    assert len(candidates) == 2
+    assert all("联系方式" not in item.requirement_text for item in candidates)
+    low_confidence = next(item for item in candidates if item.item_type == "qualification")
+    assert low_confidence.explanation_json["needs_human_review"] is True
+    assert "置信度较低" in low_confidence.explanation_json["review_hint"]
+    technical = next(item for item in candidates if item.item_type == "technical_response")
+    assert technical.explanation_json["classification_reason"] == "技术响应硬要求。"
+    assert technical.explanation_json["source_quote"]
+
+
+def test_model_compliance_extract_missing_source_falls_back_to_rules(monkeypatch) -> None:
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+
+    def fake_chat_completion(*_args, **kwargs) -> LLMResult:
+        return LLMResult(
+            content='{"items":[{"source_chunk_index":99,"item_type":"qualification","requirement_text":"投标人须具备营业执照。","risk_level":"high","is_mandatory":true,"confidence_score":0.9}]}',
+            provider="deepseek",
+            model_name="fake-chat",
+            complexity="simple",
+            prompt_version=kwargs["prompt_version"],
+            log_id=uuid4(),
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    monkeypatch.setattr("app.services.compliance_generation.chat_completion", fake_chat_completion)
+    chunks = [fake_chunk(1, "投标人须具备有效的企业营业执照。")]
+
+    with SessionLocal() as db:
+        task = build_fake_task(db, project_id, section_id)
+        provider, candidates = extract_compliance_candidates(db, task, chunks)  # type: ignore[arg-type]
+
+    assert provider == "rules"
+    assert any("营业执照" in item.requirement_text for item in candidates)
 
 
 def test_compliance_matrix_generation_creates_items_from_word_chunks(monkeypatch) -> None:

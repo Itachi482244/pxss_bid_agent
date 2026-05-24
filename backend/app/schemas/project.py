@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.document import DocumentChunkRead
+
 
 class ProjectSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -180,6 +182,21 @@ class ComplianceItemRead(BaseModel):
     response_suggestion: str | None
     evidence_text: str | None
     rule_explanation: dict[str, Any] | None = None
+    dedup_key: str | None = None
+    duplicate_group_id: uuid.UUID | None = None
+    duplicate_group_status: str | None = None
+    duplicate_group_confirmed_at: datetime | None = None
+    duplicate_group_confirmed_by: uuid.UUID | None = None
+    duplicate_group_count: int = 0
+    selected_text: str | None = None
+    selection_start_offset: int | None = None
+    selection_end_offset: int | None = None
+    source_create_method: str | None = None
+    review_hint: str | None = None
+    classification_reason: str | None = None
+    split_reason: str | None = None
+    source_quote: str | None = None
+    needs_human_review: bool = False
     enterprise_evidence_count: int = 0
     enterprise_evidence_summary: str | None = None
     priority_rank: int = 3
@@ -197,6 +214,8 @@ class ComplianceItemRead(BaseModel):
     modified_by: uuid.UUID | None
     modified_at: datetime | None
     modify_reason: str | None
+    cascade_affected_count: int = 0
+    cascade_affected_items: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -276,6 +295,134 @@ class ComplianceItemUpdateRequest(BaseModel):
 
 class ComplianceItemConfirmRequest(BaseModel):
     reason: str = Field(default="人工逐条确认合规矩阵项", min_length=2, max_length=1000)
+    source_verified: bool = False
+    cascade: bool = True
+
+
+class ComplianceItemFromSourceRequest(BaseModel):
+    source_chunk_id: uuid.UUID
+    selected_text: str = Field(min_length=2, max_length=8000)
+    selection_start_offset: int | None = Field(default=None, ge=0)
+    selection_end_offset: int | None = Field(default=None, ge=0)
+    item_type: str = "mandatory_response"
+    risk_level: str = "medium"
+    is_mandatory: bool = True
+    response_suggestion: str | None = Field(default=None, max_length=4000)
+    reason: str = Field(default="人工从原文新增合规矩阵项", min_length=2, max_length=1000)
+
+    @field_validator("item_type")
+    @classmethod
+    def validate_item_type(cls, value: str) -> str:
+        allowed = {
+            "qualification",
+            "mandatory_response",
+            "format",
+            "deadline",
+            "scoring",
+            "reference_info",
+            "technical_response",
+            "other",
+        }
+        if value not in allowed:
+            raise ValueError("不支持的合规项类型")
+        return value
+
+    @field_validator("risk_level")
+    @classmethod
+    def validate_source_risk_level(cls, value: str) -> str:
+        if value not in {"low", "medium", "high"}:
+            raise ValueError("风险等级必须是 low、medium 或 high")
+        return value
+
+
+class TextDiffSegment(BaseModel):
+    operation: str
+    base_text: str | None = None
+    candidate_text: str | None = None
+
+
+class SimilarCandidateRead(BaseModel):
+    candidate_key: str
+    source_chunk_id: uuid.UUID
+    source_chunk_index: int
+    page_no: int | None = None
+    heading_path: str | None = None
+    selected_text: str
+    selection_start_offset: int | None = None
+    selection_end_offset: int | None = None
+    similarity: float
+    match_type: str
+    diff_segments: list[TextDiffSegment] = Field(default_factory=list)
+    existing_item_id: uuid.UUID | None = None
+
+
+class ComplianceItemFromSourceResult(BaseModel):
+    item: ComplianceItemRead
+    similar_candidates: list[SimilarCandidateRead] = Field(default_factory=list)
+
+
+class SimilarCandidateApplyItem(BaseModel):
+    candidate_key: str
+    source_chunk_id: uuid.UUID
+    selected_text: str = Field(min_length=2, max_length=8000)
+    selection_start_offset: int | None = Field(default=None, ge=0)
+    selection_end_offset: int | None = Field(default=None, ge=0)
+    action: str
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, value: str) -> str:
+        if value not in {"join_group", "create_independent", "skip"}:
+            raise ValueError("action 必须是 join_group、create_independent 或 skip")
+        return value
+
+
+class SimilarCandidateApplyRequest(BaseModel):
+    candidates: list[SimilarCandidateApplyItem] = Field(min_length=1, max_length=50)
+    reason: str = Field(default="人工确认相似片段补票", min_length=2, max_length=1000)
+
+
+class DuplicateGroupActionRequest(BaseModel):
+    item_ids: list[uuid.UUID] | None = Field(default=None, max_length=100)
+    reason: str = Field(default="人工确认重复要求关联组", min_length=2, max_length=1000)
+
+
+class DuplicateGroupActionResult(BaseModel):
+    duplicate_group_id: uuid.UUID | None = None
+    affected_item_count: int
+    items: list[ComplianceItemRead] = Field(default_factory=list)
+
+
+class MatrixReviewStats(BaseModel):
+    total_items: int
+    confirmed_items: int
+    high_risk_total: int
+    high_risk_confirmed: int
+    uncovered_chunk_count: int
+    duplicate_candidate_group_count: int
+    duplicate_confirmed_group_count: int
+
+
+class MatrixReviewUncoveredChunkRead(BaseModel):
+    chunk: DocumentChunkRead
+    reason: str
+
+
+class MatrixReviewDuplicateGroupRead(BaseModel):
+    group_key: str
+    group_type: str
+    status: str
+    item_ids: list[uuid.UUID]
+    item_count: int
+    representative_text: str
+
+
+class MatrixReviewRead(BaseModel):
+    chunks: list[DocumentChunkRead] = Field(default_factory=list)
+    items: list[ComplianceItemRead] = Field(default_factory=list)
+    stats: MatrixReviewStats
+    uncovered_chunks: list[MatrixReviewUncoveredChunkRead] = Field(default_factory=list)
+    duplicate_groups: list[MatrixReviewDuplicateGroupRead] = Field(default_factory=list)
 
 
 class ComplianceItemAssignRequest(BaseModel):

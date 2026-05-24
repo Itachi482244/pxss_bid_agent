@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import AsyncTask, AuditLog, ComplianceItem, Document, DocumentChunk, DocumentVersion
+from app.prompts import get_prompt
 from app.services.llm_gateway import LLMGatewayError, chat_completion
 
 
@@ -81,6 +82,7 @@ VALID_ITEM_TYPES = {
     "other",
 }
 VALID_RISK_LEVELS = {"low", "medium", "high"}
+LLM_LOW_CONFIDENCE_THRESHOLD = 0.60
 PURE_HEADING_RE = re.compile(r"^\d+(?:[.．]\d+)*[.．、]?\s*[\w\u4e00-\u9fff（）()]{2,24}$")
 CONTACT_KEYWORDS = ("联系方式", "招标代理机构", "联 系 人", "联系人", "电 话", "电话", "地 址", "地址")
 REFERENCE_SIGNALS = (
@@ -157,6 +159,11 @@ class LLMComplianceItem(BaseModel):
     response_suggestion: str | None = None
     risk_level: str = "medium"
     is_mandatory: bool = True
+    classification_reason: str | None = None
+    split_reason: str | None = None
+    source_quote: str | None = None
+    review_hint: str | None = None
+    needs_human_review: bool = False
     confidence_score: float = Field(default=0.75, ge=0, le=1)
 
     @field_validator("item_type")
@@ -406,35 +413,48 @@ def _json_from_model_text(content: str) -> dict[str, Any]:
 
 def _llm_prompt(chunks: list[DocumentChunk]) -> list[dict[str, str]]:
     payload = json.dumps(_chunk_payload(chunks), ensure_ascii=False)
-    return [
-        {
-            "role": "system",
-            "content": (
-                "你是招投标合规矩阵分析助手。请只输出 JSON，不要输出解释。"
-                "任务是从招标公告/招标文件分块中抽取投标人必须响应或需要核验的合规项。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "请从下面的 chunks 中抽取合规矩阵候选项。只抽取文本中有证据的要求，"
-                "不要编造。模板说明、未选中的 □ 选项不要抽取；如果勾选符号被识别成 ? 或 ？ ，"
-                "请结合语义判断。每项必须引用 source_chunk_index。\n\n"
-                "输出 JSON 格式：\n"
-                "{ \"items\": [ {"
-                "\"source_chunk_index\": 22,"
-                "\"item_type\": \"qualification|mandatory_response|format|deadline|scoring|reference_info|technical_response|other\","
-                "\"requirement_text\": \"原文要求\","
-                "\"normalized_requirement\": \"简短归一化描述\","
-                "\"response_suggestion\": \"投标响应建议或需准备材料\","
-                "\"risk_level\": \"low|medium|high\","
-                "\"is_mandatory\": true,"
-                "\"confidence_score\": 0.0"
-                "} ] }\n\n"
-                f"chunks:\n{payload}"
-            ),
-        },
-    ]
+    return get_prompt("compliance_extract", "1.1.0").render(chunks_json=payload)
+
+
+def _source_quote(item: LLMComplianceItem, source_chunk: DocumentChunk, cleaned_text: str) -> str:
+    quote = _clean_requirement_text(item.source_quote or "")
+    if quote and quote in source_chunk.content_text:
+        return quote[:300]
+    if cleaned_text in source_chunk.content_text:
+        return cleaned_text[:300]
+    return _clean_requirement_text(source_chunk.content_text)[:300]
+
+
+def _llm_candidate_notes(
+    item: LLMComplianceItem,
+    source_chunk: DocumentChunk,
+    cleaned_text: str,
+) -> tuple[bool, str | None, str | None, str | None]:
+    needs_review = bool(item.needs_human_review)
+    review_reasons: list[str] = []
+
+    if item.confidence_score < LLM_LOW_CONFIDENCE_THRESHOLD:
+        needs_review = True
+        review_reasons.append("模型置信度较低，需要人工复核。")
+
+    rule_type = _rule_item_type(cleaned_text, source_chunk.heading_path)
+    if item.item_type != rule_type and item.item_type != "other":
+        needs_review = True
+        review_reasons.append(f"模型分类为{_item_type_label(item.item_type)}，规则复核倾向为{_item_type_label(rule_type)}。")
+
+    rule_risk = _risk_level(rule_type if item.item_type == "other" else item.item_type, cleaned_text)
+    if item.risk_level != rule_risk:
+        needs_review = True
+        review_reasons.append(f"模型风险为{item.risk_level}，规则复核倾向为{rule_risk}。")
+
+    classification_reason = item.classification_reason or (
+        f"模型分类为{_item_type_label(item.item_type)}，规则复核参考类型为{_item_type_label(rule_type)}。"
+    )
+    split_reason = item.split_reason or "模型按最小可审核要求拆分；人工可对照来源 chunk 复核。"
+    review_hint = item.review_hint
+    if review_reasons:
+        review_hint = " ".join(review_reasons + ([review_hint] if review_hint else []))
+    return needs_review, classification_reason, split_reason if split_reason else None, review_hint
 
 
 def _call_llm(
@@ -443,6 +463,7 @@ def _call_llm(
     chunks: list[DocumentChunk],
 ) -> tuple[str, list[ComplianceCandidate]]:
     messages = _llm_prompt(chunks)
+    prompt = get_prompt("compliance_extract", "1.1.0")
     char_count = sum(len(chunk.content_text or "") for chunk in chunks)
     result = chat_completion(
         db,
@@ -452,7 +473,7 @@ def _call_llm(
         actor_user_id=task.created_by,
         actor_type="worker",
         task_type="compliance_matrix_generation",
-        prompt_version="compliance-matrix-extract@2026-05-17",
+        prompt_version=prompt.prompt_version,
         messages=messages,
         complexity="complex" if len(chunks) >= 40 or char_count >= 6000 else "simple",
         temperature=0.0,
@@ -471,24 +492,52 @@ def _call_llm(
         if not cleaned_text:
             continue
         source_chunk = chunk_by_index.get(item.source_chunk_index)
+        if source_chunk is None:
+            continue
+        if _should_skip_rule_text(cleaned_text, source_chunk.heading_path):
+            continue
+        if _is_contact_text(cleaned_text, source_chunk.heading_path):
+            continue
+        needs_review, classification_reason, split_reason, review_hint = _llm_candidate_notes(
+            item,
+            source_chunk,
+            cleaned_text,
+        )
+        normalized = item.normalized_requirement or _semantic_key(cleaned_text, item.item_type)
+        if not normalized.startswith("auto:"):
+            normalized = _normalized_key(normalized)
+        explanation = _candidate_explanation(
+            item_type=item.item_type,
+            text=cleaned_text,
+            heading_path=source_chunk.heading_path,
+            risk_level=item.risk_level,
+            is_mandatory=item.is_mandatory,
+            extraction_provider=f"{result.provider}:{result.model_name}",
+        )
+        explanation.update(
+            {
+                "prompt_id": prompt.prompt_id,
+                "prompt_version": prompt.prompt_version,
+                "output_schema": "compliance_extract",
+                "classification_reason": classification_reason,
+                "split_reason": split_reason,
+                "source_quote": _source_quote(item, source_chunk, cleaned_text),
+                "review_hint": review_hint,
+                "needs_human_review": needs_review,
+                "model_confidence_score": item.confidence_score,
+            }
+        )
         candidates.append(
             ComplianceCandidate(
                 source_chunk_index=item.source_chunk_index,
                 item_type=item.item_type,
                 requirement_text=cleaned_text,
-                normalized_requirement=item.normalized_requirement or _normalized_key(item.requirement_text),
+                normalized_requirement=normalized,
                 response_suggestion=item.response_suggestion,
                 risk_level=item.risk_level,
                 is_mandatory=item.is_mandatory,
                 confidence_score=_confidence(item.confidence_score),
-                explanation_json=_candidate_explanation(
-                    item_type=item.item_type,
-                    text=cleaned_text,
-                    heading_path=source_chunk.heading_path if source_chunk else None,
-                    risk_level=item.risk_level,
-                    is_mandatory=item.is_mandatory,
-                    extraction_provider=f"{result.provider}:{result.model_name}",
-                ),
+                explanation_json=explanation,
             )
         )
     return f"{result.provider}:{result.model_name}", candidates
@@ -950,9 +999,11 @@ def execute_compliance_matrix_generation_task(
                         item_type=candidate.item_type,
                         requirement_text=candidate.requirement_text,
                         normalized_requirement=candidate.normalized_requirement,
+                        dedup_key=candidate.normalized_requirement[:160],
                         response_suggestion=candidate.response_suggestion,
                         evidence_text=chunk.content_text,
                         explanation_json=candidate.explanation_json,
+                        source_create_method=candidate.explanation_json.get("extraction_provider") or "rule",
                         status="pending_confirm",
                         risk_level=candidate.risk_level,
                         is_mandatory=candidate.is_mandatory,
@@ -967,9 +1018,11 @@ def execute_compliance_matrix_generation_task(
                 existing.source_page_no = chunk.page_no
                 existing.item_type = candidate.item_type
                 existing.requirement_text = candidate.requirement_text
+                existing.dedup_key = candidate.normalized_requirement[:160]
                 existing.response_suggestion = candidate.response_suggestion
                 existing.evidence_text = chunk.content_text
                 existing.explanation_json = candidate.explanation_json
+                existing.source_create_method = candidate.explanation_json.get("extraction_provider") or "rule"
                 existing.risk_level = candidate.risk_level
                 existing.is_mandatory = candidate.is_mandatory
                 existing.is_batch_confirm_allowed = is_batch_confirm_allowed

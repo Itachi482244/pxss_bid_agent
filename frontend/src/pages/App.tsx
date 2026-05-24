@@ -2,6 +2,8 @@ import {
   AuditOutlined,
   BellOutlined,
   CheckCircleOutlined,
+  BranchesOutlined,
+  HighlightOutlined,
   CloudUploadOutlined,
   ClockCircleOutlined,
   CloseOutlined,
@@ -29,12 +31,14 @@ import {
   Avatar,
   Badge,
   Button,
+  Checkbox,
   DatePicker,
   Drawer,
   Empty,
   Input,
   Layout,
   Modal,
+  Popover,
   Progress,
   Select,
   Space,
@@ -50,19 +54,22 @@ import {
 } from "antd";
 import type { UploadProps } from "antd";
 import dayjs from "dayjs";
-import type { Key } from "react";
+import type { Key, MouseEvent as ReactMouseEvent } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   assignComplianceItem,
+  applySimilarCandidates,
   bindComplianceEvidence,
   bulkAssignComplianceItems,
   bulkConfirmComplianceItems,
   confirmComplianceItem,
+  confirmDuplicateGroup,
   confirmQualificationDecision,
   confirmQualificationEvaluation,
   confirmProjectImportDraft,
   createApprovalTask,
+  createComplianceItemFromSource,
   createParseTask,
   createProjectImportDraftFromFile,
   createProjectImportDraftFromUrl,
@@ -76,6 +83,7 @@ import {
   generateBusinessDraftChapters,
   generateComplianceMatrix,
   getPreflightCheck,
+  getMatrixReview,
   generateQualificationDecision,
   getEnterpriseProfile,
   getProject,
@@ -89,6 +97,7 @@ import {
   listExportFiles,
   listAuditLogs,
   listComplianceItems,
+  listSimilarCandidates,
   listQualificationEvaluations,
   listProjects,
   listSections,
@@ -100,12 +109,14 @@ import {
   getChatModelConfig,
   uploadEnterpriseMaterialFile,
   unbindComplianceEvidence,
+  unlinkDuplicateGroupItem,
   updateProject,
   updateSection,
   saveChatModelConfig,
   testChatModelConfig,
   upsertEnterpriseProfile,
   uploadDocument,
+  splitDuplicateGroupItem,
   updateBusinessDraftChapter,
   updateComplianceItem
 } from "../api/bid";
@@ -117,6 +128,7 @@ import type {
   ChatModelConfigPayload,
   ChatModelConfigTestResult,
   ComplianceEvidenceBinding,
+  ComplianceItemFromSourceResult,
   ComplianceItem,
   DocumentChunk,
   EnterpriseMaterial,
@@ -131,6 +143,10 @@ import type {
   QualificationDecision,
   QualificationEvaluation,
   SectionSummary,
+  SimilarCandidate,
+  MatrixReviewDuplicateGroup,
+  MatrixReviewUncoveredChunk,
+  TextDiffSegment,
   AsyncTask
 } from "../api/bid";
 import "./app.css";
@@ -204,8 +220,35 @@ type KeyInfoDraft = {
 };
 
 type ProjectCreateMode = "manual" | "file" | "url";
-type WorkflowStepKey = "documents" | "matrix" | "technical" | "evidence" | "qualification" | "chapter" | "approval";
+type WorkflowStepKey =
+  | "documents"
+  | "matrix"
+  | "review"
+  | "technical"
+  | "evidence"
+  | "qualification"
+  | "chapter"
+  | "approval";
 type WorkflowStepStatus = "not_started" | "todo" | "risk" | "done";
+type MatrixReviewFilter = "all" | "unconfirmed" | "high" | "mandatory" | "missing_evidence";
+type ReviewChunk = Pick<
+  DocumentChunk,
+  "id" | "chunk_index" | "page_no" | "heading_path" | "content_text" | "document_version_id"
+>;
+
+type SourceSelectionDraft = {
+  chunk: ReviewChunk;
+  selectedText: string;
+  selectionStartOffset: number | null;
+  selectionEndOffset: number | null;
+  itemType: string;
+  riskLevel: string;
+  isMandatory: boolean;
+  responseSuggestion: string;
+  reason: string;
+};
+
+type SimilarAction = "join_group" | "create_independent" | "skip";
 
 type WorkflowStep = {
   key: WorkflowStepKey;
@@ -537,6 +580,12 @@ function auditActionText(log: AuditLog) {
     "matrix.items_batch_confirmed": "批量确认矩阵项",
     "matrix.evidence_bound": "绑定企业资料证据",
     "matrix.evidence_unbound": "解除企业资料证据",
+    "matrix.item_created_from_source": "从原文新增矩阵项",
+    "matrix.duplicate_group_confirmed": "确认重复关联组",
+    "matrix.duplicate_group_unlinked": "解除重复联动",
+    "matrix.duplicate_group_split": "拆分重复关联组",
+    "matrix.similar_candidate_applied": "确认相似补票",
+    "matrix.cascade_confirmed": "级联确认矩阵项",
     "document.uploaded": "上传文件",
     "document.public_url_downloaded": "获取公开文件",
     "export.excel_succeeded": "导出矩阵快照",
@@ -573,6 +622,20 @@ export function App() {
   const [riskFilter, setRiskFilter] = useState<string | undefined>();
   const [mandatoryFilter, setMandatoryFilter] = useState<string | undefined>();
   const [prioritySortEnabled, setPrioritySortEnabled] = useState(true);
+  const [matrixReviewFilter, setMatrixReviewFilter] = useState<MatrixReviewFilter>("unconfirmed");
+  const [reviewChunks, setReviewChunks] = useState<ReviewChunk[]>([]);
+  const [loadingReviewChunks, setLoadingReviewChunks] = useState(false);
+  const [activeReviewItemId, setActiveReviewItemId] = useState("");
+  const [reviewUncoveredChunks, setReviewUncoveredChunks] = useState<MatrixReviewUncoveredChunk[]>([]);
+  const [reviewDuplicateGroups, setReviewDuplicateGroups] = useState<MatrixReviewDuplicateGroup[]>([]);
+  const [sourceCreateMode, setSourceCreateMode] = useState(false);
+  const [sourceSelectionDraft, setSourceSelectionDraft] = useState<SourceSelectionDraft | null>(null);
+  const [savingSourceItem, setSavingSourceItem] = useState(false);
+  const [similarBaseRow, setSimilarBaseRow] = useState<MatrixRow | null>(null);
+  const [similarCandidates, setSimilarCandidates] = useState<SimilarCandidate[]>([]);
+  const [similarActions, setSimilarActions] = useState<Record<string, SimilarAction>>({});
+  const [similarDrawerOpen, setSimilarDrawerOpen] = useState(false);
+  const [loadingSimilarCandidates, setLoadingSimilarCandidates] = useState(false);
   const [sourceDrawer, setSourceDrawer] = useState<MatrixRow | null>(null);
   const [evidenceDrawer, setEvidenceDrawer] = useState<MatrixRow | null>(null);
   const [evidenceBindings, setEvidenceBindings] = useState<ComplianceEvidenceBinding[]>([]);
@@ -935,6 +998,14 @@ export function App() {
     };
   }, [selectedProjectId, selectedSectionId]);
 
+  const reviewDocument = useMemo(
+    () =>
+      documents.find((document) => document.doc_type === "tender" && isUsableParseStatus(document.current_version?.parse_status)) ??
+      documents.find((document) => isUsableParseStatus(document.current_version?.parse_status)) ??
+      null,
+    [documents]
+  );
+
   useEffect(() => {
     if (!selectedProjectId || !selectedSectionId) return;
     let active = true;
@@ -949,6 +1020,34 @@ export function App() {
       active = false;
     };
   }, [selectedProjectId, selectedSectionId, complianceItems, businessDraftChapters, approvalTasks, documents]);
+
+  useEffect(() => {
+    if (activeTab !== "review" || !selectedProjectId || !selectedSectionId) {
+      return;
+    }
+    let active = true;
+    setLoadingReviewChunks(true);
+    getMatrixReview(selectedProjectId, selectedSectionId)
+      .then((review) => {
+        if (!active) return;
+        setReviewChunks(review.chunks);
+        setComplianceItems(review.items);
+        setReviewUncoveredChunks(review.uncovered_chunks);
+        setReviewDuplicateGroups(review.duplicate_groups);
+      })
+      .catch(() => {
+        if (!active) return;
+        setReviewChunks([]);
+        setReviewUncoveredChunks([]);
+        setReviewDuplicateGroups([]);
+      })
+      .finally(() => {
+        if (active) setLoadingReviewChunks(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeTab, selectedProjectId, selectedSectionId]);
 
   useEffect(() => {
     if (selectedSectionId && !selectedTreeKey) {
@@ -1024,6 +1123,7 @@ export function App() {
     if (activeTab === "approval") return "审批与审计";
     if (activeTab === "evidence") return "证据处理";
     if (activeTab === "technical") return "技术响应预览";
+    if (activeTab === "review") return "矩阵审阅";
     if (activeTab === "documents") return "文件解析视图";
     return "合规矩阵";
   }, [activeTab]);
@@ -1048,6 +1148,65 @@ export function App() {
       return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
     });
   }, [filteredMatrixRows, prioritySortEnabled]);
+  const matrixReviewRows = useMemo(() => {
+    return [...matrixRows]
+      .filter((row) => {
+        if (matrixReviewFilter === "unconfirmed") return !isMatrixItemResolved(row);
+        if (matrixReviewFilter === "high") return row.riskCode === "high";
+        if (matrixReviewFilter === "mandatory") return row.mandatory;
+        if (matrixReviewFilter === "missing_evidence") return row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material";
+        return true;
+      })
+      .sort((left, right) => {
+        const leftChunk = left.raw.source_chunk_index ?? 999999;
+        const rightChunk = right.raw.source_chunk_index ?? 999999;
+        if (leftChunk !== rightChunk) return leftChunk - rightChunk;
+        if (left.raw.priority_rank !== right.raw.priority_rank) return left.raw.priority_rank - right.raw.priority_rank;
+        const riskOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+        return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
+      });
+  }, [matrixReviewFilter, matrixRows]);
+  const reviewFallbackChunks = useMemo<ReviewChunk[]>(() => {
+    const pairs = matrixRows
+      .filter((row) => row.raw.source_chunk_id && row.raw.source_content_text)
+      .map((row) => [
+        row.raw.source_chunk_id as string,
+        {
+          id: row.raw.source_chunk_id as string,
+          chunk_index: row.raw.source_chunk_index ?? 0,
+          page_no: row.raw.source_page_no,
+          heading_path: row.raw.source_heading_path,
+          content_text: row.raw.source_content_text ?? row.evidence,
+          document_version_id: row.raw.source_version_id
+        } satisfies ReviewChunk
+      ] as const);
+    return Array.from(new Map(pairs).values()).sort((left, right) => left.chunk_index - right.chunk_index);
+  }, [matrixRows]);
+  const reviewDisplayChunks = reviewChunks.length ? reviewChunks : reviewFallbackChunks;
+  const uncoveredChunkMap = useMemo(() => {
+    return new Map(reviewUncoveredChunks.map((item) => [item.chunk.id, item]));
+  }, [reviewUncoveredChunks]);
+  const duplicateGroupByItemId = useMemo(() => {
+    const map = new Map<string, MatrixReviewDuplicateGroup[]>();
+    reviewDuplicateGroups.forEach((group) => {
+      group.item_ids.forEach((itemId) => {
+        map.set(itemId, [...(map.get(itemId) ?? []), group]);
+      });
+    });
+    return map;
+  }, [reviewDuplicateGroups]);
+  const reviewProgress = useMemo(() => {
+    const confirmed = matrixRows.filter((row) => row.statusCode === "confirmed").length;
+    const highRows = matrixRows.filter((row) => row.riskCode === "high");
+    const highConfirmed = highRows.filter((row) => row.statusCode === "confirmed").length;
+    return {
+      total: matrixRows.length,
+      confirmed,
+      pending: matrixRows.length - confirmed,
+      highTotal: highRows.length,
+      highConfirmed
+    };
+  }, [matrixRows]);
   const visiblePreflightChecks = useMemo(() => {
     if (!preflightCheck) return [];
     const problemChecks = preflightCheck.checks.filter((item) => item.status !== "pass");
@@ -1111,6 +1270,7 @@ export function App() {
     const canOpenDocuments = hasSelectedScope;
     const canOpenMatrix = parsedDocuments.length > 0;
     const canOpenMatrixDerived = matrixRows.length > 0;
+    const canOpenReview = matrixRows.length > 0;
     const canOpenChapter = hasDecision || hasDraft;
     const canOpenApproval = hasDraft || approvalTasks.length > 0 || exportFiles.length > 0;
 
@@ -1171,6 +1331,29 @@ export function App() {
 	        disabled: !canOpenMatrix,
 	        disabledReason: canOpenMatrix ? null : "请先完成文件解析，形成可用解析版本。"
 	      },
+      {
+        key: "review",
+        title: "矩阵审阅",
+        description: "左右对照原文和矩阵项，逐条核对来源、风险和确认状态。",
+        status: matrixRows.length
+          ? unresolvedMatrixCount
+            ? unresolvedHighRiskCount
+              ? "risk"
+              : "todo"
+            : "done"
+          : "not_started",
+        statusText: matrixRows.length
+          ? unresolvedMatrixCount
+            ? `${unresolvedMatrixCount} 待核对`
+            : "已核对"
+          : "未开始",
+        actionText: "打开审阅台",
+        reason: matrixRows.length
+          ? `已生成 ${matrixRows.length} 条矩阵项，可在原文对照视图中核验来源。`
+          : "需要先生成合规矩阵。",
+        disabled: !canOpenReview,
+        disabledReason: canOpenReview ? null : "请先生成合规矩阵。"
+      },
       {
         key: "evidence",
         title: "证据绑定",
@@ -1385,6 +1568,15 @@ export function App() {
     }
   }, [selectedProjectId, selectedSectionId]);
 
+  const reloadMatrixReview = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId || activeTab !== "review") return;
+    const review = await getMatrixReview(selectedProjectId, selectedSectionId);
+    setReviewChunks(review.chunks);
+    setComplianceItems(review.items);
+    setReviewUncoveredChunks(review.uncovered_chunks);
+    setReviewDuplicateGroups(review.duplicate_groups);
+  }, [activeTab, selectedProjectId, selectedSectionId]);
+
   const reloadAuditLogs = useCallback(async () => {
     if (!selectedProjectId) return;
     const data = await listAuditLogs(selectedProjectId);
@@ -1448,6 +1640,7 @@ export function App() {
   const refreshAfterMatrixMutation = useCallback(async () => {
     await Promise.all([
       reloadMatrix(),
+      reloadMatrixReview(),
       reloadAuditLogs(),
       reloadWorkspaceSummary(),
       reloadDocumentsAndExports(),
@@ -1463,6 +1656,7 @@ export function App() {
     reloadBusinessDraftChapters,
     reloadDocumentsAndExports,
     reloadMatrix,
+    reloadMatrixReview,
     reloadPreflightCheck,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
@@ -1727,6 +1921,218 @@ export function App() {
     [appendLog, setWorkspaceNode]
   );
 
+  const focusReviewRow = useCallback((row: MatrixRow) => {
+    setActiveReviewItemId(row.key);
+    window.setTimeout(() => {
+      if (row.raw.source_chunk_id) {
+        document.getElementById(`review-chunk-${row.raw.source_chunk_id}`)?.scrollIntoView({
+          block: "center",
+          behavior: "smooth"
+        });
+      }
+      document.querySelector(`[data-review-item-id="${row.key}"]`)?.scrollIntoView({
+        block: "center",
+        behavior: "smooth"
+      });
+    }, 60);
+  }, []);
+
+  const focusReviewChunk = useCallback(
+    (chunkId: string) => {
+      const row = matrixRows.find((item) => item.raw.source_chunk_id === chunkId);
+      if (row) {
+        focusReviewRow(row);
+      }
+    },
+    [focusReviewRow, matrixRows]
+  );
+
+  const openSourceCreateDraft = useCallback((chunk: ReviewChunk, selectedText?: string) => {
+    const text = (selectedText || chunk.content_text).trim();
+    if (!text) {
+      Modal.warning({ title: "没有可新增的原文内容" });
+      return;
+    }
+    const startOffset = chunk.content_text.indexOf(text);
+    setSourceSelectionDraft({
+      chunk,
+      selectedText: text,
+      selectionStartOffset: startOffset >= 0 ? startOffset : null,
+      selectionEndOffset: startOffset >= 0 ? startOffset + text.length : null,
+      itemType: "mandatory_response",
+      riskLevel: "medium",
+      isMandatory: true,
+      responseSuggestion: "请人工确认响应方式并补充证据。",
+      reason: "人工从原文新增合规矩阵项"
+    });
+  }, []);
+
+  const handleReviewChunkMouseUp = useCallback(
+    (event: ReactMouseEvent<HTMLElement>, chunk: ReviewChunk) => {
+      if (!sourceCreateMode) return;
+      event.stopPropagation();
+      const selectedText = window.getSelection()?.toString().trim() ?? "";
+      if (selectedText.length < 2) return;
+      openSourceCreateDraft(chunk, selectedText);
+      setSourceCreateMode(false);
+      window.getSelection()?.removeAllRanges();
+    },
+    [openSourceCreateDraft, sourceCreateMode]
+  );
+
+  const handleCreateSourceItem = async () => {
+    if (!selectedProjectId || !selectedSectionId || !sourceSelectionDraft) return;
+    if (!sourceSelectionDraft.selectedText.trim() || !sourceSelectionDraft.reason.trim()) {
+      Modal.warning({ title: "请补充选中文本和新增原因" });
+      return;
+    }
+    setSavingSourceItem(true);
+    try {
+      const result = await createComplianceItemFromSource(selectedProjectId, selectedSectionId, {
+        source_chunk_id: sourceSelectionDraft.chunk.id,
+        selected_text: sourceSelectionDraft.selectedText.trim(),
+        selection_start_offset: sourceSelectionDraft.selectionStartOffset,
+        selection_end_offset: sourceSelectionDraft.selectionEndOffset,
+        item_type: sourceSelectionDraft.itemType,
+        risk_level: sourceSelectionDraft.riskLevel,
+        is_mandatory: sourceSelectionDraft.isMandatory,
+        response_suggestion: sourceSelectionDraft.responseSuggestion || null,
+        reason: sourceSelectionDraft.reason.trim()
+      });
+      appendLog(`从原文新增矩阵项：${truncateText(result.item.requirement_text, 18)}`);
+      setSourceSelectionDraft(null);
+      await refreshAfterMatrixMutation();
+      if (result.similar_candidates.length > 0) {
+        setSimilarBaseRow(mapMatrixRow(result.item));
+        setSimilarCandidates(result.similar_candidates);
+        setSimilarActions(
+          Object.fromEntries(result.similar_candidates.map((candidate) => [candidate.candidate_key, "skip" as SimilarAction]))
+        );
+        setSimilarDrawerOpen(true);
+      }
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "从原文新增矩阵项失败");
+    } finally {
+      setSavingSourceItem(false);
+    }
+  };
+
+  const openSimilarCandidates = async (row: MatrixRow) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    setSimilarBaseRow(row);
+    setSimilarCandidates([]);
+    setSimilarActions({});
+    setSimilarDrawerOpen(true);
+    setLoadingSimilarCandidates(true);
+    try {
+      const candidates = await listSimilarCandidates(selectedProjectId, selectedSectionId, row.key);
+      setSimilarCandidates(candidates);
+      setSimilarActions(Object.fromEntries(candidates.map((candidate) => [candidate.candidate_key, "skip" as SimilarAction])));
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "相似片段检索失败");
+    } finally {
+      setLoadingSimilarCandidates(false);
+    }
+  };
+
+  const handleApplySimilarCandidates = async () => {
+    if (!selectedProjectId || !selectedSectionId || !similarBaseRow) return;
+    const selectedCandidates = similarCandidates
+      .filter((candidate) => (similarActions[candidate.candidate_key] ?? "skip") !== "skip")
+      .map((candidate) => ({
+        candidate_key: candidate.candidate_key,
+        source_chunk_id: candidate.source_chunk_id,
+        selected_text: candidate.selected_text,
+        selection_start_offset: candidate.selection_start_offset,
+        selection_end_offset: candidate.selection_end_offset,
+        action: similarActions[candidate.candidate_key] ?? "skip"
+      }));
+    if (selectedCandidates.length === 0) {
+      setSimilarDrawerOpen(false);
+      return;
+    }
+    setLoadingSimilarCandidates(true);
+    try {
+      const result = await applySimilarCandidates(selectedProjectId, selectedSectionId, similarBaseRow.key, {
+        candidates: selectedCandidates,
+        reason: "人工确认相似片段补票"
+      });
+      appendLog(`相似补票完成，影响 ${result.affected_item_count} 条矩阵项`);
+      setSimilarDrawerOpen(false);
+      await refreshAfterMatrixMutation();
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "相似补票失败");
+    } finally {
+      setLoadingSimilarCandidates(false);
+    }
+  };
+
+  const handleConfirmDuplicateGroup = async (row: MatrixRow) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    let reason = "人工确认这些条目为同一合规要求，启用状态级联";
+    Modal.confirm({
+      title: "确认重复关联组",
+      content: (
+        <Space direction="vertical" size={10} style={{ width: "100%" }}>
+          <Text>{truncateText(row.requirement, 64)}</Text>
+          <Text type="secondary">确认后，同组条目的确认状态可级联同步；风险等级、类型和强制属性不会自动改变。</Text>
+          <TextArea defaultValue={reason} autoSize={{ minRows: 2, maxRows: 4 }} onChange={(event) => { reason = event.target.value; }} />
+        </Space>
+      ),
+      okText: "确认关联",
+      cancelText: "取消",
+      onOk: async () => {
+        if (!reason.trim()) throw new Error("reason required");
+        const result = await confirmDuplicateGroup(selectedProjectId, selectedSectionId, row.key, { reason: reason.trim() });
+        appendLog(`确认重复关联组：${result.affected_item_count} 条`);
+        await refreshAfterMatrixMutation();
+      }
+    });
+  };
+
+  const handleUnlinkDuplicateGroup = async (row: MatrixRow) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    await unlinkDuplicateGroupItem(selectedProjectId, selectedSectionId, row.key, {
+      reason: "人工判断该条与关联组存在差异，解除联动"
+    });
+    appendLog(`解除联动：${truncateText(row.requirement, 18)}`);
+    await refreshAfterMatrixMutation();
+  };
+
+  const handleSplitDuplicateGroup = async (row: MatrixRow) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    await splitDuplicateGroupItem(selectedProjectId, selectedSectionId, row.key, {
+      reason: "人工拆分为独立关联组"
+    });
+    appendLog(`拆分关联组：${truncateText(row.requirement, 18)}`);
+    await refreshAfterMatrixMutation();
+  };
+
+  const renderDiffSegments = (segments: TextDiffSegment[]) => {
+    if (!segments.length) return null;
+    return (
+      <span className="diff-inline">
+        {segments.map((segment, index) => {
+          if (segment.operation === "equal") {
+            return <span key={index}>{segment.candidate_text ?? segment.base_text}</span>;
+          }
+          if (segment.operation === "insert") {
+            return <ins key={index}>{segment.candidate_text}</ins>;
+          }
+          if (segment.operation === "delete") {
+            return <del key={index}>{segment.base_text}</del>;
+          }
+          return (
+            <span key={index}>
+              <del>{segment.base_text}</del>
+              <ins>{segment.candidate_text}</ins>
+            </span>
+          );
+        })}
+      </span>
+    );
+  };
+
   const confirmDraftGeneration = () => {
     Modal.confirm({
       title: "生成章节草稿",
@@ -1951,6 +2357,10 @@ export function App() {
       } else {
         handleGenerateMatrix();
       }
+      return;
+    }
+    if (stepKey === "review") {
+      activateWorkflowStep("review");
       return;
     }
     if (stepKey === "evidence") {
@@ -2274,12 +2684,21 @@ export function App() {
 
   const handleConfirmItem = (row: MatrixRow) => {
     let reason = "人工逐条确认合规矩阵项";
+    let sourceVerified = false;
+    const needsSourceVerified = row.riskCode === "high" || row.mandatory || row.raw.item_type === "qualification";
     Modal.confirm({
       title: "确认合规矩阵项",
       content: (
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
           <Text>{truncateText(row.requirement, 52)}</Text>
-          <Text type="secondary">确认后会记录确认人、确认时间和审计日志。</Text>
+          <Text type="secondary">
+            确认后会记录确认人、确认时间和审计日志；若该条已进入人工确认关联组，将同步确认同组条目。
+          </Text>
+          {needsSourceVerified && (
+            <Checkbox onChange={(event) => { sourceVerified = event.target.checked; }}>
+              我已核对招标文件原文和来源片段，确认该高风险/强制/资格项无误
+            </Checkbox>
+          )}
           <Text strong>确认说明（必填）</Text>
           <TextArea
             aria-label="确认说明"
@@ -2306,8 +2725,25 @@ export function App() {
           });
           throw new Error("reason required");
         }
-        await confirmComplianceItem(selectedProjectId, selectedSectionId, row.key, { reason: reason.trim() });
+        if (needsSourceVerified && !sourceVerified) {
+          Modal.warning({
+            title: "需要核对原文",
+            content: "高风险、强制项或资格项必须勾选“已核对原文”后才能确认。"
+          });
+          throw new Error("source verification required");
+        }
+        const confirmed = await confirmComplianceItem(selectedProjectId, selectedSectionId, row.key, {
+          reason: reason.trim(),
+          source_verified: sourceVerified,
+          cascade: true
+        });
         appendLog(`确认矩阵项：${truncateText(row.requirement, 18)}`);
+        if (confirmed.cascade_affected_count > 0) {
+          Modal.success({
+            title: "已同步确认关联条目",
+            content: `已同步确认全文其他 ${confirmed.cascade_affected_count} 处相同要求。`
+          });
+        }
         await refreshAfterMatrixMutation();
         if (unresolvedMatrixRows.length === 1 && !isMatrixItemResolved(row)) {
           Modal.success({
@@ -2389,19 +2825,8 @@ export function App() {
   const openWorkspace = (tab = "matrix") => {
     setViewMode("workspace");
     setActiveTab(tab);
-    setWorkspaceNode(
-      tab === "approval"
-        ? "approval"
-        : tab === "chapter"
-          ? "chapter"
-          : tab === "evidence"
-            ? "evidence"
-          : tab === "documents"
-            ? "documents"
-            : tab === "qualification"
-              ? "qualification"
-              : "matrix"
-    );
+    const workspaceTabs = new Set(["approval", "chapter", "evidence", "review", "documents", "qualification"]);
+    setWorkspaceNode(workspaceTabs.has(tab) ? tab : "matrix");
   };
 
   const resetNewProjectDraft = () => {
@@ -4404,6 +4829,9 @@ export function App() {
                             <Button icon={<RobotOutlined />} loading={loadingMatrix} onClick={() => handleGenerateMatrix()}>
                               生成矩阵
                             </Button>
+                            <Button icon={<FileSearchOutlined />} disabled={!matrixRows.length} onClick={() => activateWorkflowStep("review")}>
+                              矩阵审阅
+                            </Button>
                             <Button disabled={!selectedRowKeys.length} onClick={handleBatchConfirm}>
                               批量确认
                             </Button>
@@ -4619,6 +5047,264 @@ export function App() {
                             }
                           ]}
                         />
+                      </div>
+                    )
+                  },
+                  {
+                    key: "review",
+                    label: "矩阵审阅",
+                    children: (
+                      <div className="workspace-panel matrix-review-panel">
+                        <div className="matrix-review-header">
+                          <div>
+                            <Text strong>原文 / 矩阵对照审阅</Text>
+                            <p>按解析 chunk 定位来源，支持人工划选补漏、重复关联、级联确认和相似片段差异核对。</p>
+                          </div>
+                          <Space wrap>
+                            <Tag color="green">
+                              已确认 {reviewProgress.confirmed}/{reviewProgress.total}
+                            </Tag>
+                            <Tag color={reviewProgress.highTotal === reviewProgress.highConfirmed ? "green" : "red"}>
+                              高风险 {reviewProgress.highConfirmed}/{reviewProgress.highTotal}
+                            </Tag>
+                            <Tag color={reviewUncoveredChunks.length ? "gold" : "green"}>
+                              疑似未覆盖 {reviewUncoveredChunks.length}
+                            </Tag>
+                            <Tag color={reviewDuplicateGroups.length ? "blue" : "default"}>
+                              关联组 {reviewDuplicateGroups.length}
+                            </Tag>
+                            <Select<MatrixReviewFilter>
+                              value={matrixReviewFilter}
+                              onChange={setMatrixReviewFilter}
+                              className="toolbar-select"
+                              options={[
+                                { value: "unconfirmed", label: "仅未确认" },
+                                { value: "high", label: "高风险" },
+                                { value: "mandatory", label: "强制项" },
+                                { value: "missing_evidence", label: "缺证据" },
+                                { value: "all", label: "全部条目" }
+                              ]}
+                            />
+                            <Button
+                              icon={<HighlightOutlined />}
+                              type={sourceCreateMode ? "primary" : "default"}
+                              onClick={() => setSourceCreateMode((value) => !value)}
+                            >
+                              从原文新增
+                            </Button>
+                          </Space>
+                        </div>
+                        {sourceCreateMode && (
+                          <Alert
+                            type="info"
+                            showIcon
+                            message="请在左侧原文中划选需要补入矩阵的文字"
+                            description="划选后会打开新增条目弹窗，系统保存 chunk 来源并提示其他相似片段。"
+                          />
+                        )}
+                        <Progress
+                          percent={reviewProgress.total ? Math.round((reviewProgress.confirmed / reviewProgress.total) * 100) : 0}
+                          showInfo={false}
+                          strokeColor="#16a34a"
+                        />
+                        {matrixRows.length === 0 ? (
+                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无矩阵项；请先生成合规矩阵" />
+                        ) : (
+                          <div className="matrix-review-layout">
+                            <div className="review-source-pane">
+                              <div className="review-pane-title">
+                                <Text strong>招标文件原文</Text>
+                                <Tag>{reviewDocument?.current_version?.version_label ?? "当前解析版本"}</Tag>
+                              </div>
+                              <Spin spinning={loadingReviewChunks}>
+                                {reviewDisplayChunks.length ? (
+                                  reviewDisplayChunks.map((chunk) => {
+                                    const chunkRows = matrixRows.filter((row) => row.raw.source_chunk_id === chunk.id);
+                                    const uncovered = uncoveredChunkMap.get(chunk.id);
+                                    const chunkRisk = chunkRows.some((row) => row.riskCode === "high")
+                                      ? "high"
+                                      : chunkRows.some((row) => row.riskCode === "medium")
+                                        ? "medium"
+                                        : chunkRows.length
+                                          ? "low"
+                                          : "none";
+                                    const isActive = chunkRows.some((row) => row.key === activeReviewItemId);
+                                    return (
+                                      <div
+                                        key={chunk.id}
+                                        id={`review-chunk-${chunk.id}`}
+                                        role="button"
+                                        tabIndex={0}
+                                        className={`review-chunk review-risk-${chunkRisk} ${uncovered ? "uncovered" : ""} ${isActive ? "active" : ""}`}
+                                        onClick={() => focusReviewChunk(chunk.id)}
+                                        onMouseUp={(event) => handleReviewChunkMouseUp(event, chunk)}
+                                      >
+                                        <span className="review-chunk-meta">
+                                          #{chunk.chunk_index}
+                                          {chunk.page_no ? ` · P${chunk.page_no}` : ""}
+                                          {chunk.heading_path ? ` · ${chunk.heading_path}` : ""}
+                                        </span>
+                                        <span className="review-chunk-text">{chunk.content_text}</span>
+                                        {uncovered && (
+                                          <span className="review-uncovered-hint">
+                                            <WarningOutlined /> 疑似未覆盖：{uncovered.reason}
+                                            <Button
+                                              size="small"
+                                              type="link"
+                                              onClick={(event) => {
+                                                event.stopPropagation();
+                                                openSourceCreateDraft(chunk);
+                                              }}
+                                            >
+                                              新增条目
+                                            </Button>
+                                          </span>
+                                        )}
+                                        {chunkRows.length > 0 && (
+                                          <span className="review-chunk-tags">
+                                            {chunkRows.slice(0, 3).map((row) => (
+                                              <Tag key={row.key} color={statusColor(row.statusCode)}>
+                                                {row.status}
+                                              </Tag>
+                                            ))}
+                                            {chunkRows.length > 3 && <Tag>+{chunkRows.length - 3}</Tag>}
+                                          </span>
+                                        )}
+                                      </div>
+                                    );
+                                  })
+                                ) : (
+                                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可展示的解析分块" />
+                                )}
+                              </Spin>
+                            </div>
+                            <div className="review-item-pane">
+                              <div className="review-pane-title">
+                                <Text strong>合规条目队列</Text>
+                                <Badge count={matrixReviewRows.length} showZero color="#2563eb" />
+                              </div>
+                              {matrixReviewRows.length ? (
+                                matrixReviewRows.map((row) => {
+                                  const isActive = row.key === activeReviewItemId;
+                                  const duplicateGroups = duplicateGroupByItemId.get(row.key) ?? [];
+                                  const reviewDetail = (
+                                    <Space direction="vertical" size={8} className="review-popover">
+                                      <Text strong>{row.requirement}</Text>
+                                      {row.raw.source_quote && <Text type="secondary">来源摘录：{row.raw.source_quote}</Text>}
+                                      {row.raw.classification_reason && <Text type="secondary">分类理由：{row.raw.classification_reason}</Text>}
+                                      {row.raw.split_reason && <Text type="secondary">拆分理由：{row.raw.split_reason}</Text>}
+                                      {row.raw.review_hint && <Alert type="warning" showIcon message={row.raw.review_hint} />}
+                                      {duplicateGroups.length > 0 && (
+                                        <Space wrap>
+                                          {duplicateGroups.map((group) => (
+                                            <Tag key={group.group_key} color={group.group_type === "confirmed" ? "green" : "blue"}>
+                                              关联 x{group.item_count} · {group.group_type === "confirmed" ? "已确认" : "疑似"}
+                                            </Tag>
+                                          ))}
+                                        </Space>
+                                      )}
+                                    </Space>
+                                  );
+                                  return (
+                                    <div
+                                      key={row.key}
+                                      data-review-item-id={row.key}
+                                      className={`review-item-card review-risk-${row.riskCode} ${row.statusCode === "confirmed" ? "confirmed" : ""} ${isActive ? "active" : ""}`}
+                                      onClick={() => focusReviewRow(row)}
+                                    >
+                                      <div className="review-item-top">
+                                        <Space size={6} wrap>
+                                          <Tag color={riskColor(row.riskCode)}>{row.risk}</Tag>
+                                          <Tag>{row.chapter}</Tag>
+                                          {row.mandatory && <Tag color="red">强制</Tag>}
+                                          {row.raw.needs_human_review && <Tag color="orange">需复核</Tag>}
+                                          {row.enterpriseEvidenceCount === 0 && <Tag color="gold">缺证据</Tag>}
+                                          {(row.raw.duplicate_group_count > 1 || duplicateGroups.length > 0) && (
+                                            <Tag color={row.raw.duplicate_group_id ? "green" : "blue"} icon={<BranchesOutlined />}>
+                                              关联 x{Math.max(row.raw.duplicate_group_count, duplicateGroups[0]?.item_count ?? 0)}
+                                            </Tag>
+                                          )}
+                                        </Space>
+                                        <Tag color={statusColor(row.statusCode)}>{row.status}</Tag>
+                                      </div>
+                                      <Popover content={reviewDetail} trigger="hover" mouseEnterDelay={0.15}>
+                                        <Text strong className="review-item-summary">
+                                          {truncateText(row.requirement, 44)}
+                                        </Text>
+                                      </Popover>
+                                      <Text type="secondary" className="review-item-reason">
+                                        {row.raw.review_hint ||
+                                          row.raw.classification_reason ||
+                                          explanationText(row.raw.rule_explanation, "risk_reason")}
+                                      </Text>
+                                      <Space size={6} wrap>
+                                        <Button size="small" onClick={(event) => { event.stopPropagation(); focusReviewRow(row); }}>
+                                          定位原文
+                                        </Button>
+                                        <Button size="small" onClick={(event) => { event.stopPropagation(); setSourceDrawer(row); }}>
+                                          来源详情
+                                        </Button>
+                                        <Button
+                                          size="small"
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            void openSimilarCandidates(row);
+                                          }}
+                                        >
+                                          查找相似
+                                        </Button>
+                                        <Button
+                                          size="small"
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            void handleConfirmDuplicateGroup(row);
+                                          }}
+                                        >
+                                          确认关联
+                                        </Button>
+                                        {row.raw.duplicate_group_id && (
+                                          <>
+                                            <Button
+                                              size="small"
+                                              onClick={(event) => {
+                                                event.stopPropagation();
+                                                void handleUnlinkDuplicateGroup(row);
+                                              }}
+                                            >
+                                              解除联动
+                                            </Button>
+                                            <Button
+                                              size="small"
+                                              onClick={(event) => {
+                                                event.stopPropagation();
+                                                void handleSplitDuplicateGroup(row);
+                                              }}
+                                            >
+                                              拆分
+                                            </Button>
+                                          </>
+                                        )}
+                                        <Button
+                                          size="small"
+                                          type="primary"
+                                          disabled={row.statusCode === "confirmed"}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            handleConfirmItem(row);
+                                          }}
+                                        >
+                                          确认
+                                        </Button>
+                                      </Space>
+                                    </div>
+                                  );
+                                })
+                              ) : (
+                                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前筛选条件下暂无条目" />
+                              )}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )
                   },
@@ -5344,6 +6030,79 @@ export function App() {
         </Space>
       </Modal>
       <Modal
+        title="从原文新增合规条目"
+        open={Boolean(sourceSelectionDraft)}
+        width={760}
+        okText="保存并查找相似片段"
+        cancelText="取消"
+        confirmLoading={savingSourceItem}
+        onOk={handleCreateSourceItem}
+        onCancel={() => setSourceSelectionDraft(null)}
+      >
+        {sourceSelectionDraft && (
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            <Alert
+              type="info"
+              showIcon
+              message={`来源：#${sourceSelectionDraft.chunk.chunk_index}${sourceSelectionDraft.chunk.page_no ? ` · P${sourceSelectionDraft.chunk.page_no}` : ""}`}
+              description={sourceSelectionDraft.chunk.heading_path ?? "未识别章节路径"}
+            />
+            <TextArea
+              value={sourceSelectionDraft.selectedText}
+              autoSize={{ minRows: 4, maxRows: 8 }}
+              onChange={(event) =>
+                setSourceSelectionDraft((draft) => draft ? { ...draft, selectedText: event.target.value } : draft)
+              }
+            />
+            <Space.Compact style={{ width: "100%" }}>
+              <Select
+                value={sourceSelectionDraft.itemType}
+                style={{ width: "34%" }}
+                options={Object.entries(itemTypeLabels).map(([value, label]) => ({ value, label }))}
+                onChange={(value) =>
+                  setSourceSelectionDraft((draft) => draft ? { ...draft, itemType: value } : draft)
+                }
+              />
+              <Select
+                value={sourceSelectionDraft.riskLevel}
+                style={{ width: "33%" }}
+                options={Object.entries(riskLabels).map(([value, label]) => ({ value, label: `风险：${label}` }))}
+                onChange={(value) =>
+                  setSourceSelectionDraft((draft) => draft ? { ...draft, riskLevel: value } : draft)
+                }
+              />
+              <Select
+                value={sourceSelectionDraft.isMandatory ? "mandatory" : "normal"}
+                style={{ width: "33%" }}
+                options={[
+                  { value: "mandatory", label: "强制处理" },
+                  { value: "normal", label: "普通响应" }
+                ]}
+                onChange={(value) =>
+                  setSourceSelectionDraft((draft) => draft ? { ...draft, isMandatory: value === "mandatory" } : draft)
+                }
+              />
+            </Space.Compact>
+            <TextArea
+              placeholder="处理建议"
+              value={sourceSelectionDraft.responseSuggestion}
+              autoSize={{ minRows: 2, maxRows: 4 }}
+              onChange={(event) =>
+                setSourceSelectionDraft((draft) => draft ? { ...draft, responseSuggestion: event.target.value } : draft)
+              }
+            />
+            <TextArea
+              placeholder="新增原因"
+              value={sourceSelectionDraft.reason}
+              autoSize={{ minRows: 2, maxRows: 4 }}
+              onChange={(event) =>
+                setSourceSelectionDraft((draft) => draft ? { ...draft, reason: event.target.value } : draft)
+              }
+            />
+          </Space>
+        )}
+      </Modal>
+      <Modal
         title="新增企业资料"
         open={materialModalOpen}
         width={720}
@@ -5794,8 +6553,15 @@ export function App() {
             </div>
             <div className="source-section">
               <Text type="secondary">原文摘录</Text>
-              <p>{sourceDrawer.raw.source_content_text ?? sourceDrawer.raw.evidence_text ?? sourceDrawer.requirement}</p>
+              <p>{sourceDrawer.raw.source_quote ?? sourceDrawer.raw.source_content_text ?? sourceDrawer.raw.evidence_text ?? sourceDrawer.requirement}</p>
             </div>
+            {(sourceDrawer.raw.classification_reason || sourceDrawer.raw.split_reason || sourceDrawer.raw.review_hint) && (
+              <div className="source-section">
+                <Text type="secondary">AI/规则复核提示</Text>
+                <p>{sourceDrawer.raw.review_hint ?? sourceDrawer.raw.classification_reason ?? "暂无复核提示"}</p>
+                {sourceDrawer.raw.split_reason && <p>{sourceDrawer.raw.split_reason}</p>}
+              </div>
+            )}
             <div className="source-section">
               <Text type="secondary">规则命中解释</Text>
               <p>

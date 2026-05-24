@@ -1181,6 +1181,125 @@
   margin-top: 8px;
 }
 
+.matrix-review-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.matrix-review-header,
+.review-pane-title,
+.review-item-top {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.matrix-review-header p {
+  color: #5f6b7a;
+  margin: 4px 0 0;
+}
+
+.matrix-review-layout {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(360px, 1.25fr) minmax(320px, 0.85fr);
+  min-height: 620px;
+}
+
+.review-source-pane,
+.review-item-pane {
+  background: #ffffff;
+  border: 1px solid #d9e1ee;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  overflow: auto;
+  padding: 14px;
+}
+
+.review-chunk {
+  background: #f8fafc;
+  border: 1px solid #e3e9f3;
+  border-left-width: 5px;
+  border-radius: 8px;
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  text-align: left;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+  width: 100%;
+}
+
+.review-chunk:hover,
+.review-chunk.active,
+.review-item-card:hover,
+.review-item-card.active {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.review-risk-high {
+  border-left-color: #ef4444;
+}
+
+.review-risk-medium {
+  border-left-color: #f59e0b;
+}
+
+.review-risk-low {
+  border-left-color: #facc15;
+}
+
+.review-risk-none {
+  border-left-color: #cbd5e1;
+}
+
+.review-chunk-meta,
+.review-item-reason {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.review-chunk-text,
+.review-item-summary,
+.review-item-reason {
+  overflow-wrap: anywhere;
+}
+
+.review-chunk-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.review-item-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-left-width: 5px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+}
+
+.review-item-card.confirmed {
+  background: #f0fdf4;
+  border-left-color: #22c55e;
+}
+
+.review-item-summary,
+.review-item-reason {
+  display: block;
+}
+
 @media (max-width: 1180px) {
   .home-metrics {
     grid-template-columns: repeat(2, minmax(160px, 1fr));
@@ -1220,6 +1339,10 @@
 
   .key-info-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .matrix-review-layout {
+    grid-template-columns: 1fr;
   }
 }
 

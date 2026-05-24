@@ -61,6 +61,20 @@ class ComplianceItem(Base):
             "source_version_id",
             "source_chunk_id",
         ),
+        Index(
+            "idx_cm_dedup",
+            "tenant_id",
+            "project_id",
+            "section_id",
+            "dedup_key",
+        ),
+        Index(
+            "idx_cm_duplicate_group",
+            "tenant_id",
+            "project_id",
+            "section_id",
+            "duplicate_group_id",
+        ),
         Index("idx_cm_updated", "tenant_id", "project_id", "updated_at"),
     )
 
@@ -90,6 +104,17 @@ class ComplianceItem(Base):
     response_suggestion: Mapped[str | None] = mapped_column(Text, nullable=True)
     evidence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     explanation_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    dedup_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    duplicate_group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    duplicate_group_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duplicate_group_confirmed_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    duplicate_group_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    selected_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    selection_start_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selection_end_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_create_method: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending_confirm")
     risk_level: Mapped[str] = mapped_column(String(32), nullable=False, default="low")
     is_mandatory: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

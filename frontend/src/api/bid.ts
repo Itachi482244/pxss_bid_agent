@@ -223,6 +223,21 @@ export type ComplianceItem = {
   response_suggestion: string | null;
   evidence_text: string | null;
   rule_explanation: Record<string, unknown> | null;
+  dedup_key: string | null;
+  duplicate_group_id: string | null;
+  duplicate_group_status: string | null;
+  duplicate_group_confirmed_at: string | null;
+  duplicate_group_confirmed_by: string | null;
+  duplicate_group_count: number;
+  selected_text: string | null;
+  selection_start_offset: number | null;
+  selection_end_offset: number | null;
+  source_create_method: string | null;
+  review_hint: string | null;
+  classification_reason: string | null;
+  split_reason: string | null;
+  source_quote: string | null;
+  needs_human_review: boolean;
   enterprise_evidence_count: number;
   enterprise_evidence_summary: string | null;
   priority_rank: number;
@@ -240,8 +255,72 @@ export type ComplianceItem = {
   modified_by: string | null;
   modified_at: string | null;
   modify_reason: string | null;
+  cascade_affected_count: number;
+  cascade_affected_items: Array<Record<string, unknown>>;
   created_at: string;
   updated_at: string;
+};
+
+export type TextDiffSegment = {
+  operation: "equal" | "delete" | "insert" | "replace";
+  base_text: string | null;
+  candidate_text: string | null;
+};
+
+export type SimilarCandidate = {
+  candidate_key: string;
+  source_chunk_id: string;
+  source_chunk_index: number;
+  page_no: number | null;
+  heading_path: string | null;
+  selected_text: string;
+  selection_start_offset: number | null;
+  selection_end_offset: number | null;
+  similarity: number;
+  match_type: string;
+  diff_segments: TextDiffSegment[];
+  existing_item_id: string | null;
+};
+
+export type MatrixReviewUncoveredChunk = {
+  chunk: DocumentChunk;
+  reason: string;
+};
+
+export type MatrixReviewDuplicateGroup = {
+  group_key: string;
+  group_type: "candidate" | "confirmed";
+  status: string;
+  item_ids: string[];
+  item_count: number;
+  representative_text: string;
+};
+
+export type MatrixReview = {
+  chunks: DocumentChunk[];
+  items: ComplianceItem[];
+  stats: {
+    total_items: number;
+    confirmed_items: number;
+    high_risk_total: number;
+    high_risk_confirmed: number;
+    uncovered_chunk_count: number;
+    duplicate_candidate_group_count: number;
+    duplicate_confirmed_group_count: number;
+  };
+  uncovered_chunks: MatrixReviewUncoveredChunk[];
+  duplicate_groups: MatrixReviewDuplicateGroup[];
+};
+
+export type ComplianceItemFromSourceResult = {
+  item: ComplianceItem;
+  similar_candidates: SimilarCandidate[];
+};
+
+export type DuplicateGroupActionResult = {
+  duplicate_group_id: string | null;
+  affected_item_count: number;
+  items: ComplianceItem[];
 };
 
 export type AuditLog = {
@@ -903,6 +982,13 @@ export async function getPreflightCheck(projectId: string, sectionId: string) {
   return response.data;
 }
 
+export async function getMatrixReview(projectId: string, sectionId: string) {
+  const response = await apiClient.get<MatrixReview>(
+    `/projects/${projectId}/sections/${sectionId}/matrix-review`
+  );
+  return response.data;
+}
+
 export async function listQualificationEvaluations(projectId: string, sectionId: string) {
   const response = await apiClient.get<QualificationEvaluation[]>(
     `/projects/${projectId}/sections/${sectionId}/qualification-evaluations`
@@ -1176,10 +1262,110 @@ export async function confirmComplianceItem(
   itemId: string,
   payload: {
     reason: string;
+    source_verified?: boolean;
+    cascade?: boolean;
   }
 ) {
   const response = await apiClient.post<ComplianceItem>(
     `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/confirm`,
+    payload
+  );
+  return response.data;
+}
+
+export async function createComplianceItemFromSource(
+  projectId: string,
+  sectionId: string,
+  payload: {
+    source_chunk_id: string;
+    selected_text: string;
+    selection_start_offset?: number | null;
+    selection_end_offset?: number | null;
+    item_type: string;
+    risk_level: string;
+    is_mandatory: boolean;
+    response_suggestion?: string | null;
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<ComplianceItemFromSourceResult>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/from-source`,
+    payload
+  );
+  return response.data;
+}
+
+export async function listSimilarCandidates(projectId: string, sectionId: string, itemId: string) {
+  const response = await apiClient.post<SimilarCandidate[]>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/similar-candidates`
+  );
+  return response.data;
+}
+
+export async function applySimilarCandidates(
+  projectId: string,
+  sectionId: string,
+  itemId: string,
+  payload: {
+    candidates: Array<{
+      candidate_key: string;
+      source_chunk_id: string;
+      selected_text: string;
+      selection_start_offset?: number | null;
+      selection_end_offset?: number | null;
+      action: "join_group" | "create_independent" | "skip";
+    }>;
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<DuplicateGroupActionResult>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/similar-candidates/apply`,
+    payload
+  );
+  return response.data;
+}
+
+export async function confirmDuplicateGroup(
+  projectId: string,
+  sectionId: string,
+  itemId: string,
+  payload: {
+    item_ids?: string[] | null;
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<DuplicateGroupActionResult>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/duplicate-group/confirm`,
+    payload
+  );
+  return response.data;
+}
+
+export async function unlinkDuplicateGroupItem(
+  projectId: string,
+  sectionId: string,
+  itemId: string,
+  payload: {
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<DuplicateGroupActionResult>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/duplicate-group/unlink`,
+    payload
+  );
+  return response.data;
+}
+
+export async function splitDuplicateGroupItem(
+  projectId: string,
+  sectionId: string,
+  itemId: string,
+  payload: {
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<DuplicateGroupActionResult>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/duplicate-group/split`,
     payload
   );
   return response.data;

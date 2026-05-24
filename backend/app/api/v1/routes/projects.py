@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from difflib import SequenceMatcher
 from typing import Annotated
 from urllib.parse import quote
 
@@ -56,10 +58,18 @@ from app.schemas.project import (
     ComplianceItemsBulkAssignRequest,
     ComplianceItemsBulkConfirmRequest,
     ComplianceItemConfirmRequest,
+    ComplianceItemFromSourceRequest,
+    ComplianceItemFromSourceResult,
     ComplianceMatrixGenerateRequest,
     DraftFactCheckRead,
+    DuplicateGroupActionRequest,
+    DuplicateGroupActionResult,
     ComplianceItemRead,
     ComplianceItemUpdateRequest,
+    MatrixReviewDuplicateGroupRead,
+    MatrixReviewRead,
+    MatrixReviewStats,
+    MatrixReviewUncoveredChunkRead,
     ModelInvocationLogRead,
     PreflightCheckItem,
     PreflightCheckRead,
@@ -81,7 +91,11 @@ from app.schemas.project import (
     SectionCreateRequest,
     SectionSummary,
     SectionUpdateRequest,
+    SimilarCandidateApplyRequest,
+    SimilarCandidateRead,
+    TextDiffSegment,
 )
+from app.schemas.document import DocumentChunkRead
 from app.services.business_draft import (
     BusinessDraftError,
     export_business_draft_word,
@@ -203,6 +217,13 @@ def compliance_item_snapshot(item: ComplianceItem) -> dict[str, object]:
         "risk_level": item.risk_level,
         "is_mandatory": item.is_mandatory,
         "is_batch_confirm_allowed": item.is_batch_confirm_allowed,
+        "dedup_key": item.dedup_key,
+        "duplicate_group_id": str(item.duplicate_group_id) if item.duplicate_group_id else None,
+        "duplicate_group_status": item.duplicate_group_status,
+        "selected_text": item.selected_text,
+        "selection_start_offset": item.selection_start_offset,
+        "selection_end_offset": item.selection_end_offset,
+        "source_create_method": item.source_create_method,
         "explanation_json": item.explanation_json,
         "owner_user_id": str(item.owner_user_id) if item.owner_user_id else None,
         "confirmed_by": str(item.confirmed_by) if item.confirmed_by else None,
@@ -299,6 +320,220 @@ def enterprise_evidence_summary_for_item(
     return len(names), summary
 
 
+REVIEW_SIGNAL_KEYWORDS = (
+    "必须",
+    "不得",
+    "应当",
+    "须",
+    "资格",
+    "资质",
+    "许可证",
+    "截止",
+    "保证金",
+    "评分",
+    "响应",
+    "验收",
+    "证书",
+    "承诺",
+)
+POLLUTION_KEYWORDS = (
+    "采购人：",
+    "采购人:",
+    "代理机构：",
+    "代理机构:",
+    "联系人",
+    "联系电话",
+    "联系方式",
+    "项目编号",
+    "公告标题",
+)
+
+
+def normalize_requirement_key(text: str) -> str:
+    compact = re.sub(r"\s+", "", text.lower())
+    compact = re.sub(r"[，。、“”‘’：:；;,.!?！？（）()\[\]【】<>《》\-_/\\|]+", "", compact)
+    return compact[:160]
+
+
+def is_pollution_text(text: str, heading_path: str | None = None) -> bool:
+    combined = f"{heading_path or ''} {text}"
+    if any(keyword in combined for keyword in POLLUTION_KEYWORDS):
+        return True
+    return bool(re.fullmatch(r"\s*(公开招标公告|招标公告|采购公告|竞争性磋商公告)\s*", text.strip()))
+
+
+def chunk_has_review_signals(chunk: DocumentChunk) -> bool:
+    if is_pollution_text(chunk.content_text, chunk.heading_path):
+        return False
+    return any(keyword in chunk.content_text for keyword in REVIEW_SIGNAL_KEYWORDS)
+
+
+def duplicate_group_count_for_item(db: Session, item: ComplianceItem) -> int:
+    if item.duplicate_group_id is not None:
+        count = db.scalar(
+            select(func.count(ComplianceItem.id)).where(
+                ComplianceItem.tenant_id == item.tenant_id,
+                ComplianceItem.project_id == item.project_id,
+                ComplianceItem.section_id == item.section_id,
+                ComplianceItem.duplicate_group_id == item.duplicate_group_id,
+                ComplianceItem.deleted_at.is_(None),
+            )
+        )
+        return int(count or 0)
+    if item.dedup_key:
+        count = db.scalar(
+            select(func.count(ComplianceItem.id)).where(
+                ComplianceItem.tenant_id == item.tenant_id,
+                ComplianceItem.project_id == item.project_id,
+                ComplianceItem.section_id == item.section_id,
+                ComplianceItem.dedup_key == item.dedup_key,
+                ComplianceItem.deleted_at.is_(None),
+            )
+        )
+        return int(count or 0)
+    return 0
+
+
+def item_summary(item: ComplianceItem) -> dict[str, object]:
+    return {
+        "id": str(item.id),
+        "requirement_text": item.requirement_text,
+        "status": item.status,
+        "risk_level": item.risk_level,
+        "source_chunk_id": str(item.source_chunk_id) if item.source_chunk_id else None,
+        "duplicate_group_id": str(item.duplicate_group_id) if item.duplicate_group_id else None,
+    }
+
+
+def build_text_diff(base_text: str, candidate_text: str) -> list[TextDiffSegment]:
+    matcher = SequenceMatcher(None, base_text, candidate_text)
+    segments: list[TextDiffSegment] = []
+    for op_code, base_start, base_end, candidate_start, candidate_end in matcher.get_opcodes():
+        base_part = base_text[base_start:base_end]
+        candidate_part = candidate_text[candidate_start:candidate_end]
+        if op_code == "equal":
+            if candidate_part:
+                segments.append(TextDiffSegment(operation="equal", base_text=base_part, candidate_text=candidate_part))
+        elif op_code == "delete":
+            segments.append(TextDiffSegment(operation="delete", base_text=base_part, candidate_text=None))
+        elif op_code == "insert":
+            segments.append(TextDiffSegment(operation="insert", base_text=None, candidate_text=candidate_part))
+        elif op_code == "replace":
+            segments.append(TextDiffSegment(operation="replace", base_text=base_part, candidate_text=candidate_part))
+    return segments
+
+
+def best_chunk_match(base_text: str, chunk_text: str) -> tuple[str, int | None, int | None, float, str] | None:
+    base = base_text.strip()
+    if len(normalize_requirement_key(base)) < 8:
+        return None
+    exact_index = chunk_text.find(base)
+    if exact_index >= 0:
+        return base, exact_index, exact_index + len(base), 1.0, "exact"
+
+    normalized_base = normalize_requirement_key(base)
+    normalized_chunk = normalize_requirement_key(chunk_text)
+    if normalized_base and normalized_base in normalized_chunk:
+        return base, None, None, 0.96, "contains"
+
+    parts = [part.strip() for part in re.split(r"[。；;\n]", chunk_text) if part.strip()]
+    best: tuple[str, int | None, int | None, float, str] | None = None
+    for part in parts:
+        if len(normalize_requirement_key(part)) < 8:
+            continue
+        ratio = SequenceMatcher(None, normalize_requirement_key(base), normalize_requirement_key(part)).ratio()
+        if ratio >= 0.72 and (best is None or ratio > best[3]):
+            start = chunk_text.find(part)
+            best = (part, start if start >= 0 else None, (start + len(part)) if start >= 0 else None, ratio, "fuzzy")
+    return best
+
+
+def build_similar_candidates(
+    db: Session,
+    ctx: RequestContext,
+    *,
+    base_item: ComplianceItem,
+    limit: int = 20,
+) -> list[SimilarCandidateRead]:
+    base_text = (base_item.selected_text or base_item.requirement_text).strip()
+    if not base_text:
+        return []
+    chunks = db.scalars(
+        select(DocumentChunk)
+        .where(
+            DocumentChunk.document_version_id == base_item.source_version_id,
+            DocumentChunk.section_id == base_item.section_id,
+        )
+        .order_by(DocumentChunk.chunk_index.asc())
+    ).all()
+    existing_by_chunk = {
+        row.source_chunk_id: row.id
+        for row in db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == ctx.tenant_id,
+                ComplianceItem.project_id == base_item.project_id,
+                ComplianceItem.section_id == base_item.section_id,
+                ComplianceItem.deleted_at.is_(None),
+            )
+        ).all()
+        if row.source_chunk_id is not None and row.dedup_key == base_item.dedup_key
+    }
+    candidates: list[SimilarCandidateRead] = []
+    for chunk in chunks:
+        if chunk.id == base_item.source_chunk_id:
+            continue
+        if is_pollution_text(chunk.content_text, chunk.heading_path):
+            continue
+        match = best_chunk_match(base_text, chunk.content_text)
+        if match is None:
+            continue
+        snippet, start_offset, end_offset, similarity, match_type = match
+        candidate_key = hashlib.sha1(
+            f"{chunk.id}:{start_offset}:{end_offset}:{normalize_requirement_key(snippet)}".encode("utf-8")
+        ).hexdigest()
+        candidates.append(
+            SimilarCandidateRead(
+                candidate_key=candidate_key,
+                source_chunk_id=chunk.id,
+                source_chunk_index=chunk.chunk_index,
+                page_no=chunk.page_no,
+                heading_path=chunk.heading_path,
+                selected_text=snippet,
+                selection_start_offset=start_offset,
+                selection_end_offset=end_offset,
+                similarity=round(float(similarity), 4),
+                match_type=match_type,
+                diff_segments=build_text_diff(base_text, snippet),
+                existing_item_id=existing_by_chunk.get(chunk.id),
+            )
+        )
+    return sorted(candidates, key=lambda item: item.similarity, reverse=True)[:limit]
+
+
+def ensure_duplicate_group(
+    items: list[ComplianceItem],
+    *,
+    ctx: RequestContext,
+    now: datetime,
+) -> uuid.UUID:
+    existing_group_id = next((item.duplicate_group_id for item in items if item.duplicate_group_id), None)
+    group_id = existing_group_id or uuid.uuid4()
+    for item in items:
+        item.duplicate_group_id = group_id
+        item.duplicate_group_status = "confirmed"
+        item.duplicate_group_confirmed_at = now
+        item.duplicate_group_confirmed_by = ctx.user_id
+    return group_id
+
+
+def read_items(db: Session, items: list[ComplianceItem]) -> list[ComplianceItemRead]:
+    return [compliance_item_read_from_item(db, item) for item in items]
+
+
+def confirmation_requires_source_verified(item: ComplianceItem) -> bool:
+    return item.risk_level == "high" or item.is_mandatory or item.item_type == "qualification"
+
+
 def compliance_priority_for_item(item: ComplianceItem, evidence_count: int) -> tuple[int, str, str]:
     technical_signals = ("技术", "设备", "参数", "验收", "净化", "洁净")
     text = f"{item.requirement_text}\n{item.response_suggestion or ''}"
@@ -326,8 +561,12 @@ def compliance_item_read_payload(
     source_chunk: DocumentChunk | None,
     evidence_count: int,
     evidence_summary: str | None,
+    duplicate_group_count: int = 0,
+    cascade_affected_count: int = 0,
+    cascade_affected_items: list[dict[str, object]] | None = None,
 ) -> ComplianceItemRead:
     priority_rank, priority_label, priority_reason = compliance_priority_for_item(item, evidence_count)
+    explanation = item.explanation_json or {}
     return ComplianceItemRead(
         id=item.id,
         project_id=item.project_id,
@@ -349,6 +588,21 @@ def compliance_item_read_payload(
         response_suggestion=item.response_suggestion,
         evidence_text=item.evidence_text,
         rule_explanation=item.explanation_json,
+        dedup_key=item.dedup_key,
+        duplicate_group_id=item.duplicate_group_id,
+        duplicate_group_status=item.duplicate_group_status,
+        duplicate_group_confirmed_at=item.duplicate_group_confirmed_at,
+        duplicate_group_confirmed_by=item.duplicate_group_confirmed_by,
+        duplicate_group_count=duplicate_group_count,
+        selected_text=item.selected_text,
+        selection_start_offset=item.selection_start_offset,
+        selection_end_offset=item.selection_end_offset,
+        source_create_method=item.source_create_method,
+        review_hint=explanation.get("review_hint"),
+        classification_reason=explanation.get("classification_reason") or explanation.get("rule_reason"),
+        split_reason=explanation.get("split_reason"),
+        source_quote=explanation.get("source_quote"),
+        needs_human_review=bool(explanation.get("needs_human_review")),
         enterprise_evidence_count=evidence_count,
         enterprise_evidence_summary=evidence_summary,
         priority_rank=priority_rank,
@@ -366,6 +620,8 @@ def compliance_item_read_payload(
         modified_by=item.modified_by,
         modified_at=item.modified_at,
         modify_reason=item.modify_reason,
+        cascade_affected_count=cascade_affected_count,
+        cascade_affected_items=cascade_affected_items or [],
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
@@ -421,6 +677,7 @@ def compliance_item_read_from_item(db: Session, item: ComplianceItem) -> Complia
         item.tenant_id,
         item.id,
     )
+    duplicate_group_count = duplicate_group_count_for_item(db, item)
     return compliance_item_read_payload(
         item=item,
         source_document_title=document.title if document else None,
@@ -429,6 +686,7 @@ def compliance_item_read_from_item(db: Session, item: ComplianceItem) -> Complia
         source_chunk=source_chunk,
         evidence_count=evidence_count,
         evidence_summary=evidence_summary,
+        duplicate_group_count=duplicate_group_count,
     )
 
 
@@ -2452,6 +2710,7 @@ def list_compliance_items(
             ctx.tenant_id,
             item.id,
         )
+        duplicate_group_count = duplicate_group_count_for_item(db, item)
         results.append(
             compliance_item_read_payload(
                 item=item,
@@ -2461,9 +2720,520 @@ def list_compliance_items(
                 source_chunk=source_chunk,
                 evidence_count=evidence_count,
                 evidence_summary=evidence_summary,
+                duplicate_group_count=duplicate_group_count,
             )
         )
     return results
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/matrix-review",
+    response_model=MatrixReviewRead,
+)
+def get_matrix_review(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> MatrixReviewRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    documents = db.scalars(
+        select(Document).where(
+            Document.tenant_id == ctx.tenant_id,
+            Document.project_id == project_id,
+            Document.section_id == section_id,
+            Document.current_version_id.is_not(None),
+            Document.status != "deleted",
+        )
+    ).all()
+    version_ids = [document.current_version_id for document in documents if document.current_version_id]
+    matrix_source_version_ids = db.scalars(
+        select(ComplianceItem.source_version_id)
+        .where(
+            ComplianceItem.tenant_id == ctx.tenant_id,
+            ComplianceItem.project_id == project_id,
+            ComplianceItem.section_id == section_id,
+            ComplianceItem.deleted_at.is_(None),
+        )
+        .distinct()
+    ).all()
+    for version_id in matrix_source_version_ids:
+        if version_id not in version_ids:
+            version_ids.append(version_id)
+    chunks = (
+        db.scalars(
+            select(DocumentChunk)
+            .where(DocumentChunk.document_version_id.in_(version_ids))
+            .order_by(DocumentChunk.document_version_id.asc(), DocumentChunk.chunk_index.asc())
+        ).all()
+        if version_ids
+        else []
+    )
+    items = db.scalars(
+        select(ComplianceItem)
+        .where(
+            ComplianceItem.tenant_id == ctx.tenant_id,
+            ComplianceItem.project_id == project_id,
+            ComplianceItem.section_id == section_id,
+            ComplianceItem.deleted_at.is_(None),
+        )
+        .order_by(ComplianceItem.created_at.asc())
+    ).all()
+    item_reads = read_items(db, items)
+    item_chunk_ids = {item.source_chunk_id for item in items if item.source_chunk_id is not None}
+    uncovered_chunks = [
+        MatrixReviewUncoveredChunkRead(
+            chunk=DocumentChunkRead.model_validate(chunk),
+            reason="该原文片段包含强制/资格/截止/评分/响应等关键词，但当前没有矩阵项覆盖。",
+        )
+        for chunk in chunks
+        if chunk.id not in item_chunk_ids and chunk_has_review_signals(chunk)
+    ]
+
+    duplicate_groups: list[MatrixReviewDuplicateGroupRead] = []
+    by_group: dict[str, list[ComplianceItem]] = {}
+    by_dedup: dict[str, list[ComplianceItem]] = {}
+    for item in items:
+        if item.duplicate_group_id and item.duplicate_group_status == "confirmed":
+            by_group.setdefault(str(item.duplicate_group_id), []).append(item)
+        elif item.dedup_key:
+            by_dedup.setdefault(item.dedup_key, []).append(item)
+    for group_id, group_items in by_group.items():
+        if len(group_items) < 2:
+            continue
+        duplicate_groups.append(
+            MatrixReviewDuplicateGroupRead(
+                group_key=group_id,
+                group_type="confirmed",
+                status="confirmed",
+                item_ids=[item.id for item in group_items],
+                item_count=len(group_items),
+                representative_text=group_items[0].requirement_text,
+            )
+        )
+    for dedup_key, group_items in by_dedup.items():
+        if len(group_items) < 2:
+            continue
+        duplicate_groups.append(
+            MatrixReviewDuplicateGroupRead(
+                group_key=dedup_key,
+                group_type="candidate",
+                status="candidate",
+                item_ids=[item.id for item in group_items],
+                item_count=len(group_items),
+                representative_text=group_items[0].requirement_text,
+            )
+        )
+
+    high_items = [item for item in items if item.risk_level == "high"]
+    stats = MatrixReviewStats(
+        total_items=len(items),
+        confirmed_items=sum(1 for item in items if item.status == "confirmed"),
+        high_risk_total=len(high_items),
+        high_risk_confirmed=sum(1 for item in high_items if item.status == "confirmed"),
+        uncovered_chunk_count=len(uncovered_chunks),
+        duplicate_candidate_group_count=sum(1 for group in duplicate_groups if group.group_type == "candidate"),
+        duplicate_confirmed_group_count=sum(1 for group in duplicate_groups if group.group_type == "confirmed"),
+    )
+    return MatrixReviewRead(
+        chunks=[DocumentChunkRead.model_validate(chunk) for chunk in chunks],
+        items=item_reads,
+        stats=stats,
+        uncovered_chunks=uncovered_chunks,
+        duplicate_groups=duplicate_groups,
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/from-source",
+    response_model=ComplianceItemFromSourceResult,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_compliance_item_from_source(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: ComplianceItemFromSourceRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> ComplianceItemFromSourceResult:
+    get_section_or_404(db, ctx, project_id, section_id)
+    chunk = db.scalar(
+        select(DocumentChunk).where(
+            DocumentChunk.id == payload.source_chunk_id,
+            DocumentChunk.section_id == section_id,
+        )
+    )
+    if chunk is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source chunk not found")
+    document = db.get(Document, chunk.document_id)
+    if document is None or document.tenant_id != ctx.tenant_id or document.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source document not found")
+    selected_text = payload.selected_text.strip()
+    if selected_text not in chunk.content_text and payload.selection_start_offset is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Selected text must come from the source chunk or include explicit offsets",
+        )
+    if payload.selection_start_offset is not None and payload.selection_end_offset is not None:
+        if payload.selection_end_offset <= payload.selection_start_offset:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="selection_end_offset must be greater than selection_start_offset",
+            )
+        if payload.selection_end_offset > len(chunk.content_text):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="selection offsets exceed source chunk length",
+            )
+    dedup_key = normalize_requirement_key(selected_text)
+    now = datetime.now(UTC)
+    is_batch_confirm_allowed = payload.risk_level != "high" and not payload.is_mandatory
+    item = ComplianceItem(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        source_document_id=document.id,
+        source_version_id=chunk.document_version_id,
+        source_chunk_id=chunk.id,
+        source_page_no=chunk.page_no,
+        item_type=payload.item_type,
+        requirement_text=selected_text,
+        normalized_requirement=f"manual:{dedup_key}",
+        dedup_key=dedup_key,
+        response_suggestion=payload.response_suggestion.strip() if payload.response_suggestion else None,
+        evidence_text=selected_text,
+        explanation_json={
+            "rule_code": "MANUAL-SOURCE-CREATE",
+            "rule_reason": "审核人从招标文件原文手动新增。",
+            "source_quote": selected_text,
+            "needs_human_review": True,
+        },
+        selected_text=selected_text,
+        selection_start_offset=payload.selection_start_offset,
+        selection_end_offset=payload.selection_end_offset,
+        source_create_method="manual_selection",
+        status="pending_confirm",
+        risk_level=payload.risk_level,
+        is_mandatory=payload.is_mandatory,
+        is_batch_confirm_allowed=is_batch_confirm_allowed,
+        owner_user_id=ctx.user_id,
+        confidence_score=Decimal("1.0000"),
+        created_by=ctx.user_id,
+        modified_by=ctx.user_id,
+        modified_at=now,
+        modify_reason=payload.reason.strip(),
+    )
+    db.add(item)
+    db.flush()
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="matrix.item_created_from_source",
+        object_type="compliance_item",
+        object_id=item.id,
+        before_json=None,
+        after_json=compliance_item_snapshot(item),
+        reason=payload.reason.strip(),
+    )
+    db.commit()
+    db.refresh(item)
+    similar_candidates = build_similar_candidates(db, ctx, base_item=item)
+    return ComplianceItemFromSourceResult(
+        item=compliance_item_read_from_item(db, item),
+        similar_candidates=similar_candidates,
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/similar-candidates",
+    response_model=list[SimilarCandidateRead],
+)
+def get_similar_candidates(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> list[SimilarCandidateRead]:
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    return build_similar_candidates(db, ctx, base_item=item)
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/similar-candidates/apply",
+    response_model=DuplicateGroupActionResult,
+)
+def apply_similar_candidates(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: SimilarCandidateApplyRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> DuplicateGroupActionResult:
+    base_item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    now = datetime.now(UTC)
+    affected_items: list[ComplianceItem] = [base_item]
+    if any(candidate.action == "join_group" for candidate in payload.candidates):
+        ensure_duplicate_group([base_item], ctx=ctx, now=now)
+
+    created_items: list[ComplianceItem] = []
+    skipped: list[dict[str, object]] = []
+    for candidate in payload.candidates:
+        if candidate.action == "skip":
+            skipped.append({"candidate_key": candidate.candidate_key, "source_chunk_id": str(candidate.source_chunk_id)})
+            continue
+        chunk = db.scalar(
+            select(DocumentChunk).where(
+                DocumentChunk.id == candidate.source_chunk_id,
+                DocumentChunk.section_id == section_id,
+            )
+        )
+        if chunk is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Similar source chunk not found")
+        duplicate = db.scalar(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == ctx.tenant_id,
+                ComplianceItem.project_id == project_id,
+                ComplianceItem.section_id == section_id,
+                ComplianceItem.source_chunk_id == chunk.id,
+                ComplianceItem.dedup_key == base_item.dedup_key,
+                ComplianceItem.deleted_at.is_(None),
+            )
+        )
+        if duplicate is not None:
+            affected_items.append(duplicate)
+            if candidate.action == "join_group":
+                ensure_duplicate_group([base_item, duplicate], ctx=ctx, now=now)
+            continue
+        selected_text = candidate.selected_text.strip()
+        status_value = base_item.status if candidate.action == "join_group" and base_item.status == "confirmed" else "pending_confirm"
+        new_item = ComplianceItem(
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            source_document_id=base_item.source_document_id,
+            source_version_id=chunk.document_version_id,
+            source_chunk_id=chunk.id,
+            source_page_no=chunk.page_no,
+            item_type=base_item.item_type,
+            requirement_text=selected_text,
+            normalized_requirement=f"similar:{normalize_requirement_key(selected_text)}:{uuid.uuid4().hex[:8]}",
+            dedup_key=base_item.dedup_key or normalize_requirement_key(selected_text),
+            duplicate_group_id=base_item.duplicate_group_id if candidate.action == "join_group" else None,
+            duplicate_group_status="confirmed" if candidate.action == "join_group" else None,
+            duplicate_group_confirmed_at=now if candidate.action == "join_group" else None,
+            duplicate_group_confirmed_by=ctx.user_id if candidate.action == "join_group" else None,
+            response_suggestion=base_item.response_suggestion,
+            evidence_text=selected_text,
+            explanation_json={
+                "rule_code": "MANUAL-SIMILAR-APPLY",
+                "rule_reason": "审核人确认相似片段后补入矩阵。",
+                "source_quote": selected_text,
+                "base_item_id": str(base_item.id),
+                "similar_candidate_key": candidate.candidate_key,
+                "needs_human_review": candidate.action != "join_group",
+            },
+            selected_text=selected_text,
+            selection_start_offset=candidate.selection_start_offset,
+            selection_end_offset=candidate.selection_end_offset,
+            source_create_method="similar_candidate",
+            status=status_value,
+            risk_level=base_item.risk_level,
+            is_mandatory=base_item.is_mandatory,
+            is_batch_confirm_allowed=base_item.risk_level != "high" and not base_item.is_mandatory,
+            owner_user_id=base_item.owner_user_id or ctx.user_id,
+            confidence_score=base_item.confidence_score,
+            confirmed_by=ctx.user_id if status_value == "confirmed" else None,
+            confirmed_at=now if status_value == "confirmed" else None,
+            created_by=ctx.user_id,
+            modified_by=ctx.user_id,
+            modified_at=now,
+            modify_reason=payload.reason.strip(),
+        )
+        db.add(new_item)
+        db.flush()
+        if candidate.action == "join_group":
+            ensure_duplicate_group([base_item, new_item], ctx=ctx, now=now)
+        created_items.append(new_item)
+        affected_items.append(new_item)
+
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="matrix.similar_candidate_applied",
+        object_type="compliance_item",
+        object_id=base_item.id,
+        before_json={"base_item": item_summary(base_item)},
+        after_json={
+            "created_items": [item_summary(item) for item in created_items],
+            "affected_items": [item_summary(item) for item in affected_items],
+            "skipped": skipped,
+        },
+        reason=payload.reason.strip(),
+    )
+    db.commit()
+    return DuplicateGroupActionResult(
+        duplicate_group_id=base_item.duplicate_group_id,
+        affected_item_count=len({item.id for item in affected_items}),
+        items=read_items(db, affected_items),
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/duplicate-group/confirm",
+    response_model=DuplicateGroupActionResult,
+)
+def confirm_duplicate_group(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: DuplicateGroupActionRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> DuplicateGroupActionResult:
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    if payload.item_ids:
+        unique_ids = list(dict.fromkeys(payload.item_ids))
+        items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == ctx.tenant_id,
+                ComplianceItem.project_id == project_id,
+                ComplianceItem.section_id == section_id,
+                ComplianceItem.id.in_(unique_ids),
+                ComplianceItem.deleted_at.is_(None),
+            )
+        ).all()
+        if len(items) != len(unique_ids):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Some group items were not found")
+        if item.id not in {group_item.id for group_item in items}:
+            items.append(item)
+    elif item.dedup_key:
+        items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == ctx.tenant_id,
+                ComplianceItem.project_id == project_id,
+                ComplianceItem.section_id == section_id,
+                ComplianceItem.dedup_key == item.dedup_key,
+                ComplianceItem.duplicate_group_status.is_distinct_from("unlinked"),
+                ComplianceItem.deleted_at.is_(None),
+            )
+        ).all()
+    else:
+        items = [item]
+    if len(items) < 2:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="At least two items are required to confirm a duplicate group")
+
+    before_items = [compliance_item_snapshot(group_item) for group_item in items]
+    group_id = ensure_duplicate_group(items, ctx=ctx, now=datetime.now(UTC))
+    after_items = [compliance_item_snapshot(group_item) for group_item in items]
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="matrix.duplicate_group_confirmed",
+        object_type="compliance_item_duplicate_group",
+        object_id=group_id,
+        before_json={"items": before_items},
+        after_json={"items": after_items, "duplicate_group_id": str(group_id)},
+        reason=payload.reason.strip(),
+    )
+    db.commit()
+    return DuplicateGroupActionResult(
+        duplicate_group_id=group_id,
+        affected_item_count=len(items),
+        items=read_items(db, items),
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/duplicate-group/unlink",
+    response_model=DuplicateGroupActionResult,
+)
+def unlink_duplicate_group_item(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: DuplicateGroupActionRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> DuplicateGroupActionResult:
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    before = compliance_item_snapshot(item)
+    previous_group_id = item.duplicate_group_id
+    item.duplicate_group_id = None
+    item.duplicate_group_status = "unlinked"
+    item.duplicate_group_confirmed_at = None
+    item.duplicate_group_confirmed_by = None
+    item.modified_by = ctx.user_id
+    item.modified_at = datetime.now(UTC)
+    item.modify_reason = payload.reason.strip()
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="matrix.duplicate_group_unlinked",
+        object_type="compliance_item",
+        object_id=item.id,
+        before_json=before,
+        after_json={**compliance_item_snapshot(item), "previous_duplicate_group_id": str(previous_group_id) if previous_group_id else None},
+        reason=payload.reason.strip(),
+    )
+    db.commit()
+    return DuplicateGroupActionResult(
+        duplicate_group_id=None,
+        affected_item_count=1,
+        items=[compliance_item_read_from_item(db, item)],
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/duplicate-group/split",
+    response_model=DuplicateGroupActionResult,
+)
+def split_duplicate_group_item(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: DuplicateGroupActionRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> DuplicateGroupActionResult:
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    before = compliance_item_snapshot(item)
+    now = datetime.now(UTC)
+    new_group_id = uuid.uuid4()
+    item.duplicate_group_id = new_group_id
+    item.duplicate_group_status = "confirmed"
+    item.duplicate_group_confirmed_at = now
+    item.duplicate_group_confirmed_by = ctx.user_id
+    item.modified_by = ctx.user_id
+    item.modified_at = now
+    item.modify_reason = payload.reason.strip()
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="matrix.duplicate_group_split",
+        object_type="compliance_item",
+        object_id=item.id,
+        before_json=before,
+        after_json=compliance_item_snapshot(item),
+        reason=payload.reason.strip(),
+    )
+    db.commit()
+    return DuplicateGroupActionResult(
+        duplicate_group_id=new_group_id,
+        affected_item_count=1,
+        items=[compliance_item_read_from_item(db, item)],
+    )
 
 
 @router.patch(
@@ -2546,17 +3316,35 @@ def confirm_compliance_item(
             status_code=status.HTTP_409_CONFLICT,
             detail="Cannot confirm item without source evidence",
         )
+    cascade_items: list[ComplianceItem] = [item]
+    if payload.cascade and item.duplicate_group_id is not None and item.duplicate_group_status == "confirmed":
+        cascade_items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == ctx.tenant_id,
+                ComplianceItem.project_id == project_id,
+                ComplianceItem.section_id == section_id,
+                ComplianceItem.duplicate_group_id == item.duplicate_group_id,
+                ComplianceItem.duplicate_group_status == "confirmed",
+                ComplianceItem.deleted_at.is_(None),
+            )
+        ).all()
+    if any(confirmation_requires_source_verified(group_item) for group_item in cascade_items) and not payload.source_verified:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="High-risk, mandatory, or qualification items require source verification before confirmation",
+        )
 
-    before = compliance_item_snapshot(item)
+    before_items = [compliance_item_snapshot(group_item) for group_item in cascade_items]
     now = datetime.now(UTC)
-    item.status = "confirmed"
-    item.confirmed_by = ctx.user_id
-    item.confirmed_at = now
-    item.modified_by = ctx.user_id
-    item.modified_at = now
-    item.modify_reason = payload.reason.strip()
-    refresh_batch_confirm_guard(item)
-    after = compliance_item_snapshot(item)
+    for group_item in cascade_items:
+        group_item.status = "confirmed"
+        group_item.confirmed_by = ctx.user_id
+        group_item.confirmed_at = now
+        group_item.modified_by = ctx.user_id
+        group_item.modified_at = now
+        group_item.modify_reason = payload.reason.strip()
+        refresh_batch_confirm_guard(group_item)
+    after_items = [compliance_item_snapshot(group_item) for group_item in cascade_items]
     add_matrix_audit_log(
         db,
         ctx,
@@ -2565,13 +3353,50 @@ def confirm_compliance_item(
         action="matrix.item_confirmed",
         object_type="compliance_item",
         object_id=item.id,
-        before_json=before,
-        after_json=after,
+        before_json={"items": before_items},
+        after_json={
+            "items": after_items,
+            "source_verified": payload.source_verified,
+            "cascade": payload.cascade,
+        },
         reason=payload.reason.strip(),
     )
+    if len(cascade_items) > 1:
+        add_matrix_audit_log(
+            db,
+            ctx,
+            project_id=project_id,
+            section_id=section_id,
+            action="matrix.cascade_confirmed",
+            object_type="compliance_item_duplicate_group",
+            object_id=item.duplicate_group_id,
+            before_json={"items": before_items},
+            after_json={
+                "items": after_items,
+                "trigger_item_id": str(item.id),
+                "affected_item_count": len(cascade_items),
+            },
+            reason=payload.reason.strip(),
+        )
     db.commit()
     db.refresh(item)
-    return compliance_item_read_from_item(db, item)
+    document = db.get(Document, item.source_document_id)
+    version = db.get(DocumentVersion, item.source_version_id)
+    source_chunk = db.get(DocumentChunk, item.source_chunk_id) if item.source_chunk_id else None
+    owner_name = db.scalar(select(User.name).where(User.id == item.owner_user_id)) if item.owner_user_id else None
+    evidence_count, evidence_summary = enterprise_evidence_summary_for_item(db, item.tenant_id, item.id)
+    return compliance_item_read_payload(
+        item=item,
+        source_document_title=document.title if document else None,
+        source_version_label=version.version_label if version else None,
+        owner_name=owner_name,
+        source_chunk=source_chunk,
+        evidence_count=evidence_count,
+        evidence_summary=evidence_summary,
+        duplicate_group_count=duplicate_group_count_for_item(db, item),
+        cascade_affected_count=max(0, len(cascade_items) - 1),
+        cascade_affected_items=[item_summary(group_item) for group_item in cascade_items if group_item.id != item.id],
+    )
 
 
 @router.post(
