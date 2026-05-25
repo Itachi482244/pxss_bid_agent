@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 from decimal import Decimal
 from pathlib import Path
@@ -539,6 +540,103 @@ def create_api_test_compliance_item(
         return str(item.id)
 
 
+def create_review_test_chunks(
+    project_id: str,
+    section_id: str,
+    contents: list[str],
+) -> list[dict[str, object]]:
+    with SessionLocal() as db:
+        document = db.scalar(
+            select(Document).where(
+                Document.project_id == UUID(project_id),
+                Document.section_id == UUID(section_id),
+                Document.original_filename == "招标文件.pdf",
+            )
+        )
+        assert document is not None
+        assert document.current_version_id is not None
+        max_index = db.scalar(
+            select(func.max(DocumentChunk.chunk_index)).where(
+                DocumentChunk.document_version_id == document.current_version_id
+            )
+        ) or 0
+        chunks: list[DocumentChunk] = []
+        for index, content in enumerate(contents, start=1):
+            chunk = DocumentChunk(
+                tenant_id=document.tenant_id,
+                document_id=document.id,
+                document_version_id=document.current_version_id,
+                section_id=UUID(section_id),
+                chunk_index=max_index + index,
+                page_no=900 + index,
+                heading_path=f"MVP1.1 P1 回归/第 {index} 处",
+                content_text=content,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                bbox_json=None,
+                table_json=None,
+            )
+            db.add(chunk)
+            chunks.append(chunk)
+        db.commit()
+        return [
+            {
+                "id": str(chunk.id),
+                "chunk_index": chunk.chunk_index,
+                "page_no": chunk.page_no,
+                "content_text": chunk.content_text,
+            }
+            for chunk in chunks
+        ]
+
+
+def create_review_test_item(
+    project_id: str,
+    section_id: str,
+    chunk_id: str,
+    *,
+    requirement_text: str,
+    dedup_key: str,
+    risk_level: str = "low",
+    is_mandatory: bool = False,
+) -> str:
+    with SessionLocal() as db:
+        chunk = db.get(DocumentChunk, UUID(chunk_id))
+        assert chunk is not None
+        document = db.get(Document, chunk.document_id)
+        assert document is not None
+        user = db.scalar(select(User).where(User.external_id == "demo-admin"))
+        assert user is not None
+        item = ComplianceItem(
+            tenant_id=document.tenant_id,
+            project_id=UUID(project_id),
+            section_id=UUID(section_id),
+            source_document_id=document.id,
+            source_version_id=chunk.document_version_id,
+            source_chunk_id=chunk.id,
+            source_page_no=chunk.page_no,
+            item_type="mandatory_response",
+            requirement_text=requirement_text,
+            normalized_requirement=f"p1_test:{dedup_key}:{uuid4().hex}",
+            dedup_key=dedup_key,
+            response_suggestion="P1 回归测试项，请人工确认。",
+            evidence_text=chunk.content_text,
+            explanation_json={
+                "rule_code": "TEST-MVP11-P1",
+                "rule_reason": "MVP1.1 P1 关联组回归测试注入项。",
+            },
+            status="pending_confirm",
+            risk_level=risk_level,
+            is_mandatory=is_mandatory,
+            is_batch_confirm_allowed=risk_level != "high" and not is_mandatory,
+            owner_user_id=user.id,
+            confidence_score=Decimal("0.9000"),
+            created_by=user.id,
+        )
+        db.add(item)
+        db.commit()
+        return str(item.id)
+
+
 def test_compliance_item_update_confirm_assign_and_audit() -> None:
     client = TestClient(app)
     project_id, section_id = get_seed_project_and_section(client)
@@ -576,9 +674,16 @@ def test_compliance_item_update_confirm_assign_and_audit() -> None:
     assigned = assign_response.json()
     assert assigned["owner_name"] == "演示管理员"
 
-    confirm_response = client.post(
+    blocked_confirm_response = client.post(
         f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/{item_id}/confirm",
         json={"reason": "测试单条确认"},
+    )
+    assert blocked_confirm_response.status_code == 409
+    assert "source verification" in blocked_confirm_response.json()["detail"]
+
+    confirm_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/{item_id}/confirm",
+        json={"reason": "测试单条确认", "source_verified": True},
     )
     assert confirm_response.status_code == 200
     confirmed = confirm_response.json()
@@ -596,6 +701,217 @@ def test_compliance_item_update_confirm_assign_and_audit() -> None:
         if item["object_id"] == item_id
     }
     assert {"matrix.item_updated", "matrix.item_assigned", "matrix.item_confirmed"} <= actions
+
+
+def test_matrix_review_p1_manual_source_similar_candidates_and_apply() -> None:
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    unique = uuid4().hex[:8]
+    selected_text = f"投标人须提供洁净设备安装调试方案 {unique}。"
+    fuzzy_text = f"投标人须提供洁净设备调试安装方案 {unique}。"
+    chunks = create_review_test_chunks(
+        project_id,
+        section_id,
+        [
+            f"补充条款：{selected_text} 本条用于人工补漏回归。",
+            f"重复条款：{selected_text} 请在响应文件中承诺。",
+            f"近似条款：{fuzzy_text}",
+            f"采购人：测试单位 联系电话：13800000000 {selected_text}",
+        ],
+    )
+    base_chunk = chunks[0]
+
+    review_before_response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/matrix-review")
+    assert review_before_response.status_code == 200
+    review_before = review_before_response.json()
+    assert any(item["chunk"]["id"] == base_chunk["id"] for item in review_before["uncovered_chunks"])
+
+    start = str(base_chunk["content_text"]).index(selected_text)
+    create_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/from-source",
+        json={
+            "source_chunk_id": base_chunk["id"],
+            "selected_text": selected_text,
+            "selection_start_offset": start,
+            "selection_end_offset": start + len(selected_text),
+            "item_type": "mandatory_response",
+            "risk_level": "medium",
+            "is_mandatory": True,
+            "response_suggestion": "请提供安装调试方案并在响应文件中承诺。",
+            "reason": "P1 回归：人工从原文补漏新增",
+        },
+    )
+    assert create_response.status_code == 201
+    created_result = create_response.json()
+    created_item = created_result["item"]
+    assert created_item["source_create_method"] == "manual_selection"
+    assert created_item["selected_text"] == selected_text
+    assert created_item["selection_start_offset"] == start
+    assert created_item["selection_end_offset"] == start + len(selected_text)
+    assert created_item["dedup_key"]
+
+    candidates = created_result["similar_candidates"]
+    candidate_chunk_ids = {candidate["source_chunk_id"] for candidate in candidates}
+    assert chunks[1]["id"] in candidate_chunk_ids
+    assert chunks[2]["id"] in candidate_chunk_ids
+    assert chunks[3]["id"] not in candidate_chunk_ids
+    fuzzy_candidate = next(candidate for candidate in candidates if candidate["source_chunk_id"] == chunks[2]["id"])
+    assert fuzzy_candidate["match_type"] == "fuzzy"
+    assert any(segment["operation"] in {"insert", "replace"} for segment in fuzzy_candidate["diff_segments"])
+
+    exact_candidate = next(candidate for candidate in candidates if candidate["source_chunk_id"] == chunks[1]["id"])
+    apply_response = client.post(
+        (
+            f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/"
+            f"{created_item['id']}/similar-candidates/apply"
+        ),
+        json={
+            "reason": "P1 回归：逐个确认相似补票",
+            "candidates": [
+                {
+                    "candidate_key": exact_candidate["candidate_key"],
+                    "source_chunk_id": exact_candidate["source_chunk_id"],
+                    "selected_text": exact_candidate["selected_text"],
+                    "selection_start_offset": exact_candidate["selection_start_offset"],
+                    "selection_end_offset": exact_candidate["selection_end_offset"],
+                    "action": "join_group",
+                },
+                {
+                    "candidate_key": fuzzy_candidate["candidate_key"],
+                    "source_chunk_id": fuzzy_candidate["source_chunk_id"],
+                    "selected_text": fuzzy_candidate["selected_text"],
+                    "selection_start_offset": fuzzy_candidate["selection_start_offset"],
+                    "selection_end_offset": fuzzy_candidate["selection_end_offset"],
+                    "action": "create_independent",
+                },
+            ],
+        },
+    )
+    assert apply_response.status_code == 200
+    apply_result = apply_response.json()
+    assert apply_result["affected_item_count"] == 3
+    joined_items = [
+        item for item in apply_result["items"]
+        if item["source_chunk_id"] in {created_item["source_chunk_id"], chunks[1]["id"]}
+    ]
+    independent_items = [item for item in apply_result["items"] if item["source_chunk_id"] == chunks[2]["id"]]
+    assert len(joined_items) == 2
+    assert {item["duplicate_group_id"] for item in joined_items} == {apply_result["duplicate_group_id"]}
+    assert independent_items[0]["duplicate_group_id"] is None
+
+    audit_response = client.get(
+        f"/api/v1/projects/{project_id}/audit-logs",
+        params={"limit": 100},
+    )
+    assert audit_response.status_code == 200
+    actions = {item["action"] for item in audit_response.json()}
+    assert {"matrix.item_created_from_source", "matrix.similar_candidate_applied"} <= actions
+
+
+def test_matrix_review_p1_duplicate_group_unlink_split_and_cascade_confirmation() -> None:
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    unique = uuid4().hex[:8]
+    requirement = f"投标人须提供项目经理驻场服务承诺 {unique}。"
+    dedup_key = f"p1_duplicate_{unique}"
+    chunks = create_review_test_chunks(
+        project_id,
+        section_id,
+        [
+            f"第一处：{requirement}",
+            f"第二处：{requirement}",
+            f"第三处：{requirement}",
+        ],
+    )
+    item_ids = [
+        create_review_test_item(
+            project_id,
+            section_id,
+            str(chunk["id"]),
+            requirement_text=requirement,
+            dedup_key=dedup_key,
+        )
+        for chunk in chunks
+    ]
+
+    review_candidate_response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/matrix-review")
+    assert review_candidate_response.status_code == 200
+    candidate_groups = [
+        group for group in review_candidate_response.json()["duplicate_groups"]
+        if group["group_key"] == dedup_key and group["group_type"] == "candidate"
+    ]
+    assert candidate_groups and candidate_groups[0]["item_count"] == 3
+
+    confirm_group_response = client.post(
+        (
+            f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/"
+            f"{item_ids[0]}/duplicate-group/confirm"
+        ),
+        json={"reason": "P1 回归：人工确认重复关联组"},
+    )
+    assert confirm_group_response.status_code == 200
+    group_result = confirm_group_response.json()
+    assert group_result["affected_item_count"] == 3
+    assert group_result["duplicate_group_id"]
+    assert {item["duplicate_group_status"] for item in group_result["items"]} == {"confirmed"}
+
+    unlink_response = client.post(
+        (
+            f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/"
+            f"{item_ids[2]}/duplicate-group/unlink"
+        ),
+        json={"reason": "P1 回归：第三处存在语义差异，解除联动"},
+    )
+    assert unlink_response.status_code == 200
+    unlinked_item = unlink_response.json()["items"][0]
+    assert unlinked_item["duplicate_group_id"] is None
+    assert unlinked_item["duplicate_group_status"] == "unlinked"
+
+    confirm_item_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/{item_ids[0]}/confirm",
+        json={"reason": "P1 回归：确认同组条目并验证级联", "cascade": True},
+    )
+    assert confirm_item_response.status_code == 200
+    confirmed_item = confirm_item_response.json()
+    assert confirmed_item["status"] == "confirmed"
+    assert confirmed_item["cascade_affected_count"] == 1
+    assert confirmed_item["cascade_affected_items"][0]["id"] == item_ids[1]
+
+    with SessionLocal() as db:
+        first = db.get(ComplianceItem, UUID(item_ids[0]))
+        second = db.get(ComplianceItem, UUID(item_ids[1]))
+        third = db.get(ComplianceItem, UUID(item_ids[2]))
+        assert first is not None and second is not None and third is not None
+        assert first.status == "confirmed"
+        assert second.status == "confirmed"
+        assert third.status == "pending_confirm"
+        assert third.duplicate_group_status == "unlinked"
+
+    split_response = client.post(
+        (
+            f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/"
+            f"{item_ids[2]}/duplicate-group/split"
+        ),
+        json={"reason": "P1 回归：拆分为独立关联组"},
+    )
+    assert split_response.status_code == 200
+    split_item = split_response.json()["items"][0]
+    assert split_item["duplicate_group_id"]
+    assert split_item["duplicate_group_id"] != group_result["duplicate_group_id"]
+    assert split_item["duplicate_group_status"] == "confirmed"
+
+    audit_response = client.get(
+        f"/api/v1/projects/{project_id}/audit-logs",
+        params={"limit": 120},
+    )
+    assert audit_response.status_code == 200
+    actions = {item["action"] for item in audit_response.json()}
+    assert {
+        "matrix.duplicate_group_confirmed",
+        "matrix.duplicate_group_unlinked",
+        "matrix.duplicate_group_split",
+        "matrix.cascade_confirmed",
+    } <= actions
 
 
 def test_compliance_item_bulk_guards() -> None:
