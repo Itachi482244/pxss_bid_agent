@@ -16,7 +16,7 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.main import app
 from app.models import AsyncTask, BidSection, ComplianceItem, Project
-from app.parsers.word import parse_docx_bytes
+from app.parsers.word import ParsedWordChunk, parse_docx_bytes
 from app.services.compliance_generation import _rule_extract, execute_compliance_matrix_generation_task
 from app.services.document_parse import execute_document_parse_task
 from scripts.seed_dev_data import seed
@@ -151,6 +151,41 @@ def test_cleanroom_notice_rule_fallback_atomizes_and_deduplicates_requirements()
 
     qualification_count = sum(1 for item in candidates if item.item_type == "qualification")
     assert qualification_count >= 8
+
+
+def test_rule_fallback_splits_chinese_numbered_notice_before_classification() -> None:
+    source_text = (
+        "说明 一、为规范上城区限额以下小额公共资源交易活动，保障市场主体的合法权益，"
+        "根据有关规定，制定杭州市上城区小额交易文件示范文本2024年V1.0版。 "
+        "二、本小额交易文件示范文本适用于杭州市上城区行政区域内采用竞标方式的"
+        "限额以下小额工程建设项目，包括施工、勘察、设计、监理、全过程工程咨询项目。 "
+        "三、有下划线和交易须知前附表空白部分，由发包人根据发包项目实际情况和国家有关"
+        "法律法规规定进行填写，文字应采用斜体字；确实不需要填写内容的，用斜线标示。"
+        "除可选择部分、下划线空白部分外，其他文字不得改动。 "
+        "四、发包人委托代理机构组织交易的，代理服务费用原则上由发包人支付，可计入工程前期费用。 "
+        "五、发包人应根据项目的实际情况合理选定评审办法，鼓励选用合理低价法和双随机信用法。 "
+        "六、交易文件、工程量清单、图纸等技术资料的获取为网上免费下载形式。"
+        "发包人应在交易公告及交易文件中明确获取方式及时 间，获取截止时间同响应文件提交截止时间一致。 "
+        "七、采用综合评分法的工程项目，自交易文件发出之日起至响应文件提交截止时间"
+        "不得少于10日（日历天），其他工程项目不得少于5个工作日。"
+    )
+    chunks = [ParsedWordChunk(chunk_index=1, heading_path="PDF 第 2 页", content_text=source_text)]
+
+    candidates = _rule_extract(chunks)  # type: ignore[arg-type]
+    texts = [item.requirement_text for item in candidates]
+
+    assert len(candidates) > 1
+    assert not any("一、" in text and "二、" in text and "七、" in text for text in texts)
+    deadline_items = [item for item in candidates if item.item_type == "deadline"]
+    assert any("不得少于10日" in item.requirement_text for item in deadline_items)
+    early_marker_items = [
+        item
+        for item in candidates
+        if any(marker in item.requirement_text for marker in ("一、", "二、", "三、", "四、", "五、"))
+    ]
+    assert early_marker_items
+    assert all(item.item_type != "deadline" for item in early_marker_items)
+
 
 def test_compliance_matrix_generation_creates_items_from_word_chunks(monkeypatch) -> None:
     settings.run_tasks_inline = False

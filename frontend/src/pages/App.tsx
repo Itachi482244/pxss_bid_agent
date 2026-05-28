@@ -54,8 +54,8 @@ import {
 } from "antd";
 import type { UploadProps } from "antd";
 import dayjs from "dayjs";
-import type { Key, MouseEvent as ReactMouseEvent } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import type { CSSProperties, Key, MouseEvent as ReactMouseEvent } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   assignComplianceItem,
@@ -116,6 +116,7 @@ import {
   testChatModelConfig,
   upsertEnterpriseProfile,
   uploadDocument,
+  waiveComplianceEvidenceRequirement,
   splitDuplicateGroupItem,
   updateBusinessDraftChapter,
   updateComplianceItem
@@ -145,6 +146,11 @@ import type {
   SectionSummary,
   SimilarCandidate,
   MatrixReviewDuplicateGroup,
+  MatrixReviewDocument,
+  MatrixReviewHighlight,
+  ReviewDocumentBlock,
+  ReviewDocumentParagraph,
+  ReviewDocumentRun,
   MatrixReviewUncoveredChunk,
   TextDiffSegment,
   AsyncTask
@@ -170,6 +176,8 @@ type MatrixRow = {
   evidence: string;
   enterpriseEvidenceCount: number;
   enterpriseEvidenceSummary: string | null;
+  enterpriseEvidenceNotRequired: boolean;
+  enterpriseEvidenceNotRequiredReason: string | null;
   raw: ComplianceItem;
 };
 
@@ -563,6 +571,8 @@ function mapMatrixRow(item: ComplianceItem): MatrixRow {
     evidence: item.enterprise_evidence_summary ?? item.evidence_text ?? item.response_suggestion ?? "待补充证据",
     enterpriseEvidenceCount: item.enterprise_evidence_count,
     enterpriseEvidenceSummary: item.enterprise_evidence_summary,
+    enterpriseEvidenceNotRequired: item.enterprise_evidence_not_required,
+    enterpriseEvidenceNotRequiredReason: item.enterprise_evidence_not_required_reason,
     raw: item
   };
 }
@@ -579,6 +589,7 @@ function auditActionText(log: AuditLog) {
     "matrix.items_assigned": "批量指派矩阵项",
     "matrix.items_batch_confirmed": "批量确认矩阵项",
     "matrix.evidence_bound": "绑定企业资料证据",
+    "matrix.evidence_not_required": "标记无需绑定证据",
     "matrix.evidence_unbound": "解除企业资料证据",
     "matrix.item_created_from_source": "从原文新增矩阵项",
     "matrix.duplicate_group_confirmed": "确认重复关联组",
@@ -607,6 +618,51 @@ function auditActionText(log: AuditLog) {
   return labels[log.action] ?? log.action;
 }
 
+function paragraphCss(paragraph: ReviewDocumentParagraph | null): CSSProperties {
+  const style = paragraph?.style;
+  if (!style) return {};
+  const css: CSSProperties = {};
+  if (style.alignment) {
+    css.textAlign = style.alignment === "both" ? "justify" : (style.alignment as CSSProperties["textAlign"]);
+  }
+  if (style.indent_left_pt != null) css.marginLeft = `${style.indent_left_pt}pt`;
+  if (style.first_line_indent_pt != null) css.textIndent = `${style.first_line_indent_pt}pt`;
+  if (style.line_spacing != null) css.lineHeight = style.line_spacing;
+  return css;
+}
+
+function runCss(run: ReviewDocumentRun): CSSProperties {
+  return {
+    fontFamily: run.style.font_family ?? undefined,
+    fontSize: run.style.font_size_pt ? `${run.style.font_size_pt}pt` : undefined,
+    fontWeight: run.style.bold ? 700 : undefined,
+    fontStyle: run.style.italic ? "italic" : undefined,
+    textDecoration: run.style.underline ? "underline" : undefined,
+    color: run.style.color ?? undefined
+  };
+}
+
+function reviewBlockCss(block: ReviewDocumentBlock): CSSProperties {
+  const bbox = block.bbox_json;
+  if (!bbox || typeof bbox !== "object") return {};
+  const x0 = Number(bbox.x0);
+  const pageWidth = Number(bbox.page_width);
+  if (!Number.isFinite(x0) || !Number.isFinite(pageWidth) || pageWidth <= 0) return {};
+  return {
+    marginLeft: `${Math.min(56, Math.max(0, (x0 / pageWidth) * 72))}px`
+  };
+}
+
+function scrollElementIntoContainer(target: HTMLElement, container: HTMLElement) {
+  const targetRect = target.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  const offset = targetRect.top - containerRect.top - container.clientHeight / 2 + targetRect.height / 2;
+  container.scrollTo({
+    top: container.scrollTop + offset,
+    behavior: "smooth"
+  });
+}
+
 export function App() {
   const [assistantCollapsed, setAssistantCollapsed] = useState(false);
   const [projectNavCollapsed, setProjectNavCollapsed] = useState(false);
@@ -622,10 +678,13 @@ export function App() {
   const [riskFilter, setRiskFilter] = useState<string | undefined>();
   const [mandatoryFilter, setMandatoryFilter] = useState<string | undefined>();
   const [prioritySortEnabled, setPrioritySortEnabled] = useState(true);
-  const [matrixReviewFilter, setMatrixReviewFilter] = useState<MatrixReviewFilter>("unconfirmed");
+  const [matrixReviewFilter, setMatrixReviewFilter] = useState<MatrixReviewFilter>("all");
   const [reviewChunks, setReviewChunks] = useState<ReviewChunk[]>([]);
   const [loadingReviewChunks, setLoadingReviewChunks] = useState(false);
   const [activeReviewItemId, setActiveReviewItemId] = useState("");
+  const [locatingReviewItemId, setLocatingReviewItemId] = useState("");
+  const [reviewOpenXmlDocument, setReviewOpenXmlDocument] = useState<MatrixReviewDocument | null>(null);
+  const [reviewHighlights, setReviewHighlights] = useState<MatrixReviewHighlight[]>([]);
   const [reviewUncoveredChunks, setReviewUncoveredChunks] = useState<MatrixReviewUncoveredChunk[]>([]);
   const [reviewDuplicateGroups, setReviewDuplicateGroups] = useState<MatrixReviewDuplicateGroup[]>([]);
   const [sourceCreateMode, setSourceCreateMode] = useState(false);
@@ -639,6 +698,11 @@ export function App() {
   const [sourceDrawer, setSourceDrawer] = useState<MatrixRow | null>(null);
   const [evidenceDrawer, setEvidenceDrawer] = useState<MatrixRow | null>(null);
   const [evidenceBindings, setEvidenceBindings] = useState<ComplianceEvidenceBinding[]>([]);
+  const [openingEvidenceItemId, setOpeningEvidenceItemId] = useState("");
+  const [waivingEvidenceItemId, setWaivingEvidenceItemId] = useState("");
+  const reviewSourcePaneRef = useRef<HTMLDivElement | null>(null);
+  const reviewItemPaneRef = useRef<HTMLDivElement | null>(null);
+  const locateReviewTimerRef = useRef<number | null>(null);
   const [materialSearchQuery, setMaterialSearchQuery] = useState("");
   const [materialSearchResults, setMaterialSearchResults] = useState<EnterpriseMaterialSearchResult[]>([]);
   const [loadingMaterialSearch, setLoadingMaterialSearch] = useState(false);
@@ -801,6 +865,14 @@ export function App() {
       active = false;
     };
   }, [applyProjectList]);
+
+  useEffect(() => {
+    return () => {
+      if (locateReviewTimerRef.current !== null) {
+        window.clearTimeout(locateReviewTimerRef.current);
+      }
+    };
+  }, []);
 
   const reloadEnterprise = useCallback(async () => {
     setLoadingEnterprise(true);
@@ -1031,6 +1103,8 @@ export function App() {
       .then((review) => {
         if (!active) return;
         setReviewChunks(review.chunks);
+        setReviewOpenXmlDocument(review.review_document);
+        setReviewHighlights(review.highlights);
         setComplianceItems(review.items);
         setReviewUncoveredChunks(review.uncovered_chunks);
         setReviewDuplicateGroups(review.duplicate_groups);
@@ -1038,6 +1112,8 @@ export function App() {
       .catch(() => {
         if (!active) return;
         setReviewChunks([]);
+        setReviewOpenXmlDocument(null);
+        setReviewHighlights([]);
         setReviewUncoveredChunks([]);
         setReviewDuplicateGroups([]);
       })
@@ -1154,7 +1230,9 @@ export function App() {
         if (matrixReviewFilter === "unconfirmed") return !isMatrixItemResolved(row);
         if (matrixReviewFilter === "high") return row.riskCode === "high";
         if (matrixReviewFilter === "mandatory") return row.mandatory;
-        if (matrixReviewFilter === "missing_evidence") return row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material";
+        if (matrixReviewFilter === "missing_evidence") {
+          return !row.enterpriseEvidenceNotRequired && (row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material");
+        }
         return true;
       })
       .sort((left, right) => {
@@ -1183,6 +1261,66 @@ export function App() {
     return Array.from(new Map(pairs).values()).sort((left, right) => left.chunk_index - right.chunk_index);
   }, [matrixRows]);
   const reviewDisplayChunks = reviewChunks.length ? reviewChunks : reviewFallbackChunks;
+  const reviewChunkById = useMemo(
+    () => new Map(reviewDisplayChunks.map((chunk) => [chunk.id, chunk])),
+    [reviewDisplayChunks]
+  );
+  const effectiveReviewHighlights = useMemo<MatrixReviewHighlight[]>(() => {
+    const coveredItemIds = new Set(reviewHighlights.map((highlight) => highlight.item_id));
+    const fallbackHighlights: MatrixReviewHighlight[] = [];
+
+    matrixRows.forEach((row) => {
+      if (coveredItemIds.has(row.key)) return;
+      const chunkId = row.raw.source_chunk_id;
+      const chunkText = row.raw.source_content_text;
+      if (!chunkId || !chunkText) return;
+
+      let startOffset: number | null = null;
+      let endOffset: number | null = null;
+      let matchSource = "frontend_fallback";
+      const selectionStart = row.raw.selection_start_offset;
+      const selectionEnd = row.raw.selection_end_offset;
+      if (
+        selectionStart != null &&
+        selectionEnd != null &&
+        selectionStart >= 0 &&
+        selectionEnd > selectionStart &&
+        selectionEnd <= chunkText.length
+      ) {
+        startOffset = selectionStart;
+        endOffset = selectionEnd;
+        matchSource = "selection_offset";
+      } else {
+        const candidates = [row.raw.selected_text, row.raw.source_quote, row.raw.requirement_text].filter(
+          (candidate): candidate is string => Boolean(candidate?.trim())
+        );
+        for (const candidate of candidates) {
+          const index = chunkText.indexOf(candidate.trim());
+          if (index >= 0) {
+            startOffset = index;
+            endOffset = index + candidate.trim().length;
+            matchSource = candidate === row.raw.selected_text ? "selected_text" : "text_match";
+            break;
+          }
+        }
+      }
+
+      if (startOffset == null || endOffset == null) return;
+      fallbackHighlights.push({
+        item_id: row.key,
+        chunk_id: chunkId,
+        start_offset: startOffset,
+        end_offset: endOffset,
+        risk_level: row.riskCode,
+        status: row.statusCode,
+        item_type: row.raw.item_type,
+        match_source: matchSource,
+        text: chunkText.slice(startOffset, endOffset)
+      });
+    });
+
+    return fallbackHighlights.length ? [...reviewHighlights, ...fallbackHighlights] : reviewHighlights;
+  }, [matrixRows, reviewHighlights]);
   const uncoveredChunkMap = useMemo(() => {
     return new Map(reviewUncoveredChunks.map((item) => [item.chunk.id, item]));
   }, [reviewUncoveredChunks]);
@@ -1195,6 +1333,13 @@ export function App() {
     });
     return map;
   }, [reviewDuplicateGroups]);
+  const reviewHighlightByChunkId = useMemo(() => {
+    const map = new Map<string, MatrixReviewHighlight[]>();
+    effectiveReviewHighlights.forEach((highlight) => {
+      map.set(highlight.chunk_id, [...(map.get(highlight.chunk_id) ?? []), highlight]);
+    });
+    return map;
+  }, [effectiveReviewHighlights]);
   const reviewProgress = useMemo(() => {
     const confirmed = matrixRows.filter((row) => row.statusCode === "confirmed").length;
     const highRows = matrixRows.filter((row) => row.riskCode === "high");
@@ -1222,7 +1367,7 @@ export function App() {
 
   const evidenceRows = useMemo(() => {
     return matrixRows.filter(
-      (row) => row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material"
+      (row) => !row.enterpriseEvidenceNotRequired && (row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material")
     );
   }, [matrixRows]);
 
@@ -1572,6 +1717,8 @@ export function App() {
     if (!selectedProjectId || !selectedSectionId || activeTab !== "review") return;
     const review = await getMatrixReview(selectedProjectId, selectedSectionId);
     setReviewChunks(review.chunks);
+    setReviewOpenXmlDocument(review.review_document);
+    setReviewHighlights(review.highlights);
     setComplianceItems(review.items);
     setReviewUncoveredChunks(review.uncovered_chunks);
     setReviewDuplicateGroups(review.duplicate_groups);
@@ -1763,6 +1910,7 @@ export function App() {
   const openEvidenceBindingDrawer = useCallback(
     async (row: MatrixRow) => {
       if (!selectedProjectId || !selectedSectionId) return;
+      setOpeningEvidenceItemId(row.key);
       setEvidenceDrawer(row);
       setEvidenceBindings([]);
       setMaterialSearchResults([]);
@@ -1779,6 +1927,7 @@ export function App() {
         setApiError(error instanceof Error ? error.message : "证据绑定信息加载失败");
       } finally {
         setLoadingMaterialSearch(false);
+        setOpeningEvidenceItemId((current) => (current === row.key ? "" : current));
       }
     },
     [selectedProjectId, selectedSectionId]
@@ -1793,6 +1942,15 @@ export function App() {
   const handleBindEvidence = useCallback(
     async (material: EnterpriseMaterialSearchResult) => {
       if (!selectedProjectId || !selectedSectionId || !evidenceDrawer) return;
+      if (bindingMaterialId) return;
+      if (material.verification_status === "conflict" || material.verification_status === "expired") {
+        Modal.warning({ title: "该资料暂不可绑定", content: "冲突或过期资料不能作为响应证据绑定。" });
+        return;
+      }
+      if (evidenceBindings.some((binding) => binding.enterprise_material_id === material.id)) {
+        Modal.info({ title: "资料已绑定", content: "该资料已经绑定到当前条款，无需重复绑定。" });
+        return;
+      }
       setBindingMaterialId(material.id);
       try {
         await bindComplianceEvidence(selectedProjectId, selectedSectionId, evidenceDrawer.key, {
@@ -1804,18 +1962,85 @@ export function App() {
         appendLog(`绑定企业资料证据：${truncateText(material.name, 18)}`);
         await Promise.all([reloadEvidenceBindings(), refreshAfterMatrixMutation()]);
       } catch (error) {
-        setApiError(error instanceof Error ? error.message : "证据绑定失败");
+        const message = error instanceof Error ? error.message : "证据绑定失败";
+        if (message.includes("already bound") || message.includes("409")) {
+          await reloadEvidenceBindings().catch(() => undefined);
+          Modal.info({ title: "资料已绑定", content: "该资料已经绑定到当前条款，列表已刷新。" });
+        } else {
+          setApiError(message);
+        }
       } finally {
         setBindingMaterialId("");
       }
     },
     [
       appendLog,
+      bindingMaterialId,
       evidenceDrawer,
+      evidenceBindings,
       refreshAfterMatrixMutation,
       reloadEvidenceBindings,
       selectedProjectId,
       selectedSectionId
+    ]
+  );
+
+  const handleWaiveEvidenceRequirement = useCallback(
+    (row: MatrixRow) => {
+      if (!selectedProjectId || !selectedSectionId) return;
+      let reason = row.enterpriseEvidenceNotRequiredReason || "人工判定该条款无需绑定企业资料证据";
+      Modal.confirm({
+        title: "标记为无需绑定证据",
+        content: (
+          <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            <Text>{truncateText(row.requirement, 96)}</Text>
+            <Text type="secondary">
+              适用于资格后审方式、提示性说明等不依赖本企业资料作为响应证据的条款；该条将不再计入缺证据预检。
+            </Text>
+            <TextArea
+              defaultValue={reason}
+              autoSize={{ minRows: 2, maxRows: 4 }}
+              onChange={(event) => {
+                reason = event.target.value;
+              }}
+            />
+          </Space>
+        ),
+        okText: "无需绑定证据",
+        cancelText: "取消",
+        onOk: async () => {
+          if (!reason.trim()) {
+            Modal.warning({ title: "需要填写判断原因" });
+            throw new Error("reason required");
+          }
+          setWaivingEvidenceItemId(row.key);
+          try {
+            await waiveComplianceEvidenceRequirement(selectedProjectId, selectedSectionId, row.key, {
+              reason: reason.trim()
+            });
+            appendLog(`标记无需绑定证据：${truncateText(row.requirement, 18)}`);
+            if (evidenceDrawer?.key === row.key) {
+              setEvidenceDrawer(null);
+              setEvidenceBindings([]);
+              setMaterialSearchResults([]);
+            }
+            await refreshAfterMatrixMutation();
+          } catch (error) {
+            setApiError(error instanceof Error ? error.message : "标记无需绑定证据失败");
+            throw error;
+          } finally {
+            setWaivingEvidenceItemId("");
+          }
+        }
+      });
+    },
+    [
+      appendLog,
+      evidenceDrawer?.key,
+      refreshAfterMatrixMutation,
+      selectedProjectId,
+      selectedSectionId,
+      waiveComplianceEvidenceRequirement
     ]
   );
 
@@ -1923,19 +2148,33 @@ export function App() {
 
   const focusReviewRow = useCallback((row: MatrixRow) => {
     setActiveReviewItemId(row.key);
+    setLocatingReviewItemId(row.key);
+    if (locateReviewTimerRef.current !== null) {
+      window.clearTimeout(locateReviewTimerRef.current);
+    }
+    locateReviewTimerRef.current = window.setTimeout(() => {
+      setLocatingReviewItemId("");
+      locateReviewTimerRef.current = null;
+    }, 1800);
     window.setTimeout(() => {
-      if (row.raw.source_chunk_id) {
-        document.getElementById(`review-chunk-${row.raw.source_chunk_id}`)?.scrollIntoView({
-          block: "center",
-          behavior: "smooth"
-        });
+      const highlight = effectiveReviewHighlights.find((item) => item.item_id === row.key);
+      const target =
+        document.getElementById(`review-highlight-${row.key}`) ||
+        (highlight ? document.getElementById(`review-block-${highlight.chunk_id}`) : null) ||
+        (row.raw.source_chunk_id ? document.getElementById(`review-block-${row.raw.source_chunk_id}`) : null);
+      if (target && reviewSourcePaneRef.current) {
+        scrollElementIntoContainer(target, reviewSourcePaneRef.current);
+      } else {
+        target?.scrollIntoView({ block: "center", behavior: "smooth" });
       }
-      document.querySelector(`[data-review-item-id="${row.key}"]`)?.scrollIntoView({
-        block: "center",
-        behavior: "smooth"
-      });
+      const itemTarget = document.querySelector(`[data-review-item-id="${row.key}"]`);
+      if (itemTarget instanceof HTMLElement && reviewItemPaneRef.current) {
+        scrollElementIntoContainer(itemTarget, reviewItemPaneRef.current);
+      } else {
+        itemTarget?.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
     }, 60);
-  }, []);
+  }, [effectiveReviewHighlights]);
 
   const focusReviewChunk = useCallback(
     (chunkId: string) => {
@@ -1978,6 +2217,112 @@ export function App() {
       window.getSelection()?.removeAllRanges();
     },
     [openSourceCreateDraft, sourceCreateMode]
+  );
+
+  const activateReviewHighlight = useCallback((highlight: MatrixReviewHighlight) => {
+    setActiveReviewItemId(highlight.item_id);
+    window.setTimeout(() => {
+      const itemTarget = document.querySelector(`[data-review-item-id="${highlight.item_id}"]`);
+      if (itemTarget instanceof HTMLElement && reviewItemPaneRef.current) {
+        scrollElementIntoContainer(itemTarget, reviewItemPaneRef.current);
+      }
+    }, 60);
+  }, []);
+
+  const renderHighlightedText = useCallback(
+    (text: string, highlights: MatrixReviewHighlight[], baseKey: string, baseOffset = 0) => {
+      if (!highlights.length) return text;
+      const boundaries = new Set([0, text.length]);
+      highlights.forEach((highlight) => {
+        const start = Math.max(0, highlight.start_offset - baseOffset);
+        const end = Math.min(text.length, highlight.end_offset - baseOffset);
+        if (start < end) {
+          boundaries.add(start);
+          boundaries.add(end);
+        }
+      });
+      const sorted = Array.from(boundaries).sort((left, right) => left - right);
+      return sorted.slice(0, -1).map((start, index) => {
+        const end = sorted[index + 1];
+        const segment = text.slice(start, end);
+        const absoluteStart = baseOffset + start;
+        const absoluteEnd = baseOffset + end;
+        const highlight = highlights.find(
+          (item) => item.start_offset < absoluteEnd && item.end_offset > absoluteStart
+        );
+        if (!highlight) {
+          return <span key={`${baseKey}-plain-${index}`}>{segment}</span>;
+        }
+        const isActive = highlight.item_id === activeReviewItemId;
+        const isLocating = highlight.item_id === locatingReviewItemId;
+        const isAnchor = absoluteStart === highlight.start_offset;
+        return (
+          <span
+            key={`${baseKey}-highlight-${highlight.item_id}-${index}`}
+            id={isAnchor ? `review-highlight-${highlight.item_id}` : undefined}
+            className={`review-text-highlight review-highlight-${highlight.risk_level} ${
+              highlight.match_source === "chunk_fallback" ? "fallback" : ""
+            } ${isActive ? "active" : ""} ${isLocating ? "locating" : ""}`}
+            title={highlight.match_source === "chunk_fallback" ? "定位到段落，未定位到精确文字" : "点击查看条目详情"}
+            onClick={(event) => {
+              event.stopPropagation();
+              activateReviewHighlight(highlight);
+            }}
+          >
+            {segment}
+          </span>
+        );
+      });
+    },
+    [activateReviewHighlight, activeReviewItemId, locatingReviewItemId]
+  );
+
+  const renderReviewParagraph = useCallback(
+    (paragraph: ReviewDocumentParagraph, highlights: MatrixReviewHighlight[], keyPrefix: string) => {
+      let offset = 0;
+      return paragraph.runs.length ? (
+        <>
+          {paragraph.runs.map((run, index) => {
+            const start = offset;
+            offset += run.text.length;
+            return (
+              <span key={`${keyPrefix}-run-${index}`} style={runCss(run)}>
+                {renderHighlightedText(run.text, highlights, `${keyPrefix}-run-${index}`, start)}
+              </span>
+            );
+          })}
+        </>
+      ) : (
+        <>{renderHighlightedText(paragraph.text, highlights, keyPrefix)}</>
+      );
+    },
+    [renderHighlightedText]
+  );
+
+  const blockToReviewChunk = useCallback(
+    (block: ReviewDocumentBlock): ReviewChunk | null => {
+      if (!block.chunk_id) return null;
+      return (
+        reviewChunkById.get(block.chunk_id) ?? {
+          id: block.chunk_id,
+          chunk_index: block.chunk_index ?? 0,
+          page_no: null,
+          heading_path: null,
+          content_text: block.text,
+          document_version_id: reviewOpenXmlDocument?.version_id ?? ""
+        }
+      );
+    },
+    [reviewChunkById, reviewOpenXmlDocument?.version_id]
+  );
+
+  const handleReviewBlockMouseUp = useCallback(
+    (event: ReactMouseEvent<HTMLElement>, block: ReviewDocumentBlock) => {
+      const chunk = blockToReviewChunk(block);
+      if (!chunk) return;
+      handleReviewChunkMouseUp(event, chunk);
+    },
+    [blockToReviewChunk, handleReviewChunkMouseUp]
   );
 
   const handleCreateSourceItem = async () => {
@@ -2295,6 +2640,29 @@ export function App() {
             force: true
           });
           appendLog(`提交合规矩阵生成任务：${task.id.slice(0, 8)}`);
+          if (task.status === "failed") {
+            throw new Error(task.error_message || "合规矩阵生成失败");
+          }
+          if (task.status === "succeeded") {
+            const [items] = await Promise.all([
+              listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 }),
+              reloadDocumentsAndExports(),
+              reloadAuditLogs(),
+              getPreflightCheck(selectedProjectId, selectedSectionId).then(setPreflightCheck).catch(() => undefined),
+              activeTab === "review" ? reloadMatrixReview() : Promise.resolve()
+            ]);
+            setComplianceItems(items);
+            Modal.success({
+              title: "合规矩阵已重新生成",
+              content: `新增 ${task.output_json?.created_count ?? 0} 条，更新 ${task.output_json?.updated_count ?? 0} 条，淘汰旧项 ${task.output_json?.superseded_count ?? 0} 条。`
+            });
+            setLoadingMatrix(false);
+            return;
+          }
+          Modal.info({
+            title: "矩阵生成任务已提交",
+            content: "任务正在后台队列中等待处理；请启动 worker 或稍后刷新任务状态。"
+          });
           window.setTimeout(() => {
             listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 })
               .then((data) => setComplianceItems(data))
@@ -4464,21 +4832,32 @@ export function App() {
                           </Button>
                         </div>
                         <Table<ProjectDocument>
+                          className="document-table"
                           size="middle"
                           pagination={false}
                           rowKey="id"
                           loading={documentBusy}
                           dataSource={documents}
+                          scroll={{ x: 1040 }}
                           locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无文件" /> }}
                           columns={[
                             {
                               title: "文件",
                               dataIndex: "title",
+                              width: 360,
                               render: (value, record) => (
-                                <Space direction="vertical" size={0}>
-                                  <Text strong>{value}</Text>
-                                  <Text type="secondary">{record.original_filename}</Text>
-                                </Space>
+                                <div className="document-name-cell">
+                                  <Tooltip title={value}>
+                                    <Text strong className="document-name-text">
+                                      {value}
+                                    </Text>
+                                  </Tooltip>
+                                  <Tooltip title={record.original_filename}>
+                                    <Text type="secondary" className="document-name-text">
+                                      {record.original_filename}
+                                    </Text>
+                                  </Tooltip>
+                                </div>
                               )
                             },
                             {
@@ -4509,7 +4888,7 @@ export function App() {
                             },
                             {
                               title: "操作",
-                              width: 280,
+                              width: 300,
                               render: (_, record) => (
                                 <Space size={6} wrap>
                                   <Button size="small" onClick={() => handleOpenRevisionDrawer(record)}>
@@ -4596,11 +4975,27 @@ export function App() {
                             {
                               title: "处理",
                               dataIndex: "actions",
-                              width: 140,
+                              width: 230,
                               render: (_: unknown, record) => (
-                                <Button type="primary" size="small" onClick={() => openEvidenceBindingDrawer(record)}>
-                                  绑定资料
-                                </Button>
+                                <Space size={6} wrap>
+                                  <Button
+                                    type="primary"
+                                    size="small"
+                                    loading={openingEvidenceItemId === record.key}
+                                    disabled={Boolean(openingEvidenceItemId) && openingEvidenceItemId !== record.key}
+                                    onClick={() => openEvidenceBindingDrawer(record)}
+                                  >
+                                    绑定资料
+                                  </Button>
+                                  <Button
+                                    size="small"
+                                    loading={waivingEvidenceItemId === record.key}
+                                    disabled={Boolean(waivingEvidenceItemId) && waivingEvidenceItemId !== record.key}
+                                    onClick={() => handleWaiveEvidenceRequirement(record)}
+                                  >
+                                    无需绑定证据
+                                  </Button>
+                                </Space>
                               )
                             }
                           ]}
@@ -4682,94 +5077,157 @@ export function App() {
                             />
                           )}
                         </div>
-                        <Table<QualificationEvaluation>
-                          size="middle"
-                          rowKey="id"
-                          pagination={false}
-                          loading={evaluatingQualification}
-                          scroll={{ x: 1520 }}
-                          dataSource={qualificationEvaluations}
-                          locale={{
-                            emptyText: (
-                              <Empty
-                                image={Empty.PRESENTED_IMAGE_SIMPLE}
-                                description="尚未运行资格预评估"
-                              />
-                            )
-                          }}
-                          columns={[
-                            {
-                              title: "资格要求",
-                              dataIndex: "requirement_text",
-                              width: 340,
-                              render: (value) => (
-                                <Tooltip title={value}>
-                                  <span className="clamped-cell">{value}</span>
-                                </Tooltip>
+                        <div className="qualification-next-step">
+                          {!qualificationEvaluations.length ? (
+                            <>
+                              <div>
+                                <Text strong>下一步：运行资格预评估</Text>
+                                <p>先把资格类矩阵项和企业资料库做一次规则匹配，形成可确认的评估表。</p>
+                              </div>
+                              <Button
+                                type="primary"
+                                icon={<RobotOutlined />}
+                                loading={evaluatingQualification}
+                                onClick={handleRunQualificationEvaluation}
+                              >
+                                运行资格预评估
+                              </Button>
+                            </>
+                          ) : !qualificationDecision ? (
+                            <>
+                              <div>
+                                <Text strong>下一步：生成参标建议</Text>
+                                <p>评估表已有结果，继续汇总为 Go/No-Go 建议，并创建资格确认审批任务。</p>
+                              </div>
+                              <Button
+                                type="primary"
+                                icon={<SafetyCertificateOutlined />}
+                                loading={generatingDecision}
+                                onClick={handleGenerateQualificationDecision}
+                              >
+                                生成参标建议
+                              </Button>
+                            </>
+                          ) : qualificationDecision.status !== "confirmed" ? (
+                            <>
+                              <div>
+                                <Text strong>下一步：确认参标建议</Text>
+                                <p>确认后即可把该结论作为商务标生成前的资格上下文。</p>
+                              </div>
+                              <Button type="primary" onClick={handleConfirmQualificationDecision}>
+                                确认建议
+                              </Button>
+                            </>
+                          ) : (
+                            <>
+                              <div>
+                                <Text strong>下一步：生成商务标草稿</Text>
+                                <p>资格结论已确认，可以进入商务草稿生成，把评估结果传给最终产出。</p>
+                              </div>
+                              <Button
+                                type="primary"
+                                icon={<SendOutlined />}
+                                onClick={() => {
+                                  setActiveTab("chapter");
+                                  setWorkspaceNode("chapter");
+                                }}
+                              >
+                                去商务草稿
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                        <div className="qualification-table-scroll">
+                          <Table<QualificationEvaluation>
+                            size="middle"
+                            rowKey="id"
+                            pagination={false}
+                            loading={evaluatingQualification}
+                            scroll={{ x: 1580 }}
+                            dataSource={qualificationEvaluations}
+                            locale={{
+                              emptyText: (
+                                <Empty
+                                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                                  description="尚未运行资格预评估"
+                                />
                               )
-                            },
-                            {
-                              title: "类型",
-                              dataIndex: "requirement_type",
-                              width: 120,
-                              render: (value) => <Tag>{qualificationTypeLabels[value] ?? value}</Tag>
-                            },
-                            {
-                              title: "评估结果",
-                              dataIndex: "evaluation_status",
-                              width: 120,
-                              render: (value) => (
-                                <Tag color={statusColor(value)}>{qualificationStatusLabels[value] ?? value}</Tag>
-                              )
-                            },
-                            {
-                              title: "风险",
-                              dataIndex: "risk_level",
-                              width: 90,
-                              render: (value) => <Tag color={riskColor(value)}>{riskLabels[value] ?? value}</Tag>
-                            },
-                            {
-                              title: "匹配资料",
-                              dataIndex: "matched_material_name",
-                              width: 220,
-                              render: (value, record) => value || record.missing_materials?.join("、") || "需人工确认"
-                            },
-                            {
-                              title: "规则",
-                              dataIndex: "matched_rule_code",
-                              width: 190,
-                              render: (value, record) => (
-                                <Space direction="vertical" size={0}>
-                                  <Text>{value}</Text>
-                                  <Text type="secondary">v{record.rule_version}</Text>
-                                </Space>
-                              )
-                            },
-                            {
-                              title: "判断说明",
-                              dataIndex: "reason",
-                              width: 340,
-                              render: (value) => (
-                                <Tooltip title={value}>
-                                  <span className="clamped-cell">{value}</span>
-                                </Tooltip>
-                              )
-                            },
-                            {
-                              title: "确认",
-                              dataIndex: "confirmed_at",
-                              width: 160,
-                              render: (value, record) =>
-                                value ? (
-                                  <Tag color="green">已确认</Tag>
-                                ) : (
-                                  <Button size="small" onClick={() => handleConfirmQualificationEvaluation(record)}>
-                                    人工确认
-                                  </Button>
+                            }}
+                            columns={[
+                              {
+                                title: "资格要求",
+                                dataIndex: "requirement_text",
+                                width: 340,
+                                render: (value) => (
+                                  <Tooltip title={value}>
+                                    <span className="clamped-cell">{value}</span>
+                                  </Tooltip>
                                 )
-                            }
-                          ]}
-                        />
+                              },
+                              {
+                                title: "类型",
+                                dataIndex: "requirement_type",
+                                width: 120,
+                                render: (value) => <Tag>{qualificationTypeLabels[value] ?? value}</Tag>
+                              },
+                              {
+                                title: "评估结果",
+                                dataIndex: "evaluation_status",
+                                width: 120,
+                                render: (value) => (
+                                  <Tag color={statusColor(value)}>{qualificationStatusLabels[value] ?? value}</Tag>
+                                )
+                              },
+                              {
+                                title: "风险",
+                                dataIndex: "risk_level",
+                                width: 90,
+                                render: (value) => <Tag color={riskColor(value)}>{riskLabels[value] ?? value}</Tag>
+                              },
+                              {
+                                title: "匹配资料",
+                                dataIndex: "matched_material_name",
+                                width: 220,
+                                render: (value, record) => value || record.missing_materials?.join("、") || "需人工确认"
+                              },
+                              {
+                                title: "规则",
+                                dataIndex: "matched_rule_code",
+                                width: 190,
+                                render: (value, record) => (
+                                  <Space direction="vertical" size={0}>
+                                    <Text>{value}</Text>
+                                    <Text type="secondary">v{record.rule_version}</Text>
+                                  </Space>
+                                )
+                              },
+                              {
+                                title: "判断说明",
+                                dataIndex: "reason",
+                                width: 340,
+                                render: (value) => (
+                                  <Tooltip title={value}>
+                                    <span className="clamped-cell">{value}</span>
+                                  </Tooltip>
+                                )
+                              },
+                              {
+                                title: "确认",
+                                dataIndex: "confirmed_at",
+                                width: 160,
+                                fixed: "right",
+                                render: (value, record) =>
+                                  value ? (
+                                    <Tag color="green">已确认</Tag>
+                                  ) : (
+                                    <Button size="small" onClick={() => handleConfirmQualificationEvaluation(record)}>
+                                      人工确认
+                                    </Button>
+                                  )
+                              }
+                            ]}
+                          />
+                        </div>
                       </div>
                     )
                   },
@@ -4996,7 +5454,8 @@ export function App() {
                             {
                               title: "响应证据",
                               dataIndex: "evidence",
-                              width: 320,
+                              width: 360,
+                              fixed: "right",
                               render: (value: string, record) => (
                                 <Space direction="vertical" size={6} className="evidence-cell">
                                   <Tooltip title={value}>
@@ -5006,14 +5465,31 @@ export function App() {
                                     {record.enterpriseEvidenceCount > 0 && (
                                       <Tag color="blue">已绑定 {record.enterpriseEvidenceCount} 项</Tag>
                                     )}
+                                    {record.enterpriseEvidenceNotRequired && (
+                                      <Tooltip title={record.enterpriseEvidenceNotRequiredReason ?? "人工判定无需绑定企业资料证据"}>
+                                        <Tag color="green">无需绑定证据</Tag>
+                                      </Tooltip>
+                                    )}
                                     <Button
                                       size="small"
-                                      type={record.statusCode === "needs_material" ? "primary" : "default"}
+                                      type={record.statusCode === "needs_material" && !record.enterpriseEvidenceNotRequired ? "primary" : "default"}
                                       icon={<FileSearchOutlined />}
+                                      loading={openingEvidenceItemId === record.key}
+                                      disabled={Boolean(openingEvidenceItemId) && openingEvidenceItemId !== record.key}
                                       onClick={() => openEvidenceBindingDrawer(record)}
                                     >
                                       {record.enterpriseEvidenceCount ? "管理资料" : "绑定资料"}
                                     </Button>
+                                    {!record.enterpriseEvidenceNotRequired && record.enterpriseEvidenceCount === 0 && (
+                                      <Button
+                                        size="small"
+                                        loading={waivingEvidenceItemId === record.key}
+                                        disabled={Boolean(waivingEvidenceItemId) && waivingEvidenceItemId !== record.key}
+                                        onClick={() => handleWaiveEvidenceRequirement(record)}
+                                      >
+                                        无需绑定证据
+                                      </Button>
+                                    )}
                                   </Space>
                                 </Space>
                               )
@@ -5078,11 +5554,11 @@ export function App() {
                               onChange={setMatrixReviewFilter}
                               className="toolbar-select"
                               options={[
+                                { value: "all", label: "全部条目" },
                                 { value: "unconfirmed", label: "仅未确认" },
                                 { value: "high", label: "高风险" },
                                 { value: "mandatory", label: "强制项" },
-                                { value: "missing_evidence", label: "缺证据" },
-                                { value: "all", label: "全部条目" }
+                                { value: "missing_evidence", label: "缺证据" }
                               ]}
                             />
                             <Button
@@ -5111,77 +5587,215 @@ export function App() {
                           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无矩阵项；请先生成合规矩阵" />
                         ) : (
                           <div className="matrix-review-layout">
-                            <div className="review-source-pane">
+                            <div className="review-source-pane" ref={reviewSourcePaneRef}>
                               <div className="review-pane-title">
                                 <Text strong>招标文件原文</Text>
-                                <Tag>{reviewDocument?.current_version?.version_label ?? "当前解析版本"}</Tag>
+                                <Space size={6} wrap>
+                                  <Tag
+                                    color={
+                                      reviewOpenXmlDocument?.mode === "word_xml"
+                                        ? "blue"
+                                        : reviewOpenXmlDocument?.mode === "pdf_layout"
+                                          ? "cyan"
+                                          : "gold"
+                                    }
+                                  >
+                                    {reviewOpenXmlDocument?.mode === "word_xml"
+                                      ? "Word 原文"
+                                      : reviewOpenXmlDocument?.mode === "pdf_layout"
+                                        ? "PDF 原文"
+                                        : "解析文本"}
+                                  </Tag>
+                                  <Tag>
+                                    {reviewOpenXmlDocument?.version_label ??
+                                      reviewDocument?.current_version?.version_label ??
+                                      "当前解析版本"}
+                                  </Tag>
+                                </Space>
                               </div>
                               <Spin spinning={loadingReviewChunks}>
-                                {reviewDisplayChunks.length ? (
-                                  reviewDisplayChunks.map((chunk) => {
-                                    const chunkRows = matrixRows.filter((row) => row.raw.source_chunk_id === chunk.id);
-                                    const uncovered = uncoveredChunkMap.get(chunk.id);
-                                    const chunkRisk = chunkRows.some((row) => row.riskCode === "high")
-                                      ? "high"
-                                      : chunkRows.some((row) => row.riskCode === "medium")
-                                        ? "medium"
-                                        : chunkRows.length
-                                          ? "low"
-                                          : "none";
-                                    const isActive = chunkRows.some((row) => row.key === activeReviewItemId);
-                                    return (
-                                      <div
-                                        key={chunk.id}
-                                        id={`review-chunk-${chunk.id}`}
-                                        role="button"
-                                        tabIndex={0}
-                                        className={`review-chunk review-risk-${chunkRisk} ${uncovered ? "uncovered" : ""} ${isActive ? "active" : ""}`}
-                                        onClick={() => focusReviewChunk(chunk.id)}
-                                        onMouseUp={(event) => handleReviewChunkMouseUp(event, chunk)}
-                                      >
-                                        <span className="review-chunk-meta">
-                                          #{chunk.chunk_index}
-                                          {chunk.page_no ? ` · P${chunk.page_no}` : ""}
-                                          {chunk.heading_path ? ` · ${chunk.heading_path}` : ""}
-                                        </span>
-                                        <span className="review-chunk-text">{chunk.content_text}</span>
-                                        {uncovered && (
-                                          <span className="review-uncovered-hint">
-                                            <WarningOutlined /> 疑似未覆盖：{uncovered.reason}
-                                            <Button
-                                              size="small"
-                                              type="link"
-                                              onClick={(event) => {
-                                                event.stopPropagation();
-                                                openSourceCreateDraft(chunk);
-                                              }}
-                                            >
-                                              新增条目
-                                            </Button>
-                                          </span>
-                                        )}
-                                        {chunkRows.length > 0 && (
-                                          <span className="review-chunk-tags">
-                                            {chunkRows.slice(0, 3).map((row) => (
-                                              <Tag key={row.key} color={statusColor(row.statusCode)}>
-                                                {row.status}
-                                              </Tag>
-                                            ))}
-                                            {chunkRows.length > 3 && <Tag>+{chunkRows.length - 3}</Tag>}
-                                          </span>
-                                        )}
+                                {reviewOpenXmlDocument?.blocks.length ? (
+                                  <div
+                                    className={`word-review-document ${
+                                      reviewOpenXmlDocument.mode === "word_xml"
+                                        ? "word-mode"
+                                        : reviewOpenXmlDocument.mode === "pdf_layout"
+                                          ? "pdf-mode"
+                                          : "fallback-mode"
+                                    }`}
+                                    style={{
+                                      paddingTop: reviewOpenXmlDocument.page_margins?.top
+                                        ? `${Math.min(reviewOpenXmlDocument.page_margins.top, 72)}pt`
+                                        : undefined,
+                                      paddingRight: reviewOpenXmlDocument.page_margins?.right
+                                        ? `${Math.min(reviewOpenXmlDocument.page_margins.right, 72)}pt`
+                                        : undefined,
+                                      paddingBottom: reviewOpenXmlDocument.page_margins?.bottom
+                                        ? `${Math.min(reviewOpenXmlDocument.page_margins.bottom, 72)}pt`
+                                        : undefined,
+                                      paddingLeft: reviewOpenXmlDocument.page_margins?.left
+                                        ? `${Math.min(reviewOpenXmlDocument.page_margins.left, 72)}pt`
+                                        : undefined
+                                    }}
+                                  >
+                                    {reviewOpenXmlDocument.reason && (
+                                      <Alert type="warning" showIcon message={reviewOpenXmlDocument.reason} className="review-fallback-alert" />
+                                    )}
+                                    {reviewOpenXmlDocument.headers.map((header, index) => (
+                                      <div className="word-review-header-text" key={`header-${index}`}>
+                                        {header}
                                       </div>
-                                    );
-                                  })
+                                    ))}
+                                    {(() => {
+                                      let lastPdfPageNo: number | null = null;
+                                      return reviewOpenXmlDocument.blocks.map((block) => {
+                                      const highlights = block.chunk_id ? reviewHighlightByChunkId.get(block.chunk_id) ?? [] : [];
+                                      const chunk = blockToReviewChunk(block);
+                                      const uncovered = block.chunk_id ? uncoveredChunkMap.get(block.chunk_id) : undefined;
+                                      const blockActive = highlights.some((highlight) => highlight.item_id === activeReviewItemId);
+                                      const blockLocating = highlights.some((highlight) => highlight.item_id === locatingReviewItemId);
+                                      const showPdfPage =
+                                        reviewOpenXmlDocument.mode === "pdf_layout" &&
+                                        block.page_no != null &&
+                                        block.page_no !== lastPdfPageNo;
+                                      if (block.page_no != null) lastPdfPageNo = block.page_no;
+                                      const pageDivider = showPdfPage ? (
+                                        <div className="pdf-review-page-break">第 {block.page_no} 页</div>
+                                      ) : null;
+                                      if (block.type === "table") {
+                                        return (
+                                          <Fragment key={block.id}>
+                                            {pageDivider}
+                                          <div
+                                            id={block.chunk_id ? `review-block-${block.chunk_id}` : block.id}
+                                            className={`word-review-block word-review-table-block ${blockActive ? "active" : ""} ${
+                                              blockLocating ? "locating" : ""
+                                            }`}
+                                            style={reviewBlockCss(block)}
+                                            onMouseUp={(event) => handleReviewBlockMouseUp(event, block)}
+                                            onClick={() => block.chunk_id && focusReviewChunk(block.chunk_id)}
+                                          >
+                                            <table className="word-review-table">
+                                              <tbody>
+                                                {block.rows.map((row, rowIndex) => (
+                                                  <tr key={`${block.id}-row-${rowIndex}`}>
+                                                    {row.cells.map((cell, cellIndex) => (
+                                                      <td key={`${block.id}-cell-${rowIndex}-${cellIndex}`}>
+                                                        {cell.paragraphs.map((paragraph, paragraphIndex) => (
+                                                          <p
+                                                            key={`${block.id}-cell-p-${rowIndex}-${cellIndex}-${paragraphIndex}`}
+                                                            style={paragraphCss(paragraph)}
+                                                          >
+                                                            {renderReviewParagraph(
+                                                              paragraph,
+                                                              highlights,
+                                                              `${block.id}-cell-${rowIndex}-${cellIndex}-${paragraphIndex}`
+                                                            )}
+                                                          </p>
+                                                        ))}
+                                                      </td>
+                                                    ))}
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                            {uncovered && chunk && (
+                                              <div className="review-uncovered-hint">
+                                                <WarningOutlined /> 疑似未覆盖：{uncovered.reason}
+                                                <Button size="small" type="link" onClick={() => openSourceCreateDraft(chunk)}>
+                                                  新增条目
+                                                </Button>
+                                              </div>
+                                            )}
+                                          </div>
+                                          </Fragment>
+                                        );
+                                      }
+                                      return (
+                                        <Fragment key={block.id}>
+                                          {pageDivider}
+                                        <div
+                                          id={block.chunk_id ? `review-block-${block.chunk_id}` : block.id}
+                                          className={`word-review-block ${block.type === "heading" ? "word-review-heading" : ""} ${
+                                            blockActive ? "active" : ""
+                                          } ${blockLocating ? "locating" : ""}`}
+                                          style={reviewBlockCss(block)}
+                                          onMouseUp={(event) => handleReviewBlockMouseUp(event, block)}
+                                          onClick={() => block.chunk_id && focusReviewChunk(block.chunk_id)}
+                                        >
+                                          <p style={paragraphCss(block.paragraph)}>
+                                            {block.paragraph
+                                              ? renderReviewParagraph(block.paragraph, highlights, block.id)
+                                              : renderHighlightedText(block.text, highlights, block.id)}
+                                          </p>
+                                          {uncovered && chunk && (
+                                            <div className="review-uncovered-hint">
+                                              <WarningOutlined /> 疑似未覆盖：{uncovered.reason}
+                                              <Button size="small" type="link" onClick={() => openSourceCreateDraft(chunk)}>
+                                                新增条目
+                                              </Button>
+                                            </div>
+                                          )}
+                                        </div>
+                                        </Fragment>
+                                      );
+                                      });
+                                    })()}
+                                    {reviewOpenXmlDocument.footers.map((footer, index) => (
+                                      <div className="word-review-footer-text" key={`footer-${index}`}>
+                                        {footer}
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : reviewDisplayChunks.length ? (
+                                  <div className="word-review-document fallback-mode">
+                                    <Alert
+                                      type="warning"
+                                      showIcon
+                                      message="原文审阅结构暂未返回，已使用矩阵来源原文连续展示。"
+                                      className="review-fallback-alert"
+                                    />
+                                    {reviewDisplayChunks.map((chunk) => {
+                                      const highlights = reviewHighlightByChunkId.get(chunk.id) ?? [];
+                                      const uncovered = uncoveredChunkMap.get(chunk.id);
+                                      const blockActive = highlights.some((highlight) => highlight.item_id === activeReviewItemId);
+                                      const blockLocating = highlights.some((highlight) => highlight.item_id === locatingReviewItemId);
+                                      return (
+                                        <div
+                                          key={chunk.id}
+                                          id={`review-block-${chunk.id}`}
+                                          className={`word-review-block ${blockActive ? "active" : ""} ${blockLocating ? "locating" : ""}`}
+                                          onMouseUp={(event) => handleReviewChunkMouseUp(event, chunk)}
+                                          onClick={() => focusReviewChunk(chunk.id)}
+                                        >
+                                          {chunk.heading_path && <div className="word-review-fallback-heading">{chunk.heading_path}</div>}
+                                          <p>{renderHighlightedText(chunk.content_text, highlights, `fallback-${chunk.id}`)}</p>
+                                          {uncovered && (
+                                            <div className="review-uncovered-hint">
+                                              <WarningOutlined /> 疑似未覆盖：{uncovered.reason}
+                                              <Button size="small" type="link" onClick={() => openSourceCreateDraft(chunk)}>
+                                                新增条目
+                                              </Button>
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
                                 ) : (
-                                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可展示的解析分块" />
+                                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可展示的原文内容" />
                                 )}
                               </Spin>
                             </div>
-                            <div className="review-item-pane">
+                            <div className="review-item-pane" ref={reviewItemPaneRef}>
                               <div className="review-pane-title">
                                 <Text strong>合规条目队列</Text>
-                                <Badge count={matrixReviewRows.length} showZero color="#2563eb" />
+                                <Space size={6}>
+                                  <Badge count={matrixReviewRows.length} showZero color="#2563eb" />
+                                  {matrixReviewFilter !== "all" && (
+                                    <Text type="secondary">共 {matrixRows.length} 条</Text>
+                                  )}
+                                </Space>
                               </div>
                               {matrixReviewRows.length ? (
                                 matrixReviewRows.map((row) => {
@@ -5243,6 +5857,15 @@ export function App() {
                                         </Button>
                                         <Button size="small" onClick={(event) => { event.stopPropagation(); setSourceDrawer(row); }}>
                                           来源详情
+                                        </Button>
+                                        <Button
+                                          size="small"
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            openEditDraft(row);
+                                          }}
+                                        >
+                                          编辑
                                         </Button>
                                         <Button
                                           size="small"
@@ -6373,9 +6996,23 @@ export function App() {
             </div>
             <div className="evidence-section-title">
               <Title level={5}>已绑定资料</Title>
-              <Tag color={evidenceBindings.length ? "blue" : "default"}>
-                {evidenceBindings.length} 项
-              </Tag>
+              <Space size={6} wrap>
+                <Tag color={evidenceBindings.length ? "blue" : "default"}>
+                  {evidenceBindings.length} 项
+                </Tag>
+                {evidenceDrawer.enterpriseEvidenceNotRequired && (
+                  <Tag color="green">无需绑定证据</Tag>
+                )}
+                {!evidenceDrawer.enterpriseEvidenceNotRequired && !evidenceBindings.length && (
+                  <Button
+                    size="small"
+                    loading={waivingEvidenceItemId === evidenceDrawer.key}
+                    onClick={() => handleWaiveEvidenceRequirement(evidenceDrawer)}
+                  >
+                    无需绑定证据
+                  </Button>
+                )}
+              </Space>
             </div>
             <Table<ComplianceEvidenceBinding>
               size="small"
@@ -6493,21 +7130,34 @@ export function App() {
                 {
                   title: "操作",
                   dataIndex: "action",
-                  width: 92,
+                  width: 110,
                   render: (_: unknown, record) => {
                     const bound = evidenceBindings.some(
                       (binding) => binding.enterprise_material_id === record.id
                     );
+                    const blocked = record.verification_status === "conflict" || record.verification_status === "expired";
+                    const busy = Boolean(bindingMaterialId);
+                    const disabledReason = bound
+                      ? "该资料已绑定到当前条款"
+                      : blocked
+                        ? "冲突或过期资料不能绑定"
+                        : busy
+                          ? "正在绑定其他资料"
+                          : null;
                     return (
-                      <Button
-                        size="small"
-                        type="primary"
-                        disabled={bound}
-                        loading={bindingMaterialId === record.id}
-                        onClick={() => handleBindEvidence(record)}
-                      >
-                        {bound ? "已绑定" : "绑定"}
-                      </Button>
+                      <Tooltip title={disabledReason}>
+                        <span>
+                          <Button
+                            size="small"
+                            type="primary"
+                            disabled={bound || blocked || (busy && bindingMaterialId !== record.id)}
+                            loading={bindingMaterialId === record.id}
+                            onClick={() => handleBindEvidence(record)}
+                          >
+                            {bound ? "已绑定" : blocked ? "不可绑定" : "绑定"}
+                          </Button>
+                        </span>
+                      </Tooltip>
                     );
                   }
                 }

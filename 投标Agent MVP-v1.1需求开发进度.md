@@ -1,12 +1,12 @@
 # 投标 Agent MVP-v1.1 需求开发进度
 
 > 更新时间：2026-05-25
-> 当前阶段：MVP1.1 P0 + P1 已完成开发，P1 后端回归已补齐
+> 当前阶段：MVP1.1 P0 + P1 已完成开发，项目级回归通过
 > 版本定位：在 MVP1.0 可试用闭环之上，引入受控 AI 能力，增强合规矩阵的语义拆分、分类、来源核对与人工审阅效率。
 
 ## 1. 总体状态
 
-MVP1.1 当前已完成 P0 与 P1 主体开发。
+MVP1.1 当前已完成 P0 与 P1 主体开发，并已通过 `make mvp1-check` 回归。最近代码提交：`636c7bd test: cover mvp1.1 matrix review p1 flows`。
 
 本阶段完成的核心能力：
 
@@ -61,21 +61,27 @@ MVP1.1 当前已完成 P0 与 P1 主体开发。
 
 后端新增/调整：
 
-1. `backend/app/prompts/registry.py`：PromptOps registry。
-2. `backend/app/prompts/__init__.py`：prompt 模块导出。
-3. `backend/app/services/compliance_generation.py`：合规矩阵 AI 抽取、结构化校验、降级保护。
-4. `backend/app/schemas/project.py`：扩展矩阵审阅、人工补漏、相似补票、关联组和确认请求/返回结构。
-5. `backend/app/api/v1/routes/projects.py`：矩阵审阅聚合、人工新增、相似候选、补票应用、关联组确认/解除/拆分和级联确认。
-6. `backend/tests/test_prompt_registry.py`：prompt registry 单元测试。
-7. `backend/tests/test_compliance_generation_worker.py`：fake LLM 抽取、污染过滤、缺来源降级测试。
-8. `backend/tests/test_project_api.py`：P1 人工补漏、相似补票、Diff、关联组和级联确认回归测试。
-9. `backend/migrations/versions/a9d4e7f2c8b1_add_compliance_review_p1_fields.py`：P1 稳定字段迁移。
+1. `backend/app/models/ai_config.py`：模型配置表。
+2. `backend/app/services/model_config.py`、`backend/app/services/model_config_crypto.py`：模型配置解析和 API Key 加解密。
+3. `backend/app/api/v1/routes/system.py`：模型配置读写和连接测试接口。
+4. `backend/app/prompts/registry.py`：PromptOps registry。
+5. `backend/app/prompts/__init__.py`：prompt 模块导出。
+6. `backend/app/services/compliance_generation.py`：合规矩阵 AI 抽取、结构化校验、降级保护。
+7. `backend/app/schemas/project.py`：扩展矩阵审阅、人工补漏、相似补票、关联组和确认请求/返回结构。
+8. `backend/app/api/v1/routes/projects.py`：矩阵审阅聚合、人工新增、相似候选、补票应用、关联组确认/解除/拆分和级联确认。
+9. `backend/tests/test_model_config_api.py`：模型配置、加密、连接测试和 DB 优先级回归。
+10. `backend/tests/test_prompt_registry.py`：prompt registry 单元测试。
+11. `backend/tests/test_compliance_generation_worker.py`：fake LLM 抽取、污染过滤、缺来源降级测试。
+12. `backend/tests/test_project_api.py`：P1 人工补漏、相似补票、Diff、关联组和级联确认回归测试。
+13. `backend/migrations/versions/f6a1c8d9e2b3_add_ai_model_configs.py`：模型配置表迁移。
+14. `backend/migrations/versions/a9d4e7f2c8b1_add_compliance_review_p1_fields.py`：P1 稳定字段迁移。
 
 前端新增/调整：
 
 1. `frontend/src/api/bid.ts`：扩展 `ComplianceItem` 类型。
 2. `frontend/src/pages/App.tsx`：新增“矩阵审阅”视图、工作流入口、审阅筛选、定位、人工补漏、相似补票和关联组操作。
 3. `frontend/src/pages/app.css`：新增矩阵审阅视图和 Diff 高亮样式。
+4. `frontend/vite.config.ts`：拆分 `index`、`react-vendor`、`antd-vendor`、`utils-vendor`，处理 Vite chunk 体积提示。
 
 ## 5. 当前验证结果
 

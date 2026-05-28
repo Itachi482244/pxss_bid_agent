@@ -55,6 +55,7 @@ from app.schemas.project import (
     ComplianceEvidenceBindRequest,
     ComplianceEvidenceBindingRead,
     ComplianceEvidenceUnbindRequest,
+    ComplianceEvidenceWaiveRequest,
     ComplianceItemsBulkAssignRequest,
     ComplianceItemsBulkConfirmRequest,
     ComplianceItemConfirmRequest,
@@ -67,6 +68,7 @@ from app.schemas.project import (
     ComplianceItemRead,
     ComplianceItemUpdateRequest,
     MatrixReviewDuplicateGroupRead,
+    MatrixReviewHighlightRead,
     MatrixReviewRead,
     MatrixReviewStats,
     MatrixReviewUncoveredChunkRead,
@@ -115,6 +117,12 @@ from app.services.project_import import (
 )
 from app.services.qualification_evaluation import evaluation_snapshot, run_qualification_evaluation
 from app.services.storage import get_object_bytes
+from app.services.word_review import (
+    WordReviewError,
+    build_chunk_fallback_review_document,
+    build_pdf_review_document,
+    build_word_review_document,
+)
 
 router = APIRouter()
 
@@ -448,6 +456,134 @@ def best_chunk_match(base_text: str, chunk_text: str) -> tuple[str, int | None, 
     return best
 
 
+def matrix_review_highlights(
+    items: list[ComplianceItem],
+    chunks_by_id: dict[uuid.UUID, DocumentChunk],
+    chunk_id_aliases: dict[uuid.UUID, uuid.UUID] | None = None,
+) -> list[MatrixReviewHighlightRead]:
+    chunk_id_aliases = chunk_id_aliases or {}
+    highlights: list[MatrixReviewHighlightRead] = []
+    for item in items:
+        if item.source_chunk_id is None:
+            continue
+        chunk = chunks_by_id.get(item.source_chunk_id)
+        if chunk is None or not chunk.content_text:
+            continue
+
+        start: int | None = None
+        end: int | None = None
+        match_source = "chunk_fallback"
+        if (
+            item.selection_start_offset is not None
+            and item.selection_end_offset is not None
+            and 0 <= item.selection_start_offset < item.selection_end_offset <= len(chunk.content_text)
+        ):
+            start = item.selection_start_offset
+            end = item.selection_end_offset
+            match_source = "selection_offset"
+        else:
+            explanation = item.explanation_json or {}
+            source_quote = str(explanation.get("source_quote") or "")
+            candidates = [
+                ("selected_text", item.selected_text or ""),
+                ("source_quote", source_quote),
+                ("requirement_text", item.requirement_text),
+            ]
+            for candidate_source, candidate in candidates:
+                text = candidate.strip()
+                if not text:
+                    continue
+                index = chunk.content_text.find(text)
+                if index >= 0:
+                    start = index
+                    end = index + len(text)
+                    match_source = candidate_source
+                    break
+
+        if start is None or end is None:
+            start = 0
+            end = len(chunk.content_text)
+
+        highlights.append(
+            MatrixReviewHighlightRead(
+                item_id=item.id,
+                chunk_id=chunk_id_aliases.get(chunk.id, chunk.id),
+                start_offset=start,
+                end_offset=end,
+                risk_level=item.risk_level,
+                status=item.status,
+                item_type=item.item_type,
+                match_source=match_source,
+                text=chunk.content_text[start:end],
+            )
+        )
+    return highlights
+
+
+def normalized_review_text(text: str) -> str:
+    return " ".join(text.replace("\xa0", " ").split())
+
+
+def review_chunk_aliases(
+    items: list[ComplianceItem],
+    chunks_by_id: dict[uuid.UUID, DocumentChunk],
+    review_chunks: list[DocumentChunk],
+) -> dict[uuid.UUID, uuid.UUID]:
+    review_chunks_by_text: dict[str, DocumentChunk] = {}
+    for chunk in review_chunks:
+        review_chunks_by_text.setdefault(normalized_review_text(chunk.content_text), chunk)
+
+    aliases: dict[uuid.UUID, uuid.UUID] = {}
+    for item in items:
+        if item.source_chunk_id is None:
+            continue
+        source_chunk = chunks_by_id.get(item.source_chunk_id)
+        if source_chunk is None or source_chunk.id in {chunk.id for chunk in review_chunks}:
+            continue
+        review_chunk = review_chunks_by_text.get(normalized_review_text(source_chunk.content_text))
+        if review_chunk is not None:
+            aliases[source_chunk.id] = review_chunk.id
+    return aliases
+
+
+def select_review_document(documents: list[Document], items: list[ComplianceItem]) -> Document | None:
+    current_documents = [document for document in documents if document.current_version_id is not None]
+    documents_by_id = {document.id: document for document in current_documents}
+    source_counts: dict[uuid.UUID, int] = {}
+    for item in items:
+        source_counts[item.source_document_id] = source_counts.get(item.source_document_id, 0) + 1
+    used_documents = sorted(
+        (
+            document
+            for document_id in source_counts
+            if (document := documents_by_id.get(document_id)) is not None
+        ),
+        key=lambda document: (
+            source_counts.get(document.id, 0),
+            document.file_ext == "docx",
+            document.doc_type == "tender",
+        ),
+        reverse=True,
+    )
+    if used_documents:
+        return used_documents[0]
+    docx_tender = next(
+        (document for document in current_documents if document.doc_type == "tender" and document.file_ext == "docx"),
+        None,
+    )
+    if docx_tender is not None:
+        return docx_tender
+    tender = next((document for document in current_documents if document.doc_type == "tender"), None)
+    if tender is not None:
+        return tender
+    if current_documents:
+        return current_documents[0]
+    first_source_document_id = next((item.source_document_id for item in items), None)
+    if first_source_document_id is None:
+        return None
+    return next((document for document in documents if document.id == first_source_document_id), None)
+
+
 def build_similar_candidates(
     db: Session,
     ctx: RequestContext,
@@ -534,15 +670,27 @@ def confirmation_requires_source_verified(item: ComplianceItem) -> bool:
     return item.risk_level == "high" or item.is_mandatory or item.item_type == "qualification"
 
 
+def enterprise_evidence_not_required(item: ComplianceItem) -> bool:
+    explanation = item.explanation_json or {}
+    return bool(explanation.get("enterprise_evidence_not_required"))
+
+
+def enterprise_evidence_not_required_reason(item: ComplianceItem) -> str | None:
+    explanation = item.explanation_json or {}
+    reason = explanation.get("enterprise_evidence_not_required_reason")
+    return reason if isinstance(reason, str) and reason.strip() else None
+
+
 def compliance_priority_for_item(item: ComplianceItem, evidence_count: int) -> tuple[int, str, str]:
     technical_signals = ("技术", "设备", "参数", "验收", "净化", "洁净")
     text = f"{item.requirement_text}\n{item.response_suggestion or ''}"
+    evidence_required = not enterprise_evidence_not_required(item)
     if item.item_type in {"qualification", "mandatory_response", "deadline"} or (
         item.risk_level == "high" and item.is_mandatory
     ):
         return 0, "P0-资格/强制阻断", "资格、强制或截止类条款需要优先确认，避免实质性响应遗漏"
-    if item.risk_level == "high" or item.status == "needs_material" or (
-        item.is_mandatory and evidence_count == 0
+    if item.risk_level == "high" or (item.status == "needs_material" and evidence_required) or (
+        item.is_mandatory and evidence_count == 0 and evidence_required
     ):
         return 1, "P1-高风险/缺证据", "该条款存在高风险或缺少企业资料证据，建议优先补齐"
     if item.item_type in {"scoring", "technical_response"} or (
@@ -605,6 +753,8 @@ def compliance_item_read_payload(
         needs_human_review=bool(explanation.get("needs_human_review")),
         enterprise_evidence_count=evidence_count,
         enterprise_evidence_summary=evidence_summary,
+        enterprise_evidence_not_required=enterprise_evidence_not_required(item),
+        enterprise_evidence_not_required_reason=enterprise_evidence_not_required_reason(item),
         priority_rank=priority_rank,
         priority_label=priority_label,
         priority_reason=priority_reason,
@@ -904,13 +1054,22 @@ def build_preflight_check(
     high_risk_unconfirmed_count = sum(
         1 for item in items if item.risk_level == "high" and item.status != "confirmed"
     )
+    def item_requires_enterprise_evidence(item: ComplianceItem) -> bool:
+        return not enterprise_evidence_not_required(item)
+
     mandatory_missing_evidence_count = sum(
-        1 for item in items if item.is_mandatory and evidence_counts.get(item.id, 0) == 0
+        1
+        for item in items
+        if item.is_mandatory
+        and item_requires_enterprise_evidence(item)
+        and evidence_counts.get(item.id, 0) == 0
     )
     missing_evidence_count = sum(
         1
         for item in items
-        if (item.is_mandatory or item.status == "needs_material") and evidence_counts.get(item.id, 0) == 0
+        if item_requires_enterprise_evidence(item)
+        and (item.is_mandatory or item.status == "needs_material")
+        and evidence_counts.get(item.id, 0) == 0
     )
     technical_signals = ("技术", "设备", "参数", "验收", "净化", "洁净")
     technical_pending_count = sum(
@@ -2780,15 +2939,6 @@ def get_matrix_review(
         .order_by(ComplianceItem.created_at.asc())
     ).all()
     item_reads = read_items(db, items)
-    item_chunk_ids = {item.source_chunk_id for item in items if item.source_chunk_id is not None}
-    uncovered_chunks = [
-        MatrixReviewUncoveredChunkRead(
-            chunk=DocumentChunkRead.model_validate(chunk),
-            reason="该原文片段包含强制/资格/截止/评分/响应等关键词，但当前没有矩阵项覆盖。",
-        )
-        for chunk in chunks
-        if chunk.id not in item_chunk_ids and chunk_has_review_signals(chunk)
-    ]
 
     duplicate_groups: list[MatrixReviewDuplicateGroupRead] = []
     by_group: dict[str, list[ComplianceItem]] = {}
@@ -2825,6 +2975,88 @@ def get_matrix_review(
             )
         )
 
+    chunks_by_id = {chunk.id: chunk for chunk in chunks}
+    review_document_source = select_review_document(documents, items)
+    review_version = (
+        db.get(DocumentVersion, review_document_source.current_version_id)
+        if review_document_source is not None and review_document_source.current_version_id is not None
+        else None
+    )
+    review_chunks = [
+        chunk
+        for chunk in chunks
+        if review_document_source is not None
+        and review_version is not None
+        and chunk.document_id == review_document_source.id
+        and chunk.document_version_id == review_version.id
+    ]
+    fallback_review_chunks = review_chunks or chunks
+    chunk_id_aliases = review_chunk_aliases(items, chunks_by_id, review_chunks)
+    item_chunk_ids = {
+        chunk_id_aliases.get(item.source_chunk_id, item.source_chunk_id)
+        for item in items
+        if item.source_chunk_id is not None
+    }
+    uncovered_chunks = [
+        MatrixReviewUncoveredChunkRead(
+            chunk=DocumentChunkRead.model_validate(chunk),
+            reason="该原文片段包含强制/资格/截止/评分/响应等关键词，但当前没有矩阵项覆盖。",
+        )
+        for chunk in chunks
+        if chunk.id not in item_chunk_ids and chunk_has_review_signals(chunk)
+    ]
+    if review_document_source is not None and review_version is not None and review_document_source.file_ext == "pdf":
+        try:
+            review_document = build_pdf_review_document(
+                review_document_source,
+                review_version,
+                review_chunks,
+            )
+        except WordReviewError as exc:
+            review_document = build_chunk_fallback_review_document(
+                review_document_source,
+                review_version,
+                fallback_review_chunks,
+                reason=str(exc),
+            )
+    elif review_document_source is not None and review_version is not None and review_document_source.file_ext != "docx":
+        review_document = build_chunk_fallback_review_document(
+            review_document_source,
+            review_version,
+            fallback_review_chunks,
+            reason="当前原文不是 .docx，已使用解析文本连续展示。",
+        )
+    elif review_document_source is not None and review_version is not None:
+        try:
+            data = get_object_bytes(bucket=review_document_source.bucket, object_key=review_version.object_key)
+            review_document = build_word_review_document(
+                review_document_source,
+                review_version,
+                review_chunks,
+                data,
+            )
+        except WordReviewError as exc:
+            review_document = build_chunk_fallback_review_document(
+                review_document_source,
+                review_version,
+                fallback_review_chunks,
+                reason=str(exc),
+            )
+        except Exception:
+            review_document = build_chunk_fallback_review_document(
+                review_document_source,
+                review_version,
+                fallback_review_chunks,
+                reason="原文审阅视图读取文件失败，已降级为解析文本。",
+            )
+    else:
+        review_document = build_chunk_fallback_review_document(
+            None,
+            None,
+            chunks,
+            reason="未找到可用招标文件，已降级为解析文本。",
+        )
+
     high_items = [item for item in items if item.risk_level == "high"]
     stats = MatrixReviewStats(
         total_items=len(items),
@@ -2841,6 +3073,8 @@ def get_matrix_review(
         stats=stats,
         uncovered_chunks=uncovered_chunks,
         duplicate_groups=duplicate_groups,
+        review_document=review_document,
+        highlights=matrix_review_highlights(items, chunks_by_id, chunk_id_aliases),
     )
 
 
@@ -3465,6 +3699,51 @@ def list_compliance_evidence_bindings(
 
 
 @router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/evidence-not-required",
+    response_model=ComplianceItemRead,
+)
+def waive_compliance_evidence_requirement(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: ComplianceEvidenceWaiveRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> ComplianceItemRead:
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    before = compliance_item_snapshot(item)
+    now = datetime.now(UTC)
+    reason = payload.reason.strip()
+    explanation = dict(item.explanation_json or {})
+    explanation["enterprise_evidence_not_required"] = True
+    explanation["enterprise_evidence_not_required_reason"] = reason
+    explanation["enterprise_evidence_not_required_at"] = now.isoformat()
+    explanation["enterprise_evidence_not_required_by"] = str(ctx.user_id)
+    item.explanation_json = explanation
+    if item.status == "needs_material":
+        item.status = "pending_confirm"
+    item.modified_by = ctx.user_id
+    item.modified_at = now
+    item.modify_reason = reason
+    refresh_batch_confirm_guard(item)
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="matrix.evidence_not_required",
+        object_type="compliance_item",
+        object_id=item.id,
+        before_json=before,
+        after_json=compliance_item_snapshot(item),
+        reason=reason,
+    )
+    db.commit()
+    db.refresh(item)
+    return compliance_item_read_from_item(db, item)
+
+
+@router.post(
     "/{project_id}/sections/{section_id}/compliance-items/{item_id}/evidence-bindings",
     response_model=ComplianceEvidenceBindingRead,
     status_code=status.HTTP_201_CREATED,
@@ -3526,6 +3805,13 @@ def bind_compliance_evidence(
         created_by=ctx.user_id,
     )
     db.add(binding)
+
+    if enterprise_evidence_not_required(item):
+        explanation = dict(item.explanation_json or {})
+        explanation["enterprise_evidence_not_required"] = False
+        explanation["enterprise_evidence_not_required_cleared_at"] = datetime.now(UTC).isoformat()
+        explanation["enterprise_evidence_not_required_cleared_by"] = str(ctx.user_id)
+        item.explanation_json = explanation
 
     if item.status == "needs_material":
         now = datetime.now(UTC)

@@ -240,6 +240,8 @@ export type ComplianceItem = {
   needs_human_review: boolean;
   enterprise_evidence_count: number;
   enterprise_evidence_summary: string | null;
+  enterprise_evidence_not_required: boolean;
+  enterprise_evidence_not_required_reason: string | null;
   priority_rank: number;
   priority_label: string;
   priority_reason: string;
@@ -296,6 +298,95 @@ export type MatrixReviewDuplicateGroup = {
   representative_text: string;
 };
 
+export type ReviewDocumentPageMargins = {
+  top: number | null;
+  right: number | null;
+  bottom: number | null;
+  left: number | null;
+};
+
+export type ReviewDocumentPage = {
+  page_no: number;
+  width: number | null;
+  height: number | null;
+};
+
+export type ReviewDocumentRunStyle = {
+  font_family: string | null;
+  font_size_pt: number | null;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  color: string | null;
+};
+
+export type ReviewDocumentParagraphStyle = {
+  style_id: string | null;
+  style_name: string | null;
+  alignment: string | null;
+  indent_left_pt: number | null;
+  first_line_indent_pt: number | null;
+  line_spacing: number | null;
+};
+
+export type ReviewDocumentRun = {
+  text: string;
+  style: ReviewDocumentRunStyle;
+};
+
+export type ReviewDocumentParagraph = {
+  text: string;
+  runs: ReviewDocumentRun[];
+  style: ReviewDocumentParagraphStyle;
+};
+
+export type ReviewDocumentTableCell = {
+  paragraphs: ReviewDocumentParagraph[];
+};
+
+export type ReviewDocumentTableRow = {
+  cells: ReviewDocumentTableCell[];
+};
+
+export type ReviewDocumentBlock = {
+  id: string;
+  type: "paragraph" | "heading" | "table" | string;
+  chunk_id: string | null;
+  chunk_index: number | null;
+  page_no: number | null;
+  bbox_json: Record<string, unknown> | null;
+  text: string;
+  paragraph: ReviewDocumentParagraph | null;
+  rows: ReviewDocumentTableRow[];
+};
+
+export type MatrixReviewHighlight = {
+  item_id: string;
+  chunk_id: string;
+  start_offset: number;
+  end_offset: number;
+  risk_level: string;
+  status: string;
+  item_type: string;
+  match_source: string;
+  text: string;
+};
+
+export type MatrixReviewDocument = {
+  mode: "word_xml" | "chunk_fallback" | string;
+  document_id: string | null;
+  title: string | null;
+  original_filename: string | null;
+  version_id: string | null;
+  version_label: string | null;
+  reason: string | null;
+  page_margins: ReviewDocumentPageMargins | null;
+  pages: ReviewDocumentPage[];
+  headers: string[];
+  footers: string[];
+  blocks: ReviewDocumentBlock[];
+};
+
 export type MatrixReview = {
   chunks: DocumentChunk[];
   items: ComplianceItem[];
@@ -310,6 +401,8 @@ export type MatrixReview = {
   };
   uncovered_chunks: MatrixReviewUncoveredChunk[];
   duplicate_groups: MatrixReviewDuplicateGroup[];
+  review_document: MatrixReviewDocument | null;
+  highlights: MatrixReviewHighlight[];
 };
 
 export type ComplianceItemFromSourceResult = {
@@ -1152,6 +1245,21 @@ export async function bindComplianceEvidence(
 ) {
   const response = await apiClient.post<ComplianceEvidenceBinding>(
     `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/evidence-bindings`,
+    payload
+  );
+  return response.data;
+}
+
+export async function waiveComplianceEvidenceRequirement(
+  projectId: string,
+  sectionId: string,
+  itemId: string,
+  payload: {
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<ComplianceItem>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/evidence-not-required`,
     payload
   );
   return response.data;

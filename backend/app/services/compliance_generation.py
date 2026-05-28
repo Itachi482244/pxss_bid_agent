@@ -143,6 +143,20 @@ STRUCTURAL_HEADING_RE = re.compile(
 LIST_MARKER_RE = re.compile(
     r"(?<![\w./])(?:[（(]\d+[）)]|[1-9]\d?(?:[.．]\d{1,2})+[.．]?|[1-9]\d?[.．])"
 )
+CHINESE_LIST_MARKER_RE = re.compile(
+    r"(^|[\s。；;！？!?])([一二三四五六七八九十]{1,3})[、.．]"
+)
+CHINESE_NUMERAL_VALUES = {
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
 
 
 class ComplianceGenerationError(Exception):
@@ -630,6 +644,50 @@ def _split_by_markers(text: str) -> list[str]:
     return [part for part in parts if part]
 
 
+def _chinese_marker_value(marker: str) -> int | None:
+    if marker == "十":
+        return 10
+    if "十" not in marker:
+        return CHINESE_NUMERAL_VALUES.get(marker)
+    left, _, right = marker.partition("十")
+    tens = CHINESE_NUMERAL_VALUES.get(left, 1) if left else 1
+    ones = CHINESE_NUMERAL_VALUES.get(right, 0) if right else 0
+    return tens * 10 + ones
+
+
+def _consecutive_chinese_marker_matches(text: str) -> list[re.Match[str]]:
+    best: list[tuple[re.Match[str], int]] = []
+    current: list[tuple[re.Match[str], int]] = []
+    for match in CHINESE_LIST_MARKER_RE.finditer(text):
+        value = _chinese_marker_value(match.group(2))
+        if value is None:
+            current = []
+            continue
+        if not current or value == current[-1][1] + 1:
+            current.append((match, value))
+            continue
+        if len(current) > len(best):
+            best = current
+        current = [(match, value)]
+    if len(current) > len(best):
+        best = current
+    return [match for match, _ in best] if len(best) >= 2 else []
+
+
+def _split_by_chinese_markers(text: str) -> list[str]:
+    matches = _consecutive_chinese_marker_matches(text)
+    if len(matches) <= 1:
+        return [text]
+    parts: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.start(2)
+        end = matches[index + 1].start(2) if index + 1 < len(matches) else len(text)
+        part = text[start:end].strip()
+        if part:
+            parts.append(part)
+    return parts or [text]
+
+
 def _split_qualification_series(text: str) -> list[str]:
     if "资质" not in text or "须具备" not in text:
         return [text]
@@ -680,9 +738,11 @@ def _atomic_requirement_texts(text: str) -> list[str]:
     overview_parts = _split_project_overview(text)
     atomic: list[str] = []
     for overview_part in overview_parts:
-        marker_parts = _split_by_markers(overview_part)
-        for part in marker_parts:
-            atomic.extend(_split_qualification_series(part))
+        chinese_marker_parts = _split_by_chinese_markers(overview_part)
+        for chinese_part in chinese_marker_parts:
+            marker_parts = _split_by_markers(chinese_part)
+            for part in marker_parts:
+                atomic.extend(_split_qualification_series(part))
     return [item.strip() for item in atomic if item.strip()]
 
 

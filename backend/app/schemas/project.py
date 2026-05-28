@@ -199,6 +199,8 @@ class ComplianceItemRead(BaseModel):
     needs_human_review: bool = False
     enterprise_evidence_count: int = 0
     enterprise_evidence_summary: str | None = None
+    enterprise_evidence_not_required: bool = False
+    enterprise_evidence_not_required_reason: str | None = None
     priority_rank: int = 3
     priority_label: str = "P3-一般响应"
     priority_reason: str = "普通响应项，按常规流程处理"
@@ -417,12 +419,103 @@ class MatrixReviewDuplicateGroupRead(BaseModel):
     representative_text: str
 
 
+class ReviewDocumentPageMargins(BaseModel):
+    top: float | None = None
+    right: float | None = None
+    bottom: float | None = None
+    left: float | None = None
+
+
+class ReviewDocumentPage(BaseModel):
+    page_no: int
+    width: float | None = None
+    height: float | None = None
+
+
+class ReviewDocumentRunStyle(BaseModel):
+    font_family: str | None = None
+    font_size_pt: float | None = None
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+    color: str | None = None
+
+
+class ReviewDocumentParagraphStyle(BaseModel):
+    style_id: str | None = None
+    style_name: str | None = None
+    alignment: str | None = None
+    indent_left_pt: float | None = None
+    first_line_indent_pt: float | None = None
+    line_spacing: float | None = None
+
+
+class ReviewDocumentRun(BaseModel):
+    text: str
+    style: ReviewDocumentRunStyle = Field(default_factory=ReviewDocumentRunStyle)
+
+
+class ReviewDocumentParagraph(BaseModel):
+    text: str
+    runs: list[ReviewDocumentRun] = Field(default_factory=list)
+    style: ReviewDocumentParagraphStyle = Field(default_factory=ReviewDocumentParagraphStyle)
+
+
+class ReviewDocumentTableCell(BaseModel):
+    paragraphs: list[ReviewDocumentParagraph] = Field(default_factory=list)
+
+
+class ReviewDocumentTableRow(BaseModel):
+    cells: list[ReviewDocumentTableCell] = Field(default_factory=list)
+
+
+class ReviewDocumentBlock(BaseModel):
+    id: str
+    type: str
+    chunk_id: uuid.UUID | None = None
+    chunk_index: int | None = None
+    page_no: int | None = None
+    bbox_json: dict[str, Any] | None = None
+    text: str = ""
+    paragraph: ReviewDocumentParagraph | None = None
+    rows: list[ReviewDocumentTableRow] = Field(default_factory=list)
+
+
+class MatrixReviewHighlightRead(BaseModel):
+    item_id: uuid.UUID
+    chunk_id: uuid.UUID
+    start_offset: int
+    end_offset: int
+    risk_level: str
+    status: str
+    item_type: str
+    match_source: str
+    text: str
+
+
+class MatrixReviewDocumentRead(BaseModel):
+    mode: str
+    document_id: uuid.UUID | None = None
+    title: str | None = None
+    original_filename: str | None = None
+    version_id: uuid.UUID | None = None
+    version_label: str | None = None
+    reason: str | None = None
+    page_margins: ReviewDocumentPageMargins | None = None
+    pages: list[ReviewDocumentPage] = Field(default_factory=list)
+    headers: list[str] = Field(default_factory=list)
+    footers: list[str] = Field(default_factory=list)
+    blocks: list[ReviewDocumentBlock] = Field(default_factory=list)
+
+
 class MatrixReviewRead(BaseModel):
     chunks: list[DocumentChunkRead] = Field(default_factory=list)
     items: list[ComplianceItemRead] = Field(default_factory=list)
     stats: MatrixReviewStats
     uncovered_chunks: list[MatrixReviewUncoveredChunkRead] = Field(default_factory=list)
     duplicate_groups: list[MatrixReviewDuplicateGroupRead] = Field(default_factory=list)
+    review_document: MatrixReviewDocumentRead | None = None
+    highlights: list[MatrixReviewHighlightRead] = Field(default_factory=list)
 
 
 class ComplianceItemAssignRequest(BaseModel):
@@ -467,6 +560,10 @@ class ComplianceEvidenceBindRequest(BaseModel):
     evidence_text: str | None = Field(default=None, max_length=4000)
     confidence_score: Decimal | None = Field(default=None, ge=0, le=1)
     reason: str = Field(default="绑定企业资料作为响应证据", min_length=2, max_length=1000)
+
+
+class ComplianceEvidenceWaiveRequest(BaseModel):
+    reason: str = Field(default="人工判定该条款无需绑定企业资料证据", min_length=2, max_length=1000)
 
 
 class ComplianceEvidenceUnbindRequest(BaseModel):

@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.main import app
 from app.models import AsyncTask, AuditLog, Document, DocumentChunk, DocumentVersion, ParseTask
+from app.parsers.pdf import PdfTextEmptyError, parse_pdf_bytes
 from app.services.document_parse import execute_document_parse_task
 from scripts.seed_dev_data import seed
 
@@ -56,7 +57,50 @@ def build_pdf_bytes() -> bytes:
     page = document.new_page()
     page.insert_text((72, 72), "Bidder must provide a valid business license.")
     page.insert_text((72, 96), "Bid deadline is 2025-12-11 09:30.")
+    page2 = document.new_page()
+    page2.insert_text((72, 72), "The bidder shall provide a safety certificate.")
     return document.tobytes()
+
+
+def build_pdf_table_bytes() -> bytes:
+    document = fitz.open()
+    page = document.new_page(width=420, height=300)
+    page.insert_text((72, 50), "Tender qualification table")
+    page.draw_rect(fitz.Rect(72, 90, 320, 150))
+    page.draw_line((72, 120), (320, 120))
+    page.draw_line((180, 90), (180, 150))
+    page.insert_text((82, 110), "Material")
+    page.insert_text((192, 110), "Requirement")
+    page.insert_text((82, 140), "Report")
+    page.insert_text((192, 140), "Valid test report")
+    return document.tobytes()
+
+
+def build_blank_pdf_bytes() -> bytes:
+    document = fitz.open()
+    document.new_page()
+    return document.tobytes()
+
+
+def test_pdf_parser_extracts_layout_blocks_and_tables() -> None:
+    chunks = parse_pdf_bytes(build_pdf_table_bytes())
+
+    assert chunks[0].bbox_json is not None
+    assert chunks[0].bbox_json["page_no"] == 1
+    assert chunks[0].bbox_json["page_width"] == 420
+    table_chunk = next(chunk for chunk in chunks if chunk.table_json)
+    assert table_chunk.bbox_json is not None
+    assert table_chunk.bbox_json["block_type"] == "table"
+    assert table_chunk.table_json is not None
+    assert table_chunk.table_json["rows"][0] == ["Material", "Requirement"]
+    assert table_chunk.table_json["rows"][1] == ["Report", "Valid test report"]
+
+
+def test_pdf_parser_rejects_empty_text_pdf() -> None:
+    with pytest.raises(PdfTextEmptyError) as exc_info:
+        parse_pdf_bytes(build_blank_pdf_bytes())
+
+    assert exc_info.value.code == "PDF_TEXT_EMPTY_OCR_REQUIRED"
 
 
 def test_word_parse_worker_extracts_paragraphs_and_tables(monkeypatch) -> None:
@@ -178,6 +222,40 @@ def test_pdf_text_parse_worker_extracts_pages(monkeypatch) -> None:
         ).all()
         assert chunks[0].page_no == 1
         assert "business license" in chunks[0].content_text
+        assert chunks[0].bbox_json is not None
+        assert chunks[0].bbox_json["page_width"] > 0
+        assert chunks[-1].page_no == 2
+
+
+def test_pdf_text_parse_worker_marks_empty_pdf_as_ocr_required(monkeypatch) -> None:
+    settings.run_tasks_inline = False
+    from app.worker import run_document_parse_task
+
+    monkeypatch.setattr(run_document_parse_task, "delay", lambda task_id: None)
+
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    filename = f"空白招标文件-{uuid4().hex}.pdf"
+
+    upload_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/upload",
+        data={"doc_type": "tender", "title": "空白 PDF 招标文件"},
+        files={"file": (filename, build_blank_pdf_bytes(), "application/pdf")},
+    )
+    assert upload_response.status_code == 201
+    document_payload = upload_response.json()
+
+    parse_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document_payload['id']}/parse-tasks",
+        json={"parser_name": "pdf-parser", "parser_version": "0.1.0"},
+    )
+    assert parse_response.status_code == 202
+    parse_payload = parse_response.json()
+
+    with SessionLocal() as db:
+        result = execute_document_parse_task(db, UUID(parse_payload["task"]["id"]))
+        assert result["status"] == "failed"
+        assert result["error_code"] == "PDF_TEXT_EMPTY_OCR_REQUIRED"
 
 
 def test_manual_revision_creates_new_version_and_matrix_uses_revised_chunks(monkeypatch) -> None:

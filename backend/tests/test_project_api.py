@@ -4,12 +4,14 @@ import hashlib
 from io import BytesIO
 from decimal import Decimal
 from pathlib import Path
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from docx import Document as DocxDocument
+from docx.shared import Inches, Pt, RGBColor
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from sqlalchemy import func, select
@@ -17,7 +19,17 @@ from sqlalchemy import func, select
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.main import app
-from app.models import AuditLog, ComplianceItem, Document, DocumentChunk, DocumentVersion, Project, User
+from app.models import (
+    AuditLog,
+    BidSection,
+    ComplianceItem,
+    Document,
+    DocumentChunk,
+    DocumentVersion,
+    Project,
+    ProjectMember,
+    User,
+)
 from app.services.file_acquisition import DownloadedFile
 from scripts.seed_dev_data import seed
 
@@ -989,3 +1001,327 @@ def test_compliance_matrix_excel_export_api() -> None:
     assert sheet["A1"].value == "合规矩阵快照"
     assert "最新状态以投标 Agent 平台为准" in sheet["A2"].value
     assert sheet["A7"].value == "序号"
+
+
+def test_matrix_review_returns_word_xml_document_and_highlights(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = TestClient(app)
+
+    docx = DocxDocument()
+    section = docx.sections[0]
+    section.top_margin = Inches(0.8)
+    section.bottom_margin = Inches(0.7)
+    section.left_margin = Inches(1.0)
+    section.right_margin = Inches(1.0)
+    section.header.paragraphs[0].text = "测试页眉"
+    section.footer.paragraphs[0].text = "测试页脚"
+    docx.add_heading("第一章 投标人须知", level=1)
+    paragraph = docx.add_paragraph()
+    paragraph.alignment = 0
+    run = paragraph.add_run("投标人须提供有效营业执照，并加盖公章。")
+    run.bold = True
+    run.font.size = Pt(12)
+    run.font.color.rgb = RGBColor(0x22, 0x33, 0x44)
+    table = docx.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "材料"
+    table.cell(0, 1).text = "要求"
+    table.cell(1, 0).text = "检测报告"
+    table.cell(1, 1).text = "须提供净化设备检测报告"
+    buffer = BytesIO()
+    docx.save(buffer)
+    payload = buffer.getvalue()
+
+    with SessionLocal() as db:
+        user = db.scalar(select(User))
+        assert user is not None
+        project = Project(
+            tenant_id=user.tenant_id,
+            name=f"Word XML 审阅隔离测试-{uuid4()}",
+            purchaser="测试采购人",
+            agency="测试代理",
+            status="pending_confirm",
+            created_by=user.id,
+        )
+        db.add(project)
+        db.flush()
+        db.add(
+            ProjectMember(
+                tenant_id=project.tenant_id,
+                project_id=project.id,
+                user_id=user.id,
+                role_code="owner",
+                status="active",
+                created_by=user.id,
+            )
+        )
+        section_model = BidSection(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            code="word-review",
+            name="Word 原文审阅测试标段",
+            status="pending_confirm",
+            created_by=user.id,
+        )
+        db.add(section_model)
+        db.flush()
+        project_id = str(project.id)
+        section_id = str(section_model.id)
+        document = Document(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            section_id=section_model.id,
+            doc_type="tender",
+            title="Word XML 审阅测试招标文件",
+            source_type="upload",
+            original_filename="word-review-test.docx",
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            file_ext="docx",
+            file_size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            bucket=settings.minio_bucket,
+            object_key="tests/word-review-test.docx",
+            status="available",
+            created_by=user.id,
+            acquired_at=datetime.now(UTC),
+        )
+        db.add(document)
+        db.flush()
+        version = DocumentVersion(
+            tenant_id=project.tenant_id,
+            document_id=document.id,
+            version_no=1,
+            version_label="v0.word-review",
+            object_key=document.object_key,
+            sha256=document.sha256,
+            parse_status="succeeded",
+            parser_name="word",
+            parser_version="1.0",
+            created_by=user.id,
+        )
+        db.add(version)
+        db.flush()
+        document.current_version_id = version.id
+        paragraph_text = "投标人须提供有效营业执照，并加盖公章。"
+        table_text = "材料 | 要求\n检测报告 | 须提供净化设备检测报告"
+        paragraph_chunk = DocumentChunk(
+            tenant_id=project.tenant_id,
+            document_id=document.id,
+            document_version_id=version.id,
+            section_id=section_model.id,
+            chunk_index=2,
+            page_no=None,
+            heading_path="第一章 投标人须知",
+            content_text=paragraph_text,
+            content_hash=hashlib.sha256(paragraph_text.encode("utf-8")).hexdigest(),
+        )
+        table_chunk = DocumentChunk(
+            tenant_id=project.tenant_id,
+            document_id=document.id,
+            document_version_id=version.id,
+            section_id=section_model.id,
+            chunk_index=3,
+            page_no=None,
+            heading_path="第一章 投标人须知",
+            content_text=table_text,
+            content_hash=hashlib.sha256(table_text.encode("utf-8")).hexdigest(),
+            table_json={"rows": [["材料", "要求"], ["检测报告", "须提供净化设备检测报告"]]},
+        )
+        db.add_all([paragraph_chunk, table_chunk])
+        db.flush()
+        item = ComplianceItem(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            section_id=section_model.id,
+            source_document_id=document.id,
+            source_version_id=version.id,
+            source_chunk_id=paragraph_chunk.id,
+            item_type="qualification",
+            requirement_text="有效营业执照",
+            normalized_requirement="word_review_business_license",
+            response_suggestion="请提供营业执照。",
+            evidence_text=paragraph_text,
+            explanation_json={"source_quote": "有效营业执照"},
+            status="pending_confirm",
+            risk_level="high",
+            is_mandatory=True,
+            is_batch_confirm_allowed=False,
+            confidence_score=Decimal("0.9500"),
+            created_by=user.id,
+        )
+        db.add(item)
+        db.commit()
+
+    monkeypatch.setattr("app.api.v1.routes.projects.get_object_bytes", lambda **_: payload)
+
+    response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/matrix-review")
+
+    assert response.status_code == 200
+    review = response.json()
+    assert review["review_document"]["mode"] == "word_xml"
+    assert review["review_document"]["headers"] == ["测试页眉"]
+    assert review["review_document"]["footers"] == ["测试页脚"]
+    assert review["review_document"]["page_margins"]["top"] == 57.6
+    assert any(block["type"] == "table" for block in review["review_document"]["blocks"])
+    highlight = next(item for item in review["highlights"] if item["text"] == "有效营业执照")
+    assert highlight["risk_level"] == "high"
+    assert highlight["match_source"] == "source_quote"
+
+
+def test_matrix_review_returns_pdf_layout_document_and_highlights() -> None:
+    client = TestClient(app)
+    payload = b"%PDF-test-layout-placeholder"
+
+    with SessionLocal() as db:
+        user = db.scalar(select(User))
+        assert user is not None
+        project = Project(
+            tenant_id=user.tenant_id,
+            name=f"PDF 原文审阅隔离测试-{uuid4()}",
+            purchaser="测试采购人",
+            agency="测试代理",
+            status="pending_confirm",
+            created_by=user.id,
+        )
+        db.add(project)
+        db.flush()
+        db.add(
+            ProjectMember(
+                tenant_id=project.tenant_id,
+                project_id=project.id,
+                user_id=user.id,
+                role_code="owner",
+                status="active",
+                created_by=user.id,
+            )
+        )
+        section_model = BidSection(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            code="pdf-review",
+            name="PDF 原文审阅测试标段",
+            status="pending_confirm",
+            created_by=user.id,
+        )
+        db.add(section_model)
+        db.flush()
+        project_id = str(project.id)
+        section_id = str(section_model.id)
+        document = Document(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            section_id=section_model.id,
+            doc_type="tender",
+            title="PDF 原文审阅测试招标文件",
+            source_type="upload",
+            original_filename="pdf-review-test.pdf",
+            content_type="application/pdf",
+            file_ext="pdf",
+            file_size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            bucket=settings.minio_bucket,
+            object_key="tests/pdf-review-test.pdf",
+            status="available",
+            created_by=user.id,
+            acquired_at=datetime.now(UTC),
+        )
+        db.add(document)
+        db.flush()
+        version = DocumentVersion(
+            tenant_id=project.tenant_id,
+            document_id=document.id,
+            version_no=1,
+            version_label="v0.pdf-review",
+            object_key=document.object_key,
+            sha256=document.sha256,
+            parse_status="succeeded",
+            parser_name="pdf-parser",
+            parser_version="pymupdf-layout-v1",
+            created_by=user.id,
+        )
+        db.add(version)
+        db.flush()
+        document.current_version_id = version.id
+        paragraph_text = "Bidder must provide a valid business license."
+        table_text = "Material | Requirement\nReport | Valid test report"
+        paragraph_chunk = DocumentChunk(
+            tenant_id=project.tenant_id,
+            document_id=document.id,
+            document_version_id=version.id,
+            section_id=section_model.id,
+            chunk_index=1,
+            page_no=1,
+            heading_path="PDF 第 1 页",
+            content_text=paragraph_text,
+            content_hash=hashlib.sha256(paragraph_text.encode("utf-8")).hexdigest(),
+            bbox_json={
+                "page_no": 1,
+                "page_width": 595.0,
+                "page_height": 842.0,
+                "x0": 72.0,
+                "y0": 72.0,
+                "x1": 360.0,
+                "y1": 96.0,
+                "block_type": "text",
+                "parser_version": "pymupdf-layout-v1",
+            },
+        )
+        table_chunk = DocumentChunk(
+            tenant_id=project.tenant_id,
+            document_id=document.id,
+            document_version_id=version.id,
+            section_id=section_model.id,
+            chunk_index=2,
+            page_no=2,
+            heading_path="PDF 第 2 页",
+            content_text=table_text,
+            content_hash=hashlib.sha256(table_text.encode("utf-8")).hexdigest(),
+            bbox_json={
+                "page_no": 2,
+                "page_width": 595.0,
+                "page_height": 842.0,
+                "x0": 72.0,
+                "y0": 120.0,
+                "x1": 420.0,
+                "y1": 180.0,
+                "block_type": "table",
+                "parser_version": "pymupdf-layout-v1",
+            },
+            table_json={"rows": [["Material", "Requirement"], ["Report", "Valid test report"]]},
+        )
+        db.add_all([paragraph_chunk, table_chunk])
+        db.flush()
+        item = ComplianceItem(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            section_id=section_model.id,
+            source_document_id=document.id,
+            source_version_id=version.id,
+            source_chunk_id=paragraph_chunk.id,
+            item_type="qualification",
+            requirement_text="valid business license",
+            normalized_requirement="pdf_review_business_license",
+            response_suggestion="Please provide the business license.",
+            evidence_text=paragraph_text,
+            explanation_json={"source_quote": "valid business license"},
+            status="pending_confirm",
+            risk_level="high",
+            is_mandatory=True,
+            is_batch_confirm_allowed=False,
+            confidence_score=Decimal("0.9500"),
+            created_by=user.id,
+        )
+        db.add(item)
+        db.commit()
+
+    response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/matrix-review")
+
+    assert response.status_code == 200
+    review = response.json()
+    assert review["review_document"]["mode"] == "pdf_layout"
+    assert review["review_document"]["pages"][0]["page_no"] == 1
+    assert review["review_document"]["pages"][1]["page_no"] == 2
+    assert review["review_document"]["blocks"][0]["page_no"] == 1
+    assert review["review_document"]["blocks"][0]["bbox_json"]["page_width"] == 595.0
+    assert any(block["type"] == "table" for block in review["review_document"]["blocks"])
+    highlight = next(item for item in review["highlights"] if item["text"] == "valid business license")
+    assert highlight["risk_level"] == "high"
+    assert highlight["match_source"] == "source_quote"

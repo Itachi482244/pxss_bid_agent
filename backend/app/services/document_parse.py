@@ -8,7 +8,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.models import AsyncTask, AuditLog, Document, DocumentChunk, DocumentVersion, ParseTask
-from app.parsers.pdf import parse_pdf_bytes
+from app.parsers.pdf import PdfTextEmptyError, parse_pdf_bytes
 from app.parsers.word import parse_docx_bytes
 from app.services.storage import get_object_bytes
 
@@ -59,7 +59,10 @@ def _parse_document_bytes(parse_task: ParseTask, document: Document, data: bytes
     if parse_task.parser_type == "pdf_text":
         if document.file_ext != "pdf":
             raise DocumentParseError("PDF 文本解析器仅支持 .pdf 文件", code="PDF_FILE_REQUIRED")
-        return parse_pdf_bytes(data)
+        try:
+            return parse_pdf_bytes(data)
+        except PdfTextEmptyError as exc:
+            raise DocumentParseError(str(exc), code=exc.code) from exc
     if parse_task.parser_type != "word":
         raise DocumentParseError(
             f"暂不支持解析类型：{parse_task.parser_type}",
@@ -168,7 +171,7 @@ def execute_document_parse_task(db: Session, task_id: uuid.UUID | str) -> dict[s
             parse_task,
             action="document.parse_succeeded",
             after_json=task.output_json,
-            reason="Worker 完成 Word 文档解析并写入分块",
+            reason="Worker 完成文档解析并写入分块",
         )
         db.commit()
         return {

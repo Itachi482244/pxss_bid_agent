@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from app.db.session import SessionLocal
 from app.main import app
-from app.models import AuditLog, ComplianceEvidenceBinding, EnterpriseMaterial
+from app.models import AuditLog, ComplianceEvidenceBinding, ComplianceItem, Document, DocumentChunk, EnterpriseMaterial
 from scripts.seed_dev_data import seed
 
 
@@ -311,6 +311,94 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
             )
         ).all()
         assert logs
+
+
+def test_compliance_evidence_requirement_can_be_waived() -> None:
+    client = TestClient(app)
+    projects = client.get("/api/v1/projects").json()
+    project = next(item for item in projects if item["name"] == "智慧园区弱电工程投标")
+    sections = client.get(f"/api/v1/projects/{project['id']}/sections").json()
+    section = sections[0]
+    unique = uuid4().hex[:8]
+
+    with SessionLocal() as db:
+        document = db.scalar(
+            select(Document).where(
+                Document.project_id == UUID(project["id"]),
+                Document.section_id == UUID(section["id"]),
+                Document.current_version_id.is_not(None),
+                Document.status != "deleted",
+            )
+        )
+        assert document is not None
+        chunk = db.scalar(
+            select(DocumentChunk)
+            .where(DocumentChunk.document_version_id == document.current_version_id)
+            .order_by(DocumentChunk.chunk_index.asc())
+        )
+        assert chunk is not None
+        item = ComplianceItem(
+            tenant_id=document.tenant_id,
+            project_id=document.project_id,
+            section_id=document.section_id,
+            source_document_id=document.id,
+            source_version_id=document.current_version_id,
+            source_chunk_id=chunk.id,
+            source_page_no=chunk.page_no,
+            item_type="mandatory_response",
+            requirement_text=f"采用资格后审方式 {unique}",
+            normalized_requirement=f"采用资格后审方式 {unique}",
+            response_suggestion="该条为评审方式说明，无需企业资料证据。",
+            evidence_text="招标文件载明采用资格后审方式。",
+            explanation_json={"source_quote": "采用资格后审方式"},
+            status="needs_material",
+            risk_level="medium",
+            is_mandatory=True,
+            is_batch_confirm_allowed=False,
+            created_by=document.created_by,
+        )
+        db.add(item)
+        db.commit()
+        item_id = item.id
+
+    before_preflight = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/preflight-check"
+    )
+    assert before_preflight.status_code == 200
+    before_missing = before_preflight.json()["mandatory_missing_evidence_count"]
+    assert before_missing >= 1
+
+    waive_response = client.post(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+            f"/compliance-items/{item_id}/evidence-not-required"
+        ),
+        json={"reason": "资格后审方式为评审流程说明，无需绑定企业资料证据"},
+    )
+    assert waive_response.status_code == 200
+    waived_item = waive_response.json()
+    assert waived_item["enterprise_evidence_not_required"] is True
+    assert waived_item["enterprise_evidence_not_required_reason"] == "资格后审方式为评审流程说明，无需绑定企业资料证据"
+    assert waived_item["status"] == "pending_confirm"
+
+    after_preflight = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/preflight-check"
+    )
+    assert after_preflight.status_code == 200
+    assert after_preflight.json()["mandatory_missing_evidence_count"] == before_missing - 1
+
+    with SessionLocal() as db:
+        logs = db.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "matrix.evidence_not_required",
+                AuditLog.object_id == item_id,
+            )
+        ).all()
+        assert logs
+        saved_item = db.get(ComplianceItem, item_id)
+        if saved_item is not None:
+            db.delete(saved_item)
+            db.commit()
 
 
 def test_profile_preferences_and_forbidden_rules_affect_qualification_decision() -> None:

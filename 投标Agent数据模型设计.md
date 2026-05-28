@@ -1,12 +1,12 @@
 # 投标 Agent 数据模型设计
 
-> 版本：v0.1  
-> 日期：2026-05-14  
-> 范围：面向已冻结的 MVP-v0.5，兼顾 SaaS 多租户、安全审计、文件来源追溯和后续 MVP-v1.0 扩展。
+> 版本：v0.3
+> 日期：2026-05-25
+> 范围：覆盖已完成的 MVP-v0.5、MVP-v1.0 和 MVP-v1.1 P0 + P1，兼顾 SaaS 多租户、安全审计、文件来源追溯、模型配置、合规矩阵审阅纠错和后续 RAG 扩展。
 
 ## 1. 设计目标
 
-本数据模型优先支撑 MVP-v0.5 的完整业务闭环：
+本数据模型优先支撑当前已完成的 MVP1.0/MVP1.1 业务闭环：
 
 1. 手工创建项目和标段。
 2. 上传招标文件，或通过公开资源站点链接获取招标文件。
@@ -17,8 +17,10 @@
 7. 支持高风险项逐条确认。
 8. 导出 Excel 合规矩阵。
 9. 覆盖基础审计日志。
+10. 支持 Chat/LLM 模型配置和 API Key 加密存储。
+11. 支持合规矩阵原文审阅、人工补漏、相似补票和重复项级联确认。
 
-本模型不在 v0.5 内展开企业知识库、RAG、章节生成、完整审批流、报价和复杂地方规则包管理，但会预留扩展边界，避免后续推倒重来。
+本模型暂不展开真实企业资料向量化 RAG、Embedding/Rerank、完整技术标生成、报价和复杂地方规则包管理，但会预留扩展边界，避免后续推倒重来。
 
 ## 2. 建模原则
 
@@ -563,7 +565,7 @@ erDiagram
 
 ### 4.12 `compliance_items` 合规矩阵项表
 
-MVP-v0.5 的核心表。每条矩阵项必须回链证据来源。
+合规矩阵核心表。每条矩阵项必须回链证据来源；MVP1.1 在此基础上增加原文审阅、人工补漏、相似补票和重复项关联字段。
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -575,11 +577,21 @@ MVP-v0.5 的核心表。每条矩阵项必须回链证据来源。
 | `source_version_id` | UUID | 是 | 来源文件版本 |
 | `source_chunk_id` | UUID | 条件必填 | 来源片段；系统生成项必须有值，人工临时项可为空但不得确认 |
 | `source_page_no` | integer | 否 | 来源页码 |
-| `item_type` | varchar(64) | 是 | `qualification`、`mandatory_response`、`format`、`deadline`、`scoring`、`other` |
+| `item_type` | varchar(64) | 是 | `qualification`、`mandatory_response`、`format`、`deadline`、`scoring`、`reference_info`、`technical_response`、`other` |
 | `requirement_text` | text | 是 | 招标要求原文或摘要 |
 | `normalized_requirement` | text | 否 | 规范化要求，用于去重和比较 |
 | `response_suggestion` | text | 否 | 响应建议 |
 | `evidence_text` | text | 否 | 证据片段冗余快照 |
+| `explanation_json` | jsonb | 否 | 模型/规则解释、分类理由、拆分理由、来源摘录、人工复核提示等扩展信息 |
+| `dedup_key` | varchar(160) | 否 | 归一化后的疑似重复 key，用于候选关联提示，不自动启用级联 |
+| `duplicate_group_id` | UUID | 否 | 人工确认后的重复/相同要求关联组 ID |
+| `duplicate_group_confirmed_at` | timestamptz | 否 | 关联组人工确认时间 |
+| `duplicate_group_confirmed_by` | UUID | 否 | 关联组确认人 |
+| `duplicate_group_status` | varchar(32) | 否 | `confirmed`、`unlinked` 等关联状态 |
+| `selected_text` | text | 否 | 人工从原文划选新增时的来源文字 |
+| `selection_start_offset` | integer | 否 | 人工划选文字在来源 chunk 中的起始偏移 |
+| `selection_end_offset` | integer | 否 | 人工划选文字在来源 chunk 中的结束偏移 |
+| `source_create_method` | varchar(32) | 否 | `model`、`rule`、`manual_selection`、`similar_candidate` 等来源创建方式 |
 | `status` | varchar(32) | 是 | 矩阵项状态 |
 | `risk_level` | varchar(32) | 是 | `low`、`medium`、`high` |
 | `is_mandatory` | boolean | 是 | 是否强制项 |
@@ -611,12 +623,17 @@ MVP-v0.5 的核心表。每条矩阵项必须回链证据来源。
 - `risk_level = high`、`is_mandatory = true`、`status = needs_material` 的项不得批量确认。
 - 人工修改 `requirement_text`、`status`、`risk_level`、`owner_user_id`、`response_suggestion` 时必须填写 `modify_reason` 并写审计。
 - `evidence_text` 是来源片段的冗余快照，方便导出和审计；权威来源仍是 `source_chunk_id`。
+- `dedup_key` 只能用于疑似关联提示；只有人工确认 `duplicate_group_id` 后，状态级联才允许生效。
+- 级联确认只同步确认状态、确认人、确认时间等低风险状态；风险等级、强制属性、条目类型不得静默同步。
+- `source_create_method = manual_selection` 时必须保留 `selected_text` 和 `source_chunk_id`，offset 可为空但应尽力保存。
 
 建议索引：
 
 - `idx_cm_tenant_project_section(tenant_id, project_id, section_id)`
 - `idx_cm_filter(tenant_id, project_id, section_id, status, risk_level, owner_user_id)`
 - `idx_cm_source(tenant_id, source_document_id, source_version_id, source_chunk_id)`
+- `idx_cm_dedup(tenant_id, project_id, section_id, dedup_key)`
+- `idx_cm_duplicate_group(tenant_id, project_id, section_id, duplicate_group_id)`
 - `idx_cm_updated(tenant_id, project_id, updated_at)`
 
 ### 4.13 `export_files` 导出文件表
@@ -672,7 +689,7 @@ MVP-v0.5 的核心表。每条矩阵项必须回链证据来源。
 | `severity` | varchar(32) | 是 | `info`、`warning`、`critical` |
 | `created_at` | timestamptz | 是 | 创建时间 |
 
-MVP-v0.5 必须覆盖的动作：
+当前必须覆盖的动作：
 
 - `project.created`
 - `section.created`
@@ -696,6 +713,16 @@ MVP-v0.5 必须覆盖的动作：
 - `export.excel_failed`
 - `file.previewed`
 - `file.downloaded`
+- `model_config.updated`
+- `model_config.tested`
+- `model.invocation_succeeded`
+- `model.invocation_failed`
+- `matrix.item_created_from_source`
+- `matrix.similar_candidate_applied`
+- `matrix.duplicate_group_confirmed`
+- `matrix.duplicate_group_unlinked`
+- `matrix.duplicate_group_split`
+- `matrix.cascade_confirmed`
 
 建议索引：
 
@@ -708,6 +735,44 @@ MVP-v0.5 必须覆盖的动作：
 - 按月或按季度分区。
 - 保留在线查询窗口，历史日志归档到低成本存储。
 - 安全相关日志可同步到 SIEM。
+
+### 4.15 `ai_model_configs` 模型配置表
+
+记录租户级模型配置。MVP1.1 正式使用 `capability = chat`，预留 `embedding` 和 `rerank`；API Key 加密存储，读取接口只返回脱敏值。
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | UUID | 是 | 主键 |
+| `tenant_id` | UUID | 是 | 租户 |
+| `capability` | varchar(32) | 是 | `chat`、`embedding`、`rerank`；当前正式使用 `chat` |
+| `provider` | varchar(64) | 是 | `mock`、`deepseek`、`openai_compatible` |
+| `base_url` | text | 否 | OpenAI-compatible 服务地址 |
+| `simple_model` | varchar(128) | 否 | 简单任务模型名 |
+| `complex_model` | varchar(128) | 否 | 复杂任务模型名 |
+| `timeout_seconds` | numeric(8,2) | 是 | 调用超时时间 |
+| `enabled` | boolean | 是 | 是否启用 |
+| `api_key_encrypted` | text | 否 | AES-256-GCM 加密后的 API Key |
+| `api_key_masked` | varchar(128) | 否 | 脱敏展示值 |
+| `encryption_key_version` | varchar(32) | 否 | 加密密钥版本 |
+| `last_test_status` | varchar(32) | 否 | `success`、`failed`、`skipped` |
+| `last_test_message` | text | 否 | 最近连接测试摘要 |
+| `last_tested_at` | timestamptz | 否 | 最近测试时间 |
+| `created_by` | UUID | 是 | 创建人 |
+| `updated_by` | UUID | 是 | 更新人 |
+| `created_at` | timestamptz | 是 | 创建时间 |
+| `updated_at` | timestamptz | 是 | 更新时间 |
+
+关键规则：
+
+- 同一租户同一 `capability` 只能有一条配置。
+- 新写入 API Key 时，后端必须存在 `MODEL_CONFIG_ENCRYPTION_KEY`。
+- 明文 API Key 不得返回前端，不得写入审计日志和模型调用日志。
+- 模型调用优先使用启用的 DB 配置；没有可用 DB 配置时回退 `LLM_*` 环境变量；仍不可用则进入 mock/规则兜底。
+
+建议索引：
+
+- `uq_ai_model_configs_tenant_capability(tenant_id, capability)`
+- `idx_ai_model_configs_tenant_enabled(tenant_id, capability, enabled)`
 
 ## 5. 核心状态枚举
 
