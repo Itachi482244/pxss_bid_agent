@@ -94,6 +94,75 @@ COMPLIANCE_EXTRACT_SCHEMA: dict[str, Any] = {
 }
 
 
+DOCUMENT_SECTION_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["sections"],
+    "properties": {
+        "sections": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": [
+                    "section_index",
+                    "title",
+                    "section_type",
+                    "start_page",
+                    "end_page",
+                    "confidence_score",
+                    "evidence",
+                ],
+                "properties": {
+                    "section_index": {"type": "integer", "minimum": 1},
+                    "title": {"type": "string"},
+                    "section_type": {
+                        "type": "string",
+                        "enum": [
+                            "announcement",
+                            "bidder_instructions",
+                            "evaluation",
+                            "contract",
+                            "technical",
+                            "bill",
+                            "forms",
+                            "other",
+                        ],
+                    },
+                    "start_page": {"type": "integer", "minimum": 1},
+                    "end_page": {"type": "integer", "minimum": 1},
+                    "confidence_score": {"type": "number", "minimum": 0, "maximum": 1},
+                    "evidence": {"type": "string"},
+                },
+            },
+        }
+    },
+}
+
+
+SECTION_COVERAGE_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["status", "issues"],
+    "properties": {
+        "status": {"type": "string", "enum": ["passed", "blocked"]},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["severity", "code", "message"],
+                "properties": {
+                    "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "code": {"type": "string"},
+                    "message": {"type": "string"},
+                    "page_no": {"type": "integer"},
+                    "source_chunk_index": {"type": "integer"},
+                    "suggested_requirement": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+
 _PROMPTS: dict[str, PromptDefinition] = {
     "compliance_extract@1.1.0": PromptDefinition(
         prompt_id="compliance_extract",
@@ -104,7 +173,7 @@ _PROMPTS: dict[str, PromptDefinition] = {
             "只允许基于提供的招标文件 chunks 抽取候选项；不得编造、不得自动确认、"
             "不得输出联系信息、采购人/代理机构介绍、公告标题或纯项目信息。"
         ),
-        fallback_note="模型不可用、JSON 失败、schema 失败、缺来源或规则冲突时降级到本地规则抽取。",
+        fallback_note="旧测试兼容/对照评测 prompt；生产矩阵生成不再使用该 prompt 静默降级。",
         system_template=(
             "你是招投标合规矩阵抽取助手。你只能输出 JSON，不要输出解释性正文。"
             "你的职责是把招标公告/招标文件中的投标响应要求拆成最小可审核合规项。"
@@ -137,6 +206,80 @@ _PROMPTS: dict[str, PromptDefinition] = {
             "\"confidence_score\": 0.82"
             "} ] }\n\n"
             "chunks:\n{chunks_json}"
+        ),
+    ),
+    "document_section_plan@1.1.0": PromptDefinition(
+        prompt_id="document_section_plan",
+        version="1.1.0",
+        input_variables=("pages_json",),
+        output_schema=DOCUMENT_SECTION_PLAN_SCHEMA,
+        safety_boundary=(
+            "只允许基于提供的页文本和表格摘要规划章节；不得臆造不存在的页码或章节。"
+            "页码范围必须来自输入 payload。"
+        ),
+        fallback_note="生产流程不静默降级；章节计划失败时阻断矩阵生成并写入质量报告。",
+        system_template=(
+            "你是招标文件章节规划助手。你只能输出 JSON。"
+            "你的目标是把按页解析文本规划成连续的章节或语义段，供后续逐段抽取合规矩阵。"
+        ),
+        user_template=(
+            "请根据下面按页文本/表格摘要输出章节或语义段计划。规则：\n"
+            "1. sections 必须按 section_index 从 1 递增排序。\n"
+            "2. 每段 start_page/end_page 必须落在输入页码范围内，且 start_page <= end_page。\n"
+            "3. 段之间不得重叠；尽量覆盖所有有效正文页。目录、封面可并入最相关段或 other。\n"
+            "4. section_type 只能取 announcement、bidder_instructions、evaluation、contract、technical、bill、forms、other。\n"
+            "5. title 使用原文章节标题；没有明确标题时用语义标题。\n"
+            "6. evidence 写明用于判断边界的短证据，不要超过 120 字。\n\n"
+            "pages:\n{pages_json}"
+        ),
+    ),
+    "compliance_extract_by_section@1.1.0": PromptDefinition(
+        prompt_id="compliance_extract_by_section",
+        version="1.1.0",
+        input_variables=("section_json", "chunks_json"),
+        output_schema=COMPLIANCE_EXTRACT_SCHEMA,
+        safety_boundary=(
+            "只允许基于当前语义段 chunks 抽取；不得跨段猜测、不得编造；"
+            "不得输出未勾选 □ 选项、说明文字、联系方式、模板占位符。"
+        ),
+        fallback_note="生产流程不静默降级；模型、JSON、schema 或来源校验失败会阻断矩阵生成。",
+        system_template=(
+            "你是招投标合规矩阵抽取助手。你只能输出 JSON。"
+            "你需要从一个章节/语义段中抽取最小可审核合规项，并给出可回链的 source_quote。"
+        ),
+        user_template=(
+            "请从当前语义段抽取合规矩阵候选项。规则：\n"
+            "1. 每个 item 必须有 source_chunk_index、source_quote，source_quote 必须能在对应 chunk 文本或表格行中找到。\n"
+            "2. 抽取发包/招标范围、承包方式、评审办法/交易方式、最高限价、工期、资格资质、项目负责人资格、在建限制、联合体/分包限制、保证金、截止时间、强制响应、评分和技术硬指标。\n"
+            "3. 不要输出项目名称、建设地点、资金来源、联系人、电话、地址、纯说明文字。\n"
+            "4. 不要输出未选中的 □ 选项；遇到 ☑/√/✓ 选项只抽选中项。\n"
+            "5. 过滤 `/ 年 / 月 / 日`、`发包人需要增加...`、`说明：`、空白占位和模板提示。\n"
+            "6. 多个要求必须拆成最小原子项，但保持每项有清晰来源摘录。\n"
+            "7. item_type 只能取 qualification、mandatory_response、format、deadline、scoring、reference_info、technical_response、other。\n\n"
+            "section:\n{section_json}\n\n"
+            "chunks:\n{chunks_json}"
+        ),
+    ),
+    "section_coverage_review@1.1.0": PromptDefinition(
+        prompt_id="section_coverage_review",
+        version="1.1.0",
+        input_variables=("section_json", "chunks_json", "items_json"),
+        output_schema=SECTION_COVERAGE_REVIEW_SCHEMA,
+        safety_boundary=(
+            "只检查当前语义段是否存在明显漏抽；不得要求抽取输入中不存在的条款。"
+            "只有严重影响后续流程的漏抽才返回 high severity。"
+        ),
+        fallback_note="生产流程不静默降级；复核失败或 high severity 漏抽会阻断矩阵生成。",
+        system_template=(
+            "你是招标文件合规抽取覆盖性复核助手。你只能输出 JSON。"
+            "请检查当前段的抽取结果是否漏掉关键合规要求。"
+        ),
+        user_template=(
+            "请复核当前语义段的合规抽取覆盖性。规则：\n"
+            "1. 如果发包/招标范围、承包方式、评审办法/交易方式、最高限价、工期、企业资质、项目负责人资格、在建限制、联合体限制、保证金、截止时间等关键项在段内出现但 items 未覆盖，返回 high issue。\n"
+            "2. 对纯项目背景、建设地点、资金来源、联系人、说明文字、未选 □ 选项，不要报漏抽。\n"
+            "3. status=blocked 只在存在 high issue 时使用，否则 passed。\n\n"
+            "section:\n{section_json}\n\nchunks:\n{chunks_json}\n\nitems:\n{items_json}"
         ),
     ),
     "requirement_risk_assess@1.1.0": PromptDefinition(

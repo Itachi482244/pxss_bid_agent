@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from io import BytesIO
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -356,6 +358,63 @@ def test_project_import_from_uploaded_document_creates_project_document_and_matr
     monkeypatch.setattr(settings, "llm_provider", "mock")
     monkeypatch.setattr(settings, "llm_api_key", "")
     settings.run_tasks_inline = True
+
+    def fake_chat_completion(db, **kwargs):  # noqa: ANN001, ARG001
+        prompt_version = kwargs["prompt_version"]
+        if prompt_version == "document_section_plan@1.1.0":
+            content = {
+                "sections": [
+                    {
+                        "section_index": 1,
+                        "title": "招标公告",
+                        "section_type": "announcement",
+                        "start_page": 1,
+                        "end_page": 1,
+                        "confidence_score": 0.9,
+                        "evidence": "导入文件招标公告。",
+                    }
+                ]
+            }
+        elif prompt_version == "compliance_extract_by_section@1.1.0":
+            user_content = kwargs["messages"][-1]["content"]
+            chunks = json.loads(user_content.rsplit("chunks:\n", 1)[1])
+
+            def chunk_for(needle: str) -> dict:
+                return next(item for item in chunks if needle in item["text"])
+
+            content = {
+                "items": [
+                    {
+                        "source_chunk_index": chunk_for("营业执照")["chunk_index"],
+                        "item_type": "qualification",
+                        "requirement_text": "投标人须提供有效营业执照，并加盖公章。",
+                        "risk_level": "high",
+                        "is_mandatory": True,
+                        "source_quote": "投标人须提供有效营业执照，并加盖公章。",
+                        "confidence_score": 0.9,
+                    },
+                    {
+                        "source_chunk_index": chunk_for("最高投标限价")["chunk_index"],
+                        "item_type": "mandatory_response",
+                        "requirement_text": "最高投标限价：1349.09万元。",
+                        "risk_level": "high",
+                        "is_mandatory": True,
+                        "source_quote": "最高投标限价：1349.09万元",
+                        "confidence_score": 0.9,
+                    },
+                ]
+            }
+        else:
+            content = {"status": "passed", "issues": []}
+        return SimpleNamespace(
+            content=json.dumps(content, ensure_ascii=False),
+            provider="fake",
+            model_name="unit-test",
+            log_id=None,
+            usage={},
+        )
+
+    monkeypatch.setattr("app.services.compliance_generation.chat_completion", fake_chat_completion)
     client = TestClient(app)
     project_name = f"导入文件项目 {uuid4().hex}"
 

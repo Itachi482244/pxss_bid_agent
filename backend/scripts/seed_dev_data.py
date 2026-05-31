@@ -159,6 +159,13 @@ def get_or_create_document(
         )
     )
     if document is not None and document.current_version_id is not None:
+        document.status = "available"
+        document.doc_type = "tender"
+        document.source_type = "public_url"
+        document.source_site = "示例公共资源交易平台"
+        document.source_url = "https://example.com/tender/demo/files/tender.pdf"
+        document.file_ext = "pdf"
+        document.bucket = settings.minio_bucket
         version = db.scalar(
             select(DocumentVersion).where(
                 DocumentVersion.tenant_id == tenant.id,
@@ -501,6 +508,13 @@ def get_or_create_cleanroom_document(
         )
     )
     if document is not None and document.current_version_id is not None:
+        document.status = "available"
+        document.doc_type = "tender"
+        document.source_type = "public_url"
+        document.source_site = "脱敏公共资源交易平台"
+        document.source_url = "https://example.com/tender/cleanroom-demo/files/tender.pdf"
+        document.file_ext = "pdf"
+        document.bucket = settings.minio_bucket
         version = db.get(DocumentVersion, document.current_version_id)
         chunks = db.scalars(
             select(DocumentChunk)
@@ -788,6 +802,15 @@ def get_or_create_demo_material(
         )
     )
     if material is not None:
+        material.data_level = data_level
+        material.verification_status = verification_status
+        material.valid_until = valid_until
+        material.structured_fields = structured_fields
+        material.evidence_text = evidence_text
+        material.updated_by = user.id
+        material.updated_at = datetime.now(UTC)
+        db.flush()
+        rebuild_material_chunks(db, material)
         return material
 
     material = EnterpriseMaterial(

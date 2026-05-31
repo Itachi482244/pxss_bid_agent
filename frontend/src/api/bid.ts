@@ -183,6 +183,50 @@ export type DocumentChunk = {
   created_at: string;
 };
 
+export type QualityIssue = {
+  severity: "low" | "medium" | "high" | string;
+  code: string;
+  message: string;
+  section_id?: string | null;
+  section_index?: number | null;
+  section_title?: string | null;
+  page_no?: number | null;
+  source_chunk_index?: number | null;
+  suggested_requirement?: string | null;
+  [key: string]: unknown;
+};
+
+export type DocumentSemanticSection = {
+  id: string;
+  document_id: string;
+  document_version_id: string;
+  section_id: string | null;
+  section_index: number;
+  title: string;
+  section_type: string;
+  start_page: number;
+  end_page: number;
+  confidence_score: number | null;
+  evidence: string | null;
+  status: string;
+  model_invocation_log_id: string | null;
+  raw_json: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DocumentExtractionQualityReport = {
+  id: string;
+  task_id: string | null;
+  document_id: string;
+  document_version_id: string;
+  section_id: string | null;
+  status: "passed" | "blocked" | string;
+  issues_json: QualityIssue[];
+  summary_json: Record<string, unknown>;
+  created_at: string;
+};
+
 export type DocumentManualRevisionPayload = {
   reason: string;
   chunks: Array<{
@@ -1026,6 +1070,53 @@ export async function listDocumentChunks(
 ) {
   const response = await apiClient.get<DocumentChunk[]>(
     `/projects/${projectId}/sections/${sectionId}/documents/${documentId}/versions/${versionId}/chunks`
+  );
+  return response.data;
+}
+
+export async function listDocumentSemanticSections(
+  projectId: string,
+  sectionId: string,
+  documentId: string,
+  versionId: string
+) {
+  const response = await apiClient.get<DocumentSemanticSection[]>(
+    `/projects/${projectId}/sections/${sectionId}/documents/${documentId}/versions/${versionId}/semantic-sections`
+  );
+  return response.data;
+}
+
+export async function replanDocumentSemanticSections(
+  projectId: string,
+  sectionId: string,
+  documentId: string,
+  versionId: string
+) {
+  const response = await apiClient.post<DocumentSemanticSection[]>(
+    `/projects/${projectId}/sections/${sectionId}/documents/${documentId}/versions/${versionId}/semantic-sections/replan`
+  );
+  return response.data;
+}
+
+export async function extractDocumentSemanticSectionCompliance(
+  projectId: string,
+  sectionId: string,
+  semanticSectionId: string
+) {
+  const response = await apiClient.post<AsyncTask>(
+    `/projects/${projectId}/sections/${sectionId}/document-semantic-sections/${semanticSectionId}/extract-compliance`
+  );
+  return response.data;
+}
+
+export async function getDocumentExtractionQualityReport(
+  projectId: string,
+  sectionId: string,
+  documentId: string,
+  versionId: string
+) {
+  const response = await apiClient.get<DocumentExtractionQualityReport | null>(
+    `/projects/${projectId}/sections/${sectionId}/documents/${documentId}/versions/${versionId}/extraction-quality-report`
   );
   return response.data;
 }

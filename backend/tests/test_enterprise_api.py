@@ -322,20 +322,21 @@ def test_compliance_evidence_requirement_can_be_waived() -> None:
     unique = uuid4().hex[:8]
 
     with SessionLocal() as db:
-        document = db.scalar(
-            select(Document).where(
+        row = db.execute(
+            select(Document, DocumentChunk)
+            .join(DocumentChunk, DocumentChunk.document_version_id == Document.current_version_id)
+            .where(
                 Document.project_id == UUID(project["id"]),
                 Document.section_id == UUID(section["id"]),
                 Document.current_version_id.is_not(None),
                 Document.status != "deleted",
             )
+            .order_by(Document.updated_at.desc(), DocumentChunk.chunk_index.asc())
+            .limit(1)
         )
-        assert document is not None
-        chunk = db.scalar(
-            select(DocumentChunk)
-            .where(DocumentChunk.document_version_id == document.current_version_id)
-            .order_by(DocumentChunk.chunk_index.asc())
-        )
+        row = row.one_or_none()
+        assert row is not None
+        document, chunk = row
         assert chunk is not None
         item = ComplianceItem(
             tenant_id=document.tenant_id,

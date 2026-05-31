@@ -1001,6 +1001,27 @@
   align-items: center;
 }
 
+.section-plan-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #d9e1ee;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.section-plan-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.section-plan-header p {
+  margin: 4px 0 0;
+  color: #697386;
+}
+
 .export-list {
   display: flex;
   flex-wrap: wrap;

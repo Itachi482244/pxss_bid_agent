@@ -4,7 +4,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
+from decimal import Decimal
+
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy import UniqueConstraint
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -140,6 +142,110 @@ class DocumentChunk(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     bbox_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     table_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DocumentSemanticSection(Base):
+    __tablename__ = "document_semantic_sections"
+    __table_args__ = (
+        CheckConstraint(
+            "section_type IN ('announcement', 'bidder_instructions', 'evaluation', "
+            "'contract', 'technical', 'bill', 'forms', 'other')",
+            name="document_semantic_section_type_allowed",
+        ),
+        CheckConstraint(
+            "status IN ('planned', 'verified', 'low_confidence', 'invalid')",
+            name="document_semantic_section_status_allowed",
+        ),
+        CheckConstraint("start_page >= 1", name="document_semantic_section_start_page_positive"),
+        CheckConstraint("end_page >= start_page", name="document_semantic_section_page_range_valid"),
+        CheckConstraint(
+            "confidence_score IS NULL OR (confidence_score >= 0 AND confidence_score <= 1)",
+            name="document_semantic_section_confidence_range",
+        ),
+        UniqueConstraint("tenant_id", "document_version_id", "section_index"),
+        Index(
+            "idx_document_semantic_sections_version",
+            "tenant_id",
+            "document_version_id",
+            "section_index",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False
+    )
+    document_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document_versions.id"), nullable=False
+    )
+    section_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bid_sections.id"), nullable=True
+    )
+    section_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    section_type: Mapped[str] = mapped_column(String(64), nullable=False, default="other")
+    start_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="planned")
+    model_invocation_log_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_invocation_logs.id"), nullable=True
+    )
+    raw_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DocumentExtractionQualityReport(Base):
+    __tablename__ = "document_extraction_quality_reports"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('passed', 'blocked')",
+            name="document_extraction_quality_report_status_allowed",
+        ),
+        Index(
+            "idx_document_extraction_quality_reports_version",
+            "tenant_id",
+            "document_version_id",
+            "created_at",
+        ),
+        Index(
+            "idx_document_extraction_quality_reports_task",
+            "tenant_id",
+            "task_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("async_tasks.id"), nullable=True
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False
+    )
+    document_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document_versions.id"), nullable=False
+    )
+    section_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bid_sections.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    issues_json: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    summary_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

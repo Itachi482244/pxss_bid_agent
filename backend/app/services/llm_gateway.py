@@ -150,6 +150,7 @@ def chat_completion(
     temperature: float = 0.0,
     response_format: dict[str, Any] | None = None,
     max_tokens: int | None = None,
+    timeout_seconds: float | None = None,
     evidence_refs: dict[str, Any] | None = None,
 ) -> LLMResult:
     prompt_text = _message_text(messages)
@@ -161,6 +162,9 @@ def chat_completion(
     runtime_config = resolve_chat_model_config(db, tenant_id)
     model_name = choose_model(resolved_complexity, runtime_config)
     provider = runtime_config.provider or "mock"
+    request_timeout_seconds = float(runtime_config.timeout_seconds)
+    if timeout_seconds is not None:
+        request_timeout_seconds = max(request_timeout_seconds, float(timeout_seconds))
     prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
     estimated_tokens = _estimate_tokens(prompt_text)
 
@@ -188,6 +192,7 @@ def chat_completion(
             "message_count": len(messages),
             "message_roles": [message.get("role") for message in messages],
             "prompt_char_count": len(prompt_text),
+            "timeout_seconds": request_timeout_seconds,
             "model_config_source": runtime_config.source,
         },
         evidence_refs_json=evidence_refs,
@@ -221,7 +226,7 @@ def chat_completion(
 
     started_at = time.perf_counter()
     try:
-        with httpx.Client(timeout=runtime_config.timeout_seconds) as client:
+        with httpx.Client(timeout=request_timeout_seconds) as client:
             response = client.post(
                 f"{runtime_config.base_url.rstrip('/')}/chat/completions",
                 headers={

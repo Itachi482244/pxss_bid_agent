@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -263,6 +265,51 @@ def test_manual_revision_creates_new_version_and_matrix_uses_revised_chunks(monk
     from app.worker import run_document_parse_task
 
     monkeypatch.setattr(run_document_parse_task, "delay", lambda task_id: None)
+
+    def fake_chat_completion(db, **kwargs):  # noqa: ANN001, ARG001
+        prompt_version = kwargs["prompt_version"]
+        if prompt_version == "document_section_plan@1.1.0":
+            content = {
+                "sections": [
+                    {
+                        "section_index": 1,
+                        "title": "资格要求",
+                        "section_type": "announcement",
+                        "start_page": 1,
+                        "end_page": 1,
+                        "confidence_score": 0.9,
+                        "evidence": "人工修正后的资格要求段落。",
+                    }
+                ]
+            }
+        elif prompt_version == "compliance_extract_by_section@1.1.0":
+            user_content = kwargs["messages"][-1]["content"]
+            chunks = json.loads(user_content.rsplit("chunks:\n", 1)[1])
+            chunk = next(item for item in chunks if "安全生产许可证" in item["text"])
+            content = {
+                "items": [
+                    {
+                        "source_chunk_index": chunk["chunk_index"],
+                        "item_type": "qualification",
+                        "requirement_text": "投标人须提供有效安全生产许可证。",
+                        "risk_level": "high",
+                        "is_mandatory": True,
+                        "source_quote": "投标人须提供有效安全生产许可证。",
+                        "confidence_score": 0.9,
+                    }
+                ]
+            }
+        else:
+            content = {"status": "passed", "issues": []}
+        return SimpleNamespace(
+            content=json.dumps(content, ensure_ascii=False),
+            provider="fake",
+            model_name="unit-test",
+            log_id=None,
+            usage={},
+        )
+
+    monkeypatch.setattr("app.services.compliance_generation.chat_completion", fake_chat_completion)
 
     client = TestClient(app)
     project_id, section_id = get_seed_project_and_section(client)

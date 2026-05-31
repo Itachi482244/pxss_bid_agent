@@ -7,13 +7,23 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from difflib import SequenceMatcher
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.models import AsyncTask, AuditLog, ComplianceItem, Document, DocumentChunk, DocumentVersion
+from app.models import (
+    AsyncTask,
+    AuditLog,
+    ComplianceItem,
+    Document,
+    DocumentChunk,
+    DocumentExtractionQualityReport,
+    DocumentSemanticSection,
+    DocumentVersion,
+)
 from app.prompts import get_prompt
 from app.services.llm_gateway import LLMGatewayError, chat_completion
 
@@ -141,7 +151,7 @@ STRUCTURAL_HEADING_RE = re.compile(
     r"^(?:[一二三四五六七八九十]+[、.．]|[1-9]\d?(?:[.．]\d{1,2})*[.．、])\s*[^。；;]{2,40}[:：]?$"
 )
 LIST_MARKER_RE = re.compile(
-    r"(?<![\w./])(?:[（(]\d+[）)]|[1-9]\d?(?:[.．]\d{1,2})+[.．]?|[1-9]\d?[.．])"
+    r"(?<![\w./])(?:[（(]\d+[）)]|[1-9]\d?(?:[.．]\d{1,2})+[.．]?|[1-9]\d?[.．、])"
 )
 CHINESE_LIST_MARKER_RE = re.compile(
     r"(^|[\s。；;！？!?])([一二三四五六七八九十]{1,3})[、.．]"
@@ -157,12 +167,56 @@ CHINESE_NUMERAL_VALUES = {
     "八": 8,
     "九": 9,
 }
+OPTION_MARKER_RE = re.compile(r"\s*[□☐\uf0a3]\s*")
+PDF_NOISE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])0?43607(?![A-Za-z0-9])")
+PAGE_FOOTER_RE = re.compile(r"\s*[-－]\s*\d{1,4}\s*[-－]\s*")
+CIRCLED_LIST_MARKER_RE = re.compile(r"(?<![\w])([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳])")
+CHINESE_PAREN_MARKER_RE = re.compile(r"(?<![\w])([（(][一二三四五六七八九十]{1,3}[）)])")
+SECTION_PLAN_HEADING_SIGNALS = (
+    "章",
+    "节",
+    "篇",
+    "交易公告",
+    "招标公告",
+    "采购公告",
+    "投标人须知",
+    "交易须知",
+    "评标",
+    "评审",
+    "合同",
+    "技术",
+    "工程量清单",
+    "清单",
+    "图纸",
+    "响应文件格式",
+    "投标文件格式",
+    "资格",
+    "资质",
+    "前附表",
+)
+SECTION_EXTRACT_MAX_CHARS = 14_000
+SECTION_EXTRACT_MAX_CHUNKS = 30
+SECTION_EXTRACT_MAX_PAGES = 18
 
 
 class ComplianceGenerationError(Exception):
     def __init__(self, message: str, *, code: str = "COMPLIANCE_GENERATION_FAILED") -> None:
         super().__init__(message)
         self.code = code
+
+
+class ComplianceQualityGateError(ComplianceGenerationError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "QUALITY_GATE_BLOCKED",
+        issues: list[dict[str, Any]] | None = None,
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.issues = issues or []
+        self.summary = summary or {}
 
 
 class LLMComplianceItem(BaseModel):
@@ -197,6 +251,59 @@ class LLMComplianceResponse(BaseModel):
     items: list[LLMComplianceItem]
 
 
+class LLMDocumentSection(BaseModel):
+    section_index: int = Field(ge=1)
+    title: str = Field(min_length=1)
+    section_type: str = "other"
+    start_page: int = Field(ge=1)
+    end_page: int = Field(ge=1)
+    confidence_score: float = Field(default=0.75, ge=0, le=1)
+    evidence: str = ""
+
+    @field_validator("section_type")
+    @classmethod
+    def validate_section_type(cls, value: str) -> str:
+        allowed = {
+            "announcement",
+            "bidder_instructions",
+            "evaluation",
+            "contract",
+            "technical",
+            "bill",
+            "forms",
+            "other",
+        }
+        return value if value in allowed else "other"
+
+
+class LLMDocumentSectionPlan(BaseModel):
+    sections: list[LLMDocumentSection] = Field(min_length=1)
+
+
+class LLMCoverageIssue(BaseModel):
+    severity: str = "medium"
+    code: str = "COVERAGE_REVIEW_ISSUE"
+    message: str
+    page_no: int | None = None
+    source_chunk_index: int | None = None
+    suggested_requirement: str | None = None
+
+    @field_validator("severity")
+    @classmethod
+    def validate_severity(cls, value: str) -> str:
+        return value if value in {"low", "medium", "high"} else "medium"
+
+
+class LLMCoverageReview(BaseModel):
+    status: str = "passed"
+    issues: list[LLMCoverageIssue] = Field(default_factory=list)
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        return value if value in {"passed", "blocked"} else "blocked"
+
+
 @dataclass(frozen=True)
 class ComplianceCandidate:
     source_chunk_index: int
@@ -221,13 +328,20 @@ def _coerce_task_id(task_id: uuid.UUID | str) -> uuid.UUID:
 
 def _clean_requirement_text(text: str) -> str:
     cleaned = " ".join(text.replace("\xa0", " ").split()).strip()
-    return re.sub(r"^[□☐☑✓√？?]\s*", "", cleaned).strip()
+    cleaned = PDF_NOISE_TOKEN_RE.sub(" ", cleaned)
+    cleaned = PAGE_FOOTER_RE.sub(" ", cleaned)
+    cleaned = " ".join(cleaned.split()).strip()
+    cleaned = re.sub(r"^[□☐☑✓√？?]\s*", "", cleaned).strip()
+    return re.sub(r"(具备)\s+\1", r"\1", cleaned)
 
 
 def _heading_leaf(heading_path: str | None) -> str | None:
     if not heading_path:
         return None
-    return heading_path.split("/")[-1].strip() or None
+    leaf = heading_path.split("/")[-1].strip()
+    if re.fullmatch(r"PDF\s*第\s*\d+\s*页", leaf):
+        return None
+    return leaf or None
 
 
 def _is_contact_text(text: str, heading_path: str | None) -> bool:
@@ -355,7 +469,7 @@ def _risk_reason(item_type: str, text: str, risk_level: str) -> str:
         return "资格类条款通常属于准入条件，缺失或不满足可能导致资格审查不通过。"
     if item_type == "deadline":
         return "截止时间或开标时间错过后通常无法补救，需要作为高风险时间节点处理。"
-    if any(keyword in text for keyword in ("必须", "须", "不得", "最高投标限价", "CA")):
+    if any(keyword in text for keyword in ("必须", "须", "不得", "不允许", "最高投标限价", "最高报价限价", "CA")):
         return "原文包含必须、须、不得、限价或 CA 等强约束信号，需要逐条核验响应。"
     if risk_level == "medium":
         return "该条款需要投标文件响应或材料支撑，但暂未识别为一票否决条件。"
@@ -391,6 +505,7 @@ def _candidate_explanation(
         "batch_confirm_reason": _batch_confirm_reason(risk_level, is_mandatory),
         "matched_keywords": keywords,
         "extraction_provider": extraction_provider,
+        "source_quote": text[:300],
     }
 
 
@@ -398,6 +513,7 @@ def _chunk_payload(chunks: list[DocumentChunk]) -> list[dict[str, Any]]:
     return [
         {
             "chunk_index": chunk.chunk_index,
+            "page_no": chunk.page_no,
             "heading_path": chunk.heading_path,
             "text": chunk.content_text,
         }
@@ -405,7 +521,190 @@ def _chunk_payload(chunks: list[DocumentChunk]) -> list[dict[str, Any]]:
     ]
 
 
+def _chunk_effective_page_no(chunk: DocumentChunk) -> int:
+    return int(chunk.page_no or 1)
+
+
+def _section_plan_limits(page_count: int) -> tuple[int, int, int]:
+    if page_count >= 100:
+        return 120, 2, 100
+    if page_count >= 60:
+        return 240, 2, 120
+    if page_count >= 25:
+        return 520, 5, 180
+    return 900, 8, 220
+
+
+def _section_plan_excerpt(text: str, *, max_chars: int) -> str:
+    lines = [_clean_requirement_text(line) for line in re.split(r"[\r\n]+", text or "")]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+
+    heading_lines: list[str] = []
+    for line in lines[:30]:
+        compact = line.strip()
+        if len(compact) > 80:
+            continue
+        if _is_pure_heading(compact) or STRUCTURAL_HEADING_RE.match(compact):
+            heading_lines.append(compact)
+            continue
+        if any(signal in compact for signal in SECTION_PLAN_HEADING_SIGNALS):
+            heading_lines.append(compact)
+
+    lead = _clean_requirement_text(" ".join(lines[:8]))
+    picked = list(dict.fromkeys([*heading_lines[:8], lead]))
+    excerpt = "\n".join(line for line in picked if line)
+    return excerpt[:max_chars]
+
+
+def _page_payload(
+    chunks: list[DocumentChunk],
+    *,
+    max_text_chars: int | None = None,
+    max_table_rows: int | None = None,
+    max_table_row_chars: int | None = None,
+) -> list[dict[str, Any]]:
+    page_count = len({_chunk_effective_page_no(chunk) for chunk in chunks})
+    default_text_chars, default_table_rows, default_row_chars = _section_plan_limits(page_count)
+    text_limit = max_text_chars if max_text_chars is not None else default_text_chars
+    table_row_limit = max_table_rows if max_table_rows is not None else default_table_rows
+    table_row_char_limit = max_table_row_chars if max_table_row_chars is not None else default_row_chars
+    pages: dict[int, dict[str, Any]] = {}
+    for chunk in chunks:
+        page_no = _chunk_effective_page_no(chunk)
+        page = pages.setdefault(
+            page_no,
+            {
+                "page_no": page_no,
+                "chunk_indexes": [],
+                "headings": [],
+                "text": "",
+                "table_rows": [],
+            },
+        )
+        page["chunk_indexes"].append(chunk.chunk_index)
+        if chunk.heading_path and chunk.heading_path not in page["headings"]:
+            page["headings"].append(chunk.heading_path)
+        if len(page["text"]) < text_limit:
+            remaining = text_limit - len(page["text"])
+            excerpt = _section_plan_excerpt(chunk.content_text, max_chars=remaining)
+            if excerpt:
+                page["text"] = f"{page['text']}\n{excerpt[:remaining]}".strip()[:text_limit]
+        for row_text in _table_row_texts(chunk)[: max(1, table_row_limit)]:
+            if len(page["table_rows"]) >= table_row_limit:
+                break
+            clipped_row = row_text[:table_row_char_limit]
+            if clipped_row and clipped_row not in page["table_rows"]:
+                page["table_rows"].append(clipped_row)
+    return [pages[page_no] for page_no in sorted(pages)]
+
+
+def _section_record_payload(section: DocumentSemanticSection) -> dict[str, Any]:
+    return {
+        "id": str(section.id),
+        "section_index": section.section_index,
+        "title": section.title,
+        "section_type": section.section_type,
+        "start_page": section.start_page,
+        "end_page": section.end_page,
+        "confidence_score": float(section.confidence_score or 0),
+        "evidence": section.evidence,
+        "status": section.status,
+    }
+
+
+def _table_row_texts(chunk: DocumentChunk) -> list[str]:
+    table_json = chunk.table_json or {}
+    rows = table_json.get("rows") if isinstance(table_json, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    row_texts: list[str] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        cells = [
+            _clean_requirement_text(str(cell))
+            for cell in row
+            if cell is not None and _clean_requirement_text(str(cell))
+        ]
+        if not cells:
+            continue
+        if len(cells) == 1:
+            row_texts.append(cells[0])
+            continue
+        if re.fullmatch(r"\d{1,2}", cells[0]) and len(cells) >= 3:
+            row_texts.append(f"{cells[1]}：{'；'.join(cells[2:])}")
+            continue
+        row_texts.append(f"{cells[0]}：{'；'.join(cells[1:])}")
+    return row_texts
+
+
+def _rule_source_texts(chunk: DocumentChunk) -> list[str]:
+    table_rows = _table_row_texts(chunk)
+    return table_rows if table_rows else [chunk.content_text]
+
+
+def _best_table_row_quote(chunk: DocumentChunk, text: str) -> str | None:
+    rows = _table_row_texts(chunk)
+    if not rows:
+        return None
+
+    compact_text = re.sub(r"\s+", "", text)
+    tokens = set(re.findall(r"[A-Za-z0-9.]{2,}", compact_text))
+    for chinese_part in re.findall(r"[\u4e00-\u9fff]+", compact_text):
+        for size in (2, 3, 4):
+            tokens.update(
+                chinese_part[index : index + size]
+                for index in range(0, max(len(chinese_part) - size + 1, 0))
+            )
+
+    best_row: str | None = None
+    best_score = 0
+    for row in rows:
+        compact_row = re.sub(r"\s+", "", row)
+        score = 0
+        if compact_text and compact_text in compact_row:
+            score += 100
+        score += sum(min(len(token), 4) for token in tokens if token in compact_row)
+        if score > best_score:
+            best_row = row
+            best_score = score
+    return best_row if best_row and best_score > 0 else None
+
+
+def _is_response_form_table(chunk: DocumentChunk) -> bool:
+    if not chunk.table_json:
+        return False
+    text = _clean_requirement_text(chunk.content_text)
+    return any(
+        signal in text
+        for signal in (
+            "见响应文件",
+            "例如：",
+            "单位工程名称 | 建设规模",
+            "材料、 设备品种",
+            "机械或设备 名称",
+            "总部人员 项目主管",
+        )
+    )
+
+
 def _relevant_chunks(chunks: list[DocumentChunk]) -> list[DocumentChunk]:
+    table_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.table_json
+        and not _is_response_form_table(chunk)
+        and any(
+            keyword in f"{chunk.heading_path or ''} {chunk.content_text}"
+            for keyword in GENERATION_KEYWORDS
+        )
+    ]
+    if len(table_chunks) >= 3:
+        return table_chunks[:80]
+
     relevant = [
         chunk
         for chunk in chunks
@@ -425,18 +724,1126 @@ def _json_from_model_text(content: str) -> dict[str, Any]:
     return json.loads(content)
 
 
+def _normalize_llm_compliance_payload(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, list):
+        payload = {"items": payload}
+    if not isinstance(payload, dict):
+        return {"items": []}
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        for alias in (
+            "candidates",
+            "requirements",
+            "compliance_items",
+            "compliance_entries",
+            "compliance_matrix",
+            "matrix",
+            "matrix_items",
+            "entries",
+            "results",
+        ):
+            if isinstance(payload.get(alias), list):
+                raw_items = payload[alias]
+                break
+    if not isinstance(raw_items, list):
+        section_items: list[Any] = []
+        for key, value in payload.items():
+            if not isinstance(key, str) or not isinstance(value, list):
+                continue
+            if re.fullmatch(r"section[_-]?\d+", key, flags=re.IGNORECASE) or re.fullmatch(
+                r"第[一二三四五六七八九十\d]+[章节部分]?",
+                key,
+            ):
+                section_items.extend(value)
+        if section_items:
+            raw_items = section_items
+    if not isinstance(raw_items, list):
+        return payload
+    normalized_items: list[dict[str, Any]] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            normalized_items.append(raw_item)
+            continue
+        item = dict(raw_item)
+        if "requirement_text" not in item:
+            for alias in ("requirement", "requirement_content", "requirement_name", "text", "content"):
+                if item.get(alias):
+                    item["requirement_text"] = item[alias]
+                    break
+        if "source_chunk_index" not in item:
+            for alias in ("chunk_index", "source_index", "chunk_id"):
+                if item.get(alias) is not None:
+                    item["source_chunk_index"] = item[alias]
+                    break
+        if "source_quote" not in item:
+            for alias in ("source_excerpt", "quote", "evidence", "source_text"):
+                if item.get(alias):
+                    item["source_quote"] = item[alias]
+                    break
+        if "requirement_text" not in item and item.get("source_quote"):
+            item["requirement_text"] = item["source_quote"]
+        if "normalized_requirement" not in item and item.get("requirement_text"):
+            item["normalized_requirement"] = item["requirement_text"]
+        normalized_items.append(item)
+    return {**payload, "items": normalized_items}
+
+
+def _normalize_coverage_review_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"status": "blocked", "issues": []}
+    raw_issues = payload.get("issues")
+    if not isinstance(raw_issues, list):
+        return {**payload, "issues": []}
+    normalized_issues: list[dict[str, Any]] = []
+    for raw_issue in raw_issues:
+        if not isinstance(raw_issue, dict):
+            continue
+        issue = dict(raw_issue)
+        if "message" not in issue:
+            for alias in ("description", "reason", "detail", "issue"):
+                if issue.get(alias):
+                    issue["message"] = issue[alias]
+                    break
+        if "message" not in issue and (issue.get("item") or issue.get("field")):
+            issue_type = str(issue.get("type") or issue.get("code") or "coverage_issue")
+            issue["message"] = f"{issue_type}: {issue.get('item') or issue.get('field')}"
+        if "suggested_requirement" not in issue:
+            for alias in ("suggestion", "suggested_text", "requirement", "item", "field"):
+                if issue.get(alias):
+                    issue["suggested_requirement"] = issue[alias]
+                    break
+        normalized_issues.append(issue)
+    return {**payload, "issues": normalized_issues}
+
+
+def _quality_issue(
+    *,
+    code: str,
+    message: str,
+    severity: str = "high",
+    semantic_section: DocumentSemanticSection | None = None,
+    page_no: int | None = None,
+    source_chunk_index: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    issue: dict[str, Any] = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+    }
+    if semantic_section is not None:
+        issue["section_id"] = str(semantic_section.id)
+        issue["section_index"] = semantic_section.section_index
+        issue["section_title"] = semantic_section.title
+    if page_no is not None:
+        issue["page_no"] = page_no
+    if source_chunk_index is not None:
+        issue["source_chunk_index"] = source_chunk_index
+    if extra:
+        issue.update(extra)
+    return issue
+
+
+def _write_quality_report(
+    db: Session,
+    task: AsyncTask,
+    document: Document,
+    version: DocumentVersion,
+    *,
+    status: str,
+    issues: list[dict[str, Any]] | None = None,
+    summary: dict[str, Any] | None = None,
+) -> DocumentExtractionQualityReport:
+    report = DocumentExtractionQualityReport(
+        tenant_id=task.tenant_id,
+        task_id=task.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        section_id=task.section_id,
+        status=status,
+        issues_json=issues or [],
+        summary_json=summary or {},
+    )
+    db.add(report)
+    db.flush()
+    return report
+
+
+def _message_payload_char_count(messages: list[dict[str, str]]) -> int:
+    return sum(len(message.get("content") or "") for message in messages)
+
+
+def latest_extraction_quality_report(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    document_version_id: uuid.UUID,
+) -> DocumentExtractionQualityReport | None:
+    return db.scalar(
+        select(DocumentExtractionQualityReport)
+        .where(
+            DocumentExtractionQualityReport.tenant_id == tenant_id,
+            DocumentExtractionQualityReport.document_version_id == document_version_id,
+        )
+        .order_by(DocumentExtractionQualityReport.created_at.desc())
+        .limit(1)
+    )
+
+
+def _validate_section_plan(
+    sections: list[LLMDocumentSection],
+    chunks: list[DocumentChunk],
+) -> list[LLMDocumentSection]:
+    if not chunks:
+        raise ComplianceGenerationError("文档版本没有解析分块", code="NO_DOCUMENT_CHUNKS")
+    page_numbers = sorted({_chunk_effective_page_no(chunk) for chunk in chunks})
+    min_page = page_numbers[0]
+    max_page = page_numbers[-1]
+    ordered = sorted(sections, key=lambda section: (section.start_page, section.end_page, section.section_index))
+    if not ordered:
+        raise ComplianceQualityGateError(
+            "模型未返回有效章节计划",
+            code="SECTION_PLAN_EMPTY",
+            issues=[
+                _quality_issue(
+                    code="SECTION_PLAN_EMPTY",
+                    message="模型未返回任何章节/语义段。",
+                )
+            ],
+        )
+
+    previous_end = min_page - 1
+    normalized: list[LLMDocumentSection] = []
+    seen_indexes: set[int] = set()
+    for position, section in enumerate(ordered, start=1):
+        if section.section_index in seen_indexes:
+            raise ComplianceQualityGateError(
+                "章节计划存在重复序号",
+                code="SECTION_PLAN_DUPLICATE_INDEX",
+                issues=[
+                    _quality_issue(
+                        code="SECTION_PLAN_DUPLICATE_INDEX",
+                        message=f"章节序号 {section.section_index} 重复。",
+                        page_no=section.start_page,
+                    )
+                ],
+            )
+        seen_indexes.add(section.section_index)
+        if section.start_page < min_page or section.end_page > max_page:
+            raise ComplianceQualityGateError(
+                "章节计划页码越界",
+                code="SECTION_PLAN_PAGE_OUT_OF_RANGE",
+                issues=[
+                    _quality_issue(
+                        code="SECTION_PLAN_PAGE_OUT_OF_RANGE",
+                        message=f"章节“{section.title}”页码 {section.start_page}-{section.end_page} 超出解析页范围 {min_page}-{max_page}。",
+                        page_no=section.start_page,
+                    )
+                ],
+            )
+        if section.start_page <= previous_end:
+            raise ComplianceQualityGateError(
+                "章节计划页码重叠",
+                code="SECTION_PLAN_OVERLAP",
+                issues=[
+                    _quality_issue(
+                        code="SECTION_PLAN_OVERLAP",
+                        message=f"章节“{section.title}”与上一段页码重叠。",
+                        page_no=section.start_page,
+                    )
+                ],
+            )
+        if section.start_page > previous_end + 1:
+            raise ComplianceQualityGateError(
+                "章节计划存在断档",
+                code="SECTION_PLAN_GAP",
+                issues=[
+                    _quality_issue(
+                        code="SECTION_PLAN_GAP",
+                        message=f"章节计划缺少第 {previous_end + 1} 页到第 {section.start_page - 1} 页。",
+                        page_no=previous_end + 1,
+                    )
+                ],
+            )
+        previous_end = section.end_page
+        normalized.append(section.model_copy(update={"section_index": position}))
+    if previous_end < max_page:
+        raise ComplianceQualityGateError(
+            "章节计划末尾存在断档",
+            code="SECTION_PLAN_GAP",
+            issues=[
+                _quality_issue(
+                    code="SECTION_PLAN_GAP",
+                    message=f"章节计划缺少第 {previous_end + 1} 页到第 {max_page} 页。",
+                    page_no=previous_end + 1,
+                )
+            ],
+        )
+    return normalized
+
+
+def _section_size_stats(
+    *,
+    start_page: int,
+    end_page: int,
+    chunks: list[DocumentChunk],
+) -> tuple[int, int, int]:
+    current_chunks = [
+        chunk for chunk in chunks if start_page <= _chunk_effective_page_no(chunk) <= end_page
+    ]
+    return (
+        max(0, end_page - start_page + 1),
+        len(current_chunks),
+        sum(len(chunk.content_text or "") for chunk in current_chunks),
+    )
+
+
+def _section_within_extract_limits(
+    *,
+    start_page: int,
+    end_page: int,
+    chunks: list[DocumentChunk],
+) -> bool:
+    page_count, chunk_count, char_count = _section_size_stats(
+        start_page=start_page,
+        end_page=end_page,
+        chunks=chunks,
+    )
+    return (
+        page_count <= SECTION_EXTRACT_MAX_PAGES
+        and chunk_count <= SECTION_EXTRACT_MAX_CHUNKS
+        and char_count <= SECTION_EXTRACT_MAX_CHARS
+    )
+
+
+def _stored_section_plan_has_oversized_section(
+    sections: list[DocumentSemanticSection],
+    chunks: list[DocumentChunk],
+) -> bool:
+    return any(
+        not _section_within_extract_limits(
+            start_page=section.start_page,
+            end_page=section.end_page,
+            chunks=chunks,
+        )
+        for section in sections
+    )
+
+
+def _split_large_section_plan(
+    sections: list[LLMDocumentSection],
+    chunks: list[DocumentChunk],
+) -> list[LLMDocumentSection]:
+    chunks_by_page: dict[int, list[DocumentChunk]] = {}
+    for chunk in chunks:
+        chunks_by_page.setdefault(_chunk_effective_page_no(chunk), []).append(chunk)
+
+    split_sections: list[LLMDocumentSection] = []
+    for section in sections:
+        if _section_within_extract_limits(
+            start_page=section.start_page,
+            end_page=section.end_page,
+            chunks=chunks,
+        ):
+            split_sections.append(section)
+            continue
+
+        ranges: list[tuple[int, int]] = []
+        current_start: int | None = None
+        current_end: int | None = None
+        current_chunk_count = 0
+        current_char_count = 0
+        for page_no in range(section.start_page, section.end_page + 1):
+            page_chunks = chunks_by_page.get(page_no, [])
+            page_char_count = sum(len(chunk.content_text or "") for chunk in page_chunks)
+            would_exceed = current_start is not None and (
+                page_no - current_start + 1 > SECTION_EXTRACT_MAX_PAGES
+                or current_chunk_count + len(page_chunks) > SECTION_EXTRACT_MAX_CHUNKS
+                or current_char_count + page_char_count > SECTION_EXTRACT_MAX_CHARS
+            )
+            if would_exceed:
+                ranges.append((current_start, current_end or page_no - 1))
+                current_start = page_no
+                current_chunk_count = len(page_chunks)
+                current_char_count = page_char_count
+            else:
+                current_start = page_no if current_start is None else current_start
+                current_chunk_count += len(page_chunks)
+                current_char_count += page_char_count
+            current_end = page_no
+
+        if current_start is not None and current_end is not None:
+            ranges.append((current_start, current_end))
+
+        for offset, (start_page, end_page) in enumerate(ranges, start=1):
+            title = section.title if len(ranges) == 1 else f"{section.title}（{offset}）"
+            evidence_parts = [section.evidence.strip()] if section.evidence else []
+            evidence_parts.append("长章节按页码拆分，控制单段抽取上下文。")
+            split_sections.append(
+                section.model_copy(
+                    update={
+                        "title": title,
+                        "start_page": start_page,
+                        "end_page": end_page,
+                        "evidence": "；".join(evidence_parts),
+                    }
+                )
+            )
+
+    return [
+        section.model_copy(update={"section_index": index})
+        for index, section in enumerate(split_sections, start=1)
+    ]
+
+
+def ensure_document_section_plan(
+    db: Session,
+    task: AsyncTask,
+    document: Document,
+    version: DocumentVersion,
+    chunks: list[DocumentChunk],
+    *,
+    force: bool = False,
+) -> list[DocumentSemanticSection]:
+    existing = db.scalars(
+        select(DocumentSemanticSection)
+        .where(
+            DocumentSemanticSection.tenant_id == task.tenant_id,
+            DocumentSemanticSection.document_version_id == version.id,
+        )
+        .order_by(DocumentSemanticSection.section_index)
+    ).all()
+    if existing and not force and not _stored_section_plan_has_oversized_section(list(existing), chunks):
+        return list(existing)
+
+    prompt = get_prompt("document_section_plan", "1.1.0")
+    pages = _page_payload(chunks)
+    messages = prompt.render(pages_json=json.dumps(pages, ensure_ascii=False))
+    payload_char_count = _message_payload_char_count(messages)
+    try:
+        result = chat_completion(
+            db,
+            tenant_id=task.tenant_id,
+            project_id=task.project_id,
+            section_id=task.section_id,
+            actor_user_id=task.created_by,
+            actor_type="worker",
+            task_type="document_section_plan",
+            prompt_version=prompt.prompt_version,
+            messages=messages,
+            complexity="complex" if len(pages) >= 20 else "simple",
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            timeout_seconds=90.0 if len(pages) >= 20 else None,
+            evidence_refs={
+                "document_version_ids": [str(version.id)],
+                "page_numbers": [page["page_no"] for page in pages],
+                "chunk_indexes": [chunk.chunk_index for chunk in chunks],
+                "payload_char_count": payload_char_count,
+            },
+        )
+    except LLMGatewayError as exc:
+        timed_out = "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
+        message = "章节规划模型调用超时。" if timed_out else "章节规划模型调用失败。"
+        raise ComplianceQualityGateError(
+            f"{message}{str(exc)}",
+            code=exc.code,
+            issues=[
+                _quality_issue(
+                    code=exc.code,
+                    message=f"{message}请稍后重试；若持续失败，需要继续压缩规划输入或调高模型读取超时。",
+                    severity="high",
+                    extra={
+                        "stage": "document_section_plan",
+                        "model_invocation_log_id": str(exc.log_id) if exc.log_id else None,
+                        "page_count": len(pages),
+                        "chunk_count": len(chunks),
+                        "payload_char_count": payload_char_count,
+                    },
+                )
+            ],
+            summary={
+                "document_id": str(document.id),
+                "document_version_id": str(version.id),
+                "stage": "document_section_plan",
+                "page_count": len(pages),
+                "chunk_count": len(chunks),
+                "payload_char_count": payload_char_count,
+            },
+        ) from exc
+    plan = LLMDocumentSectionPlan.model_validate(_json_from_model_text(result.content))
+    planned_sections = _split_large_section_plan(_validate_section_plan(plan.sections, chunks), chunks)
+
+    if existing:
+        db.execute(
+            delete(DocumentSemanticSection).where(
+                DocumentSemanticSection.tenant_id == task.tenant_id,
+                DocumentSemanticSection.document_version_id == version.id,
+            )
+        )
+        db.flush()
+
+    stored: list[DocumentSemanticSection] = []
+    for section in planned_sections:
+        status = "low_confidence" if section.confidence_score < 0.6 else "planned"
+        record = DocumentSemanticSection(
+            tenant_id=task.tenant_id,
+            document_id=document.id,
+            document_version_id=version.id,
+            section_id=task.section_id,
+            section_index=section.section_index,
+            title=section.title[:300],
+            section_type=section.section_type,
+            start_page=section.start_page,
+            end_page=section.end_page,
+            confidence_score=_confidence(section.confidence_score),
+            evidence=section.evidence[:1000] if section.evidence else None,
+            status=status,
+            model_invocation_log_id=result.log_id,
+            raw_json=section.model_dump(),
+        )
+        db.add(record)
+        stored.append(record)
+    db.flush()
+    return stored
+
+
 def _llm_prompt(chunks: list[DocumentChunk]) -> list[dict[str, str]]:
     payload = json.dumps(_chunk_payload(chunks), ensure_ascii=False)
     return get_prompt("compliance_extract", "1.1.0").render(chunks_json=payload)
 
 
 def _source_quote(item: LLMComplianceItem, source_chunk: DocumentChunk, cleaned_text: str) -> str:
+    row_quote = _best_table_row_quote(source_chunk, cleaned_text)
+    if row_quote:
+        return row_quote[:300]
     quote = _clean_requirement_text(item.source_quote or "")
     if quote and quote in source_chunk.content_text:
         return quote[:300]
     if cleaned_text in source_chunk.content_text:
         return cleaned_text[:300]
     return _clean_requirement_text(source_chunk.content_text)[:300]
+
+
+def _compact_for_match(text: str) -> str:
+    return re.sub(r"\s+", "", _clean_requirement_text(text))
+
+
+def _compact_for_source_match(text: str) -> str:
+    text = text.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+    return re.sub(r"[\s|:：☑√✓□\\\"'“”‘’\x80-\x9f\ue000-\uf8ff]+", "", _clean_requirement_text(text))
+
+
+def _drop_short_parenthetical(text: str) -> str:
+    previous = None
+    cleaned = text
+    while cleaned != previous:
+        previous = cleaned
+        cleaned = re.sub(r"[(（][^()（）]{1,80}[)）]", "", cleaned)
+    return cleaned
+
+
+def _drop_soft_punctuation(text: str) -> str:
+    return re.sub(r"[，,。；;]+", "", text)
+
+
+def _drop_optional_chinese_particles(text: str) -> str:
+    return re.sub(r"[的为是]", "", text)
+
+
+def _drop_optional_source_labels(text: str) -> str:
+    return text.replace("约定", "")
+
+
+def _drop_carried_subject_prefix(text: str) -> str:
+    return re.sub(r"^(?:承包人|发包人|潜在承包人|投标人|供应商)", "", text)
+
+
+def _field_value_reordered_match(compact_source: str, compact_quote: str) -> bool:
+    for value in ("不允许", "不接受", "不收取", "允许", "接受", "无", "否", "是"):
+        if compact_quote.startswith(value):
+            field = compact_quote.removeprefix(value)
+            if len(field) >= 4 and value in compact_source and field in compact_source:
+                return True
+        if compact_quote.endswith(value):
+            field = compact_quote.removesuffix(value)
+            if len(field) >= 4 and value in compact_source and field in compact_source:
+                return True
+    return False
+
+
+def _selected_numbered_option_match(compact_source: str, compact_quote: str) -> bool:
+    marker_match = re.search(r"第[（(]?([0-9一二三四五六七八九十]+)[)）]?种方式", compact_quote)
+    if not marker_match:
+        return False
+    prefix = compact_quote[: marker_match.end()]
+    tail = compact_quote[marker_match.end() :]
+    if len(prefix) < 8 or len(tail) < 6:
+        return False
+    prefix_index = compact_source.find(prefix)
+    if prefix_index >= 0 and tail in compact_source[prefix_index + len(prefix) :]:
+        return True
+
+    searchable_source = _drop_soft_punctuation(compact_source)
+    prefix_fragments = [
+        _drop_soft_punctuation(fragment)
+        for fragment in re.split(r"[，,。；;]+", prefix)
+        if len(_drop_soft_punctuation(fragment)) >= 4
+    ]
+    searchable_tail = _drop_soft_punctuation(tail)
+    if not prefix_fragments or len(searchable_tail) < 6:
+        return False
+    cursor = 0
+    for fragment in prefix_fragments:
+        index = searchable_source.find(fragment, cursor)
+        if index < 0:
+            return False
+        cursor = index + len(fragment)
+    return searchable_tail in searchable_source[cursor:]
+
+
+def _source_insertion_fuzzy_match(compact_source: str, compact_quote: str) -> bool:
+    searchable_source = _drop_soft_punctuation(compact_source)
+    searchable_quote = _drop_soft_punctuation(compact_quote)
+    if len(searchable_quote) < 30:
+        return False
+    match = SequenceMatcher(None, searchable_quote, searchable_source, autojunk=False).find_longest_match(
+        0,
+        len(searchable_quote),
+        0,
+        len(searchable_source),
+    )
+    if match.size < 18:
+        return False
+    before = searchable_quote[: match.a]
+    after = searchable_quote[match.a + match.size :]
+    before_ok = not before or (
+        len(before) >= 6 and before in searchable_source[: match.b]
+    )
+    after_ok = not after or (
+        len(after) >= 6 and after in searchable_source[match.b + match.size :]
+    )
+    return before_ok and after_ok
+
+
+def _trailing_context_intro_match(compact_source: str, compact_quote: str) -> bool:
+    searchable_source = _drop_soft_punctuation(compact_source)
+    searchable_quote = _drop_soft_punctuation(compact_quote)
+    for context in ("发包人有权单方解除合同", "作废标处理"):
+        if not searchable_quote.endswith(context):
+            continue
+        requirement = searchable_quote.removesuffix(context)
+        if len(requirement) < 8:
+            continue
+        context_index = searchable_source.find(context)
+        requirement_index = searchable_source.find(requirement)
+        if context_index >= 0 and requirement_index >= 0:
+            return True
+    return False
+
+
+def _party_alternative_variants(compact_source: str) -> set[str]:
+    return {
+        compact_source,
+        compact_source.replace("／承包人", "").replace("/承包人", ""),
+        compact_source.replace("发包人／", "").replace("发包人/", ""),
+    }
+
+
+def _source_quote_fuzzy_matches(compact_source: str, compact_quote: str) -> bool:
+    if not compact_source:
+        return False
+    compact_source_without_soft_punctuation = _drop_soft_punctuation(compact_source)
+    ellipsis_fragments = [
+        _drop_soft_punctuation(fragment)
+        for fragment in re.split(r"(?:\.{2,}|…{1,2})", compact_quote)
+        if len(_drop_soft_punctuation(fragment)) >= 6
+    ]
+    raw_ellipsis_fragments = [
+        _drop_soft_punctuation(fragment)
+        for fragment in re.split(r"(?:\.{2,}|…{1,2})", compact_quote)
+        if _drop_soft_punctuation(fragment)
+    ]
+    if len(raw_ellipsis_fragments) >= 2:
+        first_fragment = raw_ellipsis_fragments[0]
+        last_fragment = raw_ellipsis_fragments[-1]
+        if len(first_fragment) >= 8 and len(last_fragment) >= 3:
+            first_index = compact_source_without_soft_punctuation.find(first_fragment)
+            if first_index >= 0:
+                last_index = compact_source_without_soft_punctuation.find(
+                    last_fragment,
+                    first_index + len(first_fragment),
+                )
+                if last_index >= 0:
+                    return True
+    if len(ellipsis_fragments) >= 2:
+        cursor = 0
+        matched_all = True
+        for fragment in ellipsis_fragments:
+            index = compact_source_without_soft_punctuation.find(fragment, cursor)
+            if index < 0:
+                matched_all = False
+                break
+            cursor = index + len(fragment)
+        if matched_all:
+            return True
+    fragments = [
+        fragment
+        for fragment in re.split(r"[，,。；;]+|(?=[(（]\d+[)）])", compact_quote)
+        if len(fragment) >= 6
+    ]
+    if len(fragments) >= 2 and sum(len(fragment) for fragment in fragments) >= 12:
+        cursor = 0
+        matched_all = True
+        for fragment in fragments:
+            index = compact_source.find(fragment, cursor)
+            if index < 0:
+                matched_all = False
+                break
+            cursor = index + len(fragment)
+        if matched_all:
+            return True
+    compact_quote_without_soft_punctuation = _drop_soft_punctuation(compact_quote)
+    if (
+        len(compact_quote_without_soft_punctuation) >= 160
+        and compact_quote_without_soft_punctuation[:120] in compact_source_without_soft_punctuation
+    ):
+        return True
+    if len(compact_quote) < 12:
+        return False
+    if len(compact_quote) < 20:
+        match = SequenceMatcher(None, compact_quote, compact_source, autojunk=False).find_longest_match(
+            0,
+            len(compact_quote),
+            0,
+            len(compact_source),
+        )
+        return match.size >= max(10, int(len(compact_quote) * 0.60)) and compact_quote[-4:] in compact_source
+    if len(compact_quote) < 40:
+        match = SequenceMatcher(None, compact_quote, compact_source, autojunk=False).find_longest_match(
+            0,
+            len(compact_quote),
+            0,
+            len(compact_source),
+        )
+        return match.size >= max(16, int(len(compact_quote) * 0.65)) and compact_quote[-4:] in compact_source
+    match = SequenceMatcher(None, compact_quote, compact_source, autojunk=False).find_longest_match(
+        0,
+        len(compact_quote),
+        0,
+        len(compact_source),
+    )
+    return match.size >= max(32, int(len(compact_quote) * 0.42)) or _source_insertion_fuzzy_match(
+        compact_source,
+        compact_quote,
+    )
+
+
+def _source_texts_match_quote(sources: list[str], quote: str) -> bool:
+    compact_quote = _compact_for_source_match(quote)
+    if not compact_quote:
+        return False
+    colon_fragments = [
+        _compact_for_source_match(fragment)
+        for fragment in re.split(r"[:：]", quote)
+        if _compact_for_source_match(fragment)
+    ]
+    for source in sources:
+        compact_source_base = _compact_for_source_match(source)
+        for compact_source in _party_alternative_variants(compact_source_base):
+            compact_source_without_parenthetical = _drop_short_parenthetical(compact_source)
+            compact_quote_without_parenthetical = _drop_short_parenthetical(compact_quote)
+            compact_source_without_soft_punctuation = _drop_soft_punctuation(compact_source)
+            compact_quote_without_soft_punctuation = _drop_soft_punctuation(compact_quote)
+            compact_source_without_parenthetical_soft_punctuation = _drop_soft_punctuation(
+                compact_source_without_parenthetical
+            )
+            compact_quote_without_parenthetical_soft_punctuation = _drop_soft_punctuation(
+                compact_quote_without_parenthetical
+            )
+            compact_quote_without_carried_subject = _drop_carried_subject_prefix(compact_quote)
+            compact_source_without_particles = _drop_optional_chinese_particles(
+                compact_source_without_soft_punctuation
+            )
+            compact_quote_without_particles = _drop_optional_chinese_particles(
+                compact_quote_without_soft_punctuation
+            )
+            compact_source_without_labels = _drop_optional_source_labels(
+                compact_source_without_soft_punctuation
+            )
+            compact_quote_without_labels = _drop_optional_source_labels(
+                compact_quote_without_soft_punctuation
+            )
+            colon_fragments_match = False
+            if len(colon_fragments) >= 2 and len(colon_fragments[0]) >= 4:
+                cursor = 0
+                colon_fragments_match = True
+                for fragment in colon_fragments:
+                    index = compact_source.find(fragment, cursor)
+                    if index < 0:
+                        colon_fragments_match = False
+                        break
+                    cursor = index + len(fragment)
+            if (
+                compact_quote in compact_source
+                or compact_quote_without_soft_punctuation in compact_source_without_soft_punctuation
+                or compact_quote_without_parenthetical_soft_punctuation
+                in compact_source_without_parenthetical_soft_punctuation
+                or (
+                    len(compact_quote_without_carried_subject) >= 8
+                    and compact_quote_without_carried_subject in compact_source
+                )
+                or compact_quote_without_particles in compact_source_without_particles
+                or compact_quote_without_labels in compact_source_without_labels
+                or compact_quote in compact_source_without_parenthetical
+                or compact_quote_without_parenthetical in compact_source
+                or colon_fragments_match
+                or _field_value_reordered_match(compact_source, compact_quote)
+                or _selected_numbered_option_match(compact_source, compact_quote)
+                or _trailing_context_intro_match(compact_source, compact_quote)
+                or _source_quote_fuzzy_matches(compact_source, compact_quote)
+            ):
+                return True
+    return False
+
+
+def _source_quote_matches(source_chunk: DocumentChunk, quote: str) -> bool:
+    return _source_texts_match_quote([source_chunk.content_text, *(_table_row_texts(source_chunk))], quote)
+
+
+def _source_quote_matches_adjacent_chunk_window(
+    chunks: list[DocumentChunk],
+    source_chunk: DocumentChunk,
+    quote: str,
+) -> bool:
+    ordered_chunks = sorted(chunks, key=lambda chunk: chunk.chunk_index)
+    try:
+        position = ordered_chunks.index(source_chunk)
+    except ValueError:
+        return False
+
+    windows: list[list[DocumentChunk]] = []
+    if position > 0:
+        windows.append([ordered_chunks[position - 1], source_chunk])
+    if position < len(ordered_chunks) - 1:
+        windows.append([source_chunk, ordered_chunks[position + 1]])
+    if 0 < position < len(ordered_chunks) - 1:
+        windows.append([ordered_chunks[position - 1], source_chunk, ordered_chunks[position + 1]])
+
+    for window in windows:
+        sources = ["\n".join(chunk.content_text for chunk in window)]
+        for chunk in window:
+            sources.extend(_table_row_texts(chunk))
+        if _source_texts_match_quote(sources, quote):
+            return True
+    return False
+
+
+def _source_quote_text_variants(quote: str) -> list[tuple[str, dict[str, str]]]:
+    variants: list[tuple[str, dict[str, str]]] = [(quote, {})]
+    replacements = (
+        ("专用条款", "通用条款"),
+        ("通用条款", "专用条款"),
+    )
+    for old, new in replacements:
+        if old in quote:
+            variants.append((quote.replace(old, new), {old: new}))
+    return variants
+
+
+def _align_text_with_source_quote_variant(text: str, replacements: dict[str, str]) -> str:
+    aligned = text
+    for old, new in replacements.items():
+        aligned = aligned.replace(old, new)
+    return aligned
+
+
+def _unique_chunk_matching_quote(
+    chunks: list[DocumentChunk],
+    quote: str,
+) -> DocumentChunk | None:
+    matches = [chunk for chunk in chunks if _source_quote_matches(chunk, quote)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _best_chunk_matching_quote(
+    chunks: list[DocumentChunk],
+    quote: str,
+    *,
+    preferred_chunk_index: int,
+) -> DocumentChunk | None:
+    matches = [chunk for chunk in chunks if _source_quote_matches(chunk, quote)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        return None
+    ranked = sorted(matches, key=lambda chunk: abs(chunk.chunk_index - preferred_chunk_index))
+    if len(ranked) >= 2 and abs(ranked[0].chunk_index - preferred_chunk_index) == abs(
+        ranked[1].chunk_index - preferred_chunk_index
+    ):
+        return None
+    return ranked[0]
+
+
+def _contextualized_llm_requirement_text(source_chunk: DocumentChunk, cleaned_text: str) -> str:
+    row_quote = _best_table_row_quote(source_chunk, cleaned_text)
+    if not row_quote or "：" not in row_quote:
+        return cleaned_text
+    label, _value = row_quote.split("：", 1)
+    label = _clean_requirement_text(label)
+    if not label or label in cleaned_text or len(label) > 40:
+        return cleaned_text
+    if not any(
+        signal in label
+        for signal in (
+            "发包范围",
+            "招标范围",
+            "承包方式",
+            "交易方式",
+            "评审办法",
+            "最高",
+            "限价",
+            "工期",
+            "服务期限",
+            "资质要求",
+            "资格要求",
+            "联合体",
+        )
+    ):
+        return cleaned_text
+    value = "不允许。" if "联合体" in label and "不允许" in cleaned_text else cleaned_text
+    return f"{label}：{value}"
+
+
+def _section_chunks(
+    semantic_section: DocumentSemanticSection,
+    chunks: list[DocumentChunk],
+) -> list[DocumentChunk]:
+    return [
+        chunk
+        for chunk in chunks
+        if semantic_section.start_page <= _chunk_effective_page_no(chunk) <= semantic_section.end_page
+    ]
+
+
+def _section_chunk_payload(chunks: list[DocumentChunk]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for chunk in chunks:
+        payload.append(
+            {
+                "chunk_index": chunk.chunk_index,
+                "page_no": _chunk_effective_page_no(chunk),
+                "heading_path": chunk.heading_path,
+                "text": chunk.content_text,
+                "table_rows": _table_row_texts(chunk),
+            }
+        )
+    return payload
+
+
+def _call_section_llm(
+    db: Session,
+    task: AsyncTask,
+    semantic_section: DocumentSemanticSection,
+    chunks: list[DocumentChunk],
+) -> tuple[str, list[ComplianceCandidate]]:
+    prompt = get_prompt("compliance_extract_by_section", "1.1.0")
+    messages = prompt.render(
+        section_json=json.dumps(_section_record_payload(semantic_section), ensure_ascii=False),
+        chunks_json=json.dumps(_section_chunk_payload(chunks), ensure_ascii=False),
+    )
+    char_count = sum(len(chunk.content_text or "") for chunk in chunks)
+    result = chat_completion(
+        db,
+        tenant_id=task.tenant_id,
+        project_id=task.project_id,
+        section_id=task.section_id,
+        actor_user_id=task.created_by,
+        actor_type="worker",
+        task_type="section_compliance_extract",
+        prompt_version=prompt.prompt_version,
+        messages=messages,
+        complexity="complex" if len(chunks) >= 20 or char_count >= 8000 else "simple",
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        timeout_seconds=90.0 if len(chunks) >= 20 or char_count >= 8000 else None,
+        evidence_refs={
+            "semantic_section_id": str(semantic_section.id),
+            "document_version_ids": sorted({str(chunk.document_version_id) for chunk in chunks}),
+            "chunk_ids": [str(chunk.id) for chunk in chunks],
+            "chunk_indexes": [chunk.chunk_index for chunk in chunks],
+            "page_range": [semantic_section.start_page, semantic_section.end_page],
+        },
+    )
+    parsed = LLMComplianceResponse.model_validate(
+        _normalize_llm_compliance_payload(_json_from_model_text(result.content))
+    )
+    chunk_by_index = {chunk.chunk_index: chunk for chunk in chunks}
+    candidates: list[ComplianceCandidate] = []
+    for item in parsed.items:
+        cleaned_text = _clean_requirement_text(item.requirement_text)
+        if not cleaned_text:
+            continue
+        source_chunk = chunk_by_index.get(item.source_chunk_index)
+        if source_chunk is None:
+            raise ComplianceQualityGateError(
+                "模型输出引用了不存在的解析 chunk",
+                code="SOURCE_CHUNK_NOT_FOUND",
+                issues=[
+                    _quality_issue(
+                        code="SOURCE_CHUNK_NOT_FOUND",
+                        message=f"条目“{cleaned_text[:80]}”引用的 chunk_index={item.source_chunk_index} 不在当前语义段内。",
+                        severity="high",
+                        semantic_section=semantic_section,
+                        source_chunk_index=item.source_chunk_index,
+                    )
+                ],
+                summary={"semantic_section_id": str(semantic_section.id)},
+            )
+        if _should_skip_rule_text(cleaned_text, source_chunk.heading_path):
+            continue
+        if _is_contact_text(cleaned_text, source_chunk.heading_path):
+            continue
+        cleaned_text = _contextualized_llm_requirement_text(source_chunk, cleaned_text)
+        rule_type = _rule_item_type(cleaned_text, source_chunk.heading_path)
+        item_type = item.item_type
+        risk_level = item.risk_level
+        if item_type in {"reference_info", "other"} and rule_type != "reference_info":
+            item_type = rule_type
+            risk_level = _risk_level(item_type, cleaned_text)
+        rule_risk = _risk_level(item_type, cleaned_text)
+        if rule_risk == "high" and item_type in {"qualification", "deadline", "mandatory_response", "technical_response"}:
+            risk_level = "high"
+        source_quote = _clean_requirement_text(item.source_quote or "")
+        source_chunk_was_corrected = False
+        source_quote_spans_adjacent_chunks = False
+        source_quote_text_was_aligned = False
+        if source_quote and not _source_quote_matches(source_chunk, source_quote):
+            for source_quote_variant, replacements in _source_quote_text_variants(source_quote)[1:]:
+                if _source_quote_matches(source_chunk, source_quote_variant) or _source_quote_matches_adjacent_chunk_window(
+                    chunks,
+                    source_chunk,
+                    source_quote_variant,
+                ):
+                    source_quote = source_quote_variant
+                    cleaned_text = _align_text_with_source_quote_variant(cleaned_text, replacements)
+                    source_quote_text_was_aligned = True
+                    break
+        if not _source_quote_matches(source_chunk, source_quote):
+            if _source_quote_matches_adjacent_chunk_window(chunks, source_chunk, source_quote):
+                source_quote_spans_adjacent_chunks = True
+            else:
+                corrected_source_chunk = _best_chunk_matching_quote(
+                    chunks,
+                    source_quote,
+                    preferred_chunk_index=item.source_chunk_index,
+                )
+                if corrected_source_chunk is not None:
+                    source_chunk = corrected_source_chunk
+                    source_chunk_was_corrected = True
+                    cleaned_text = _contextualized_llm_requirement_text(source_chunk, cleaned_text)
+                    rule_type = _rule_item_type(cleaned_text, source_chunk.heading_path)
+                    if item_type in {"reference_info", "other"} and rule_type != "reference_info":
+                        item_type = rule_type
+                        risk_level = _risk_level(item_type, cleaned_text)
+                    rule_risk = _risk_level(item_type, cleaned_text)
+                    if rule_risk == "high" and item_type in {
+                        "qualification",
+                        "deadline",
+                        "mandatory_response",
+                        "technical_response",
+                    }:
+                        risk_level = "high"
+        if not _source_quote_matches(source_chunk, source_quote) and not _source_quote_matches_adjacent_chunk_window(
+            chunks,
+            source_chunk,
+            source_quote,
+        ):
+            raise ComplianceQualityGateError(
+                "模型输出 source_quote 无法回链到解析文本",
+                code="SOURCE_QUOTE_NOT_FOUND",
+                issues=[
+                    _quality_issue(
+                        code="SOURCE_QUOTE_NOT_FOUND",
+                        message=f"条目“{cleaned_text[:80]}”的 source_quote 无法在 chunk {item.source_chunk_index} 文本或表格行中找到。",
+                        severity="high",
+                        semantic_section=semantic_section,
+                        page_no=_chunk_effective_page_no(source_chunk),
+                        source_chunk_index=item.source_chunk_index,
+                        extra={"source_quote": source_quote[:300]},
+                    )
+                ],
+                summary={"semantic_section_id": str(semantic_section.id)},
+            )
+        row_quote = _best_table_row_quote(source_chunk, cleaned_text)
+        if row_quote:
+            source_quote = row_quote
+
+        needs_review, classification_reason, split_reason, review_hint = _llm_candidate_notes(
+            item.model_copy(update={"item_type": item_type, "risk_level": risk_level}),
+            source_chunk,
+            cleaned_text,
+            )
+        if source_chunk_was_corrected:
+            needs_review = True
+            source_hint = (
+                f"模型引用的 chunk_index={item.source_chunk_index} 与 source_quote 不一致，"
+                f"系统已按同段唯一摘录重定位到 chunk {source_chunk.chunk_index}，请人工复核。"
+            )
+            review_hint = f"{source_hint} {review_hint}" if review_hint else source_hint
+        if source_quote_spans_adjacent_chunks:
+            needs_review = True
+            source_hint = "source_quote 跨相邻解析分块连续匹配，系统已保留候选项，请人工复核跨页摘录。"
+            review_hint = f"{source_hint} {review_hint}" if review_hint else source_hint
+        if source_quote_text_was_aligned:
+            needs_review = True
+            source_hint = "模型摘录与原文存在可定位词项差异，系统已按来源原文修正条目文本，请人工复核。"
+            review_hint = f"{source_hint} {review_hint}" if review_hint else source_hint
+        normalized = item.normalized_requirement or _semantic_key(cleaned_text, item_type)
+        if not normalized.startswith("auto:"):
+            normalized = _normalized_key(normalized)
+        extraction_provider = f"{result.provider}:{result.model_name}"
+        explanation = _candidate_explanation(
+            item_type=item_type,
+            text=cleaned_text,
+            heading_path=source_chunk.heading_path,
+            risk_level=risk_level,
+            is_mandatory=item.is_mandatory,
+            extraction_provider=extraction_provider,
+        )
+        explanation.update(
+            {
+                "prompt_id": prompt.prompt_id,
+                "prompt_version": prompt.prompt_version,
+                "output_schema": "compliance_extract_by_section",
+                "classification_reason": classification_reason,
+                "split_reason": split_reason,
+                "source_quote": source_quote[:300],
+                "review_hint": review_hint,
+                "needs_human_review": needs_review,
+                "model_confidence_score": item.confidence_score,
+                "semantic_section_id": str(semantic_section.id),
+                "semantic_section_index": semantic_section.section_index,
+                "semantic_section_title": semantic_section.title,
+            }
+        )
+        candidates.append(
+            ComplianceCandidate(
+                source_chunk_index=source_chunk.chunk_index,
+                item_type=item_type,
+                requirement_text=cleaned_text,
+                normalized_requirement=normalized,
+                response_suggestion=item.response_suggestion,
+                risk_level=risk_level,
+                is_mandatory=item.is_mandatory,
+                confidence_score=_confidence(item.confidence_score),
+                explanation_json=explanation,
+            )
+        )
+    semantic_section.status = "verified"
+    return f"{result.provider}:{result.model_name}", candidates
 
 
 def _llm_candidate_notes(
@@ -492,13 +1899,16 @@ def _call_llm(
         complexity="complex" if len(chunks) >= 40 or char_count >= 6000 else "simple",
         temperature=0.0,
         response_format={"type": "json_object"},
+        timeout_seconds=90.0 if len(chunks) >= 40 or char_count >= 6000 else None,
         evidence_refs={
             "chunk_ids": [str(chunk.id) for chunk in chunks],
             "chunk_indexes": [chunk.chunk_index for chunk in chunks],
             "document_version_ids": sorted({str(chunk.document_version_id) for chunk in chunks}),
         },
     )
-    parsed = LLMComplianceResponse.model_validate(_json_from_model_text(result.content))
+    parsed = LLMComplianceResponse.model_validate(
+        _normalize_llm_compliance_payload(_json_from_model_text(result.content))
+    )
     chunk_by_index = {chunk.chunk_index: chunk for chunk in chunks}
     candidates: list[ComplianceCandidate] = []
     for item in parsed.items:
@@ -563,14 +1973,31 @@ def _rule_item_type(text: str, heading_path: str | None) -> str:
     technical_context = any(signal in heading_leaf for signal in ("技术要求", "技术响应", "技术参数", "采购需求"))
     if _is_reference_info(text, heading_path):
         return "reference_info"
-    if any(keyword in text for keyword in ("评标办法", "综合评估法")):
-        return "scoring"
+    if "响应文件的组成" in text:
+        return "format"
     if any(keyword in text for keyword in ("截止时间", "开标时间", "解密", "递交")):
         return "deadline"
     if ("请于" in text and "至" in text) or re.search(
-        r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", text
+        r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日",
+        text,
     ):
         return "deadline"
+    if "是否允许分包" in text:
+        return "mandatory_response"
+    if any(
+        keyword in text
+        for keyword in ("评分", "评审办法", "综合评分法", "权重系数", "浮动系数", "评标基准价")
+    ) or re.search(
+        r"(?:得|扣|加)\s*\d+(?:\.\d+)?\s*分|最高得|不得分|分值|满分",
+        text,
+    ) or re.search(
+        r"\bK\d+--",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "scoring"
+    if any(keyword in text for keyword in ("评标办法", "综合评估法")):
+        return "scoring"
     if any(
         keyword in text
         for keyword in (
@@ -599,6 +2026,27 @@ def _rule_item_type(text: str, heading_path: str | None) -> str:
 
 def _should_skip_rule_text(text: str, heading_path: str | None) -> bool:
     heading_leaf = _heading_leaf(heading_path)
+    compact = re.sub(r"\s+", "", text)
+    if compact == "目录" or (
+        compact.startswith("目录") and "第一章" in compact and "第二章" in compact
+    ):
+        return True
+    if compact in {"无", "否", "/", "／"}:
+        return True
+    if (
+        compact.endswith(("：无", ":无", "：否", ":否"))
+        and "类似工程业绩要求" not in compact
+        and not any(keyword in compact for keyword in ("保证金", "交易担保", "中小企业"))
+    ):
+        return True
+    if re.fullmatch(r"第[一二三四五六七八九十]+章[\u4e00-\u9fff]+(?:前附表)?", compact):
+        return True
+    if "示范文本" in text and "不得改动" in text:
+        return True
+    if "有下划线" in text and "不得改动" in text:
+        return True
+    if "发包人应根据项目的实际情况合理选定评审办法" in text:
+        return True
     if heading_leaf and text == heading_leaf:
         return True
     if _is_contact_text(text, heading_path):
@@ -607,9 +2055,27 @@ def _should_skip_rule_text(text: str, heading_path: str | None) -> bool:
         return True
     if STRUCTURAL_HEADING_RE.match(text):
         return True
+    if text.endswith(("：", ":")) and len(text) <= 40:
+        return True
     if text.endswith(("：", ":")) and "类似工程业绩要求" in text:
         return True
     if text.endswith(("：", ":")) and not any(signal in text for signal in REQUIREMENT_SIGNALS):
+        return True
+    if "/年/月/日" in compact or "承接过/业绩" in compact:
+        return True
+    if "发包人需要增加的、符合法律法规的其他要求" in text and len(text) <= 80:
+        return True
+    if re.match(r"^(项目名称|建设地点|建设规模|资金来源(?:及比例)?)[：:]", text):
+        return True
+    if any(text.startswith(prefix) for prefix in ("项目名称", "建设地点", "资金来源及比例", "资金来源")) and not any(
+        signal in text for signal in ("须", "必须", "不得", "最高", "限价", "工期", "质量")
+    ):
+        return True
+    if "交易须知具体内容如与本前附表不一致" in text:
+        return True
+    if text.startswith(("重新组织交易的情形", "成交人确定：")):
+        return True
+    if re.match(r"^于\s*\d+\s*人的单数组成", text):
         return True
     if text == "不要求" and "类似工程业绩要求" not in (heading_path or ""):
         return True
@@ -630,16 +2096,17 @@ def _should_skip_rule_text(text: str, heading_path: str | None) -> bool:
 
 def _split_by_markers(text: str) -> list[str]:
     matches = list(LIST_MARKER_RE.finditer(text))
-    if len(matches) <= 1:
+    if not matches:
         return [text]
+    if len(matches) == 1:
+        return _single_marker_tail_after_long_prefix(text, matches[0]) or [text]
     parts: list[str] = []
-    prefix = text[: matches[0].start()].strip()
+    prefix = _context_prefix(text[: matches[0].start()])
     for index, match in enumerate(matches):
         start = match.start()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         part = text[start:end].strip()
-        if prefix and not re.match(r"^[（(]?\d+", prefix):
-            part = f"{prefix.rstrip(':：')}：{part}"
+        part = _with_context_prefix(prefix, part)
         parts.append(part)
     return [part for part in parts if part]
 
@@ -672,6 +2139,61 @@ def _consecutive_chinese_marker_matches(text: str) -> list[re.Match[str]]:
     if len(current) > len(best):
         best = current
     return [match for match, _ in best] if len(best) >= 2 else []
+
+
+def _context_prefix(prefix: str) -> str | None:
+    prefix = _clean_requirement_text(prefix).strip(" ：:；;，,")
+    if not prefix:
+        return None
+    compact = re.sub(r"\s+", "", prefix)
+    if len(compact) > 60:
+        return None
+    if any(mark in prefix for mark in "。！？!?"):
+        return None
+    if prefix.count("；") + prefix.count(";") >= 2:
+        return None
+    if "发包人需要增加" in prefix or "说明：" in prefix:
+        return None
+    return prefix
+
+
+def _with_context_prefix(prefix: str | None, part: str) -> str:
+    if not prefix:
+        return part
+    return f"{prefix.rstrip(':：')}：{part}"
+
+
+def _single_marker_tail_after_long_prefix(
+    text: str,
+    match: re.Match[str],
+) -> list[str] | None:
+    prefix = text[: match.start()].strip()
+    if not prefix:
+        return None
+    if _context_prefix(prefix) is not None:
+        return None
+    if len(re.sub(r"\s+", "", _clean_requirement_text(prefix))) <= 60:
+        return None
+    tail = text[match.start() :].strip()
+    return [tail] if tail else None
+
+
+def _split_by_inline_markers(text: str, marker_re: re.Pattern[str]) -> list[str]:
+    matches = list(marker_re.finditer(text))
+    if not matches:
+        return [text]
+    if len(matches) == 1:
+        return _single_marker_tail_after_long_prefix(text, matches[0]) or [text]
+
+    prefix = _context_prefix(text[: matches[0].start()])
+    parts: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        part = text[start:end].strip()
+        if part:
+            parts.append(_with_context_prefix(prefix, part))
+    return parts or [text]
 
 
 def _split_by_chinese_markers(text: str) -> list[str]:
@@ -734,21 +2256,100 @@ def _split_project_overview(text: str) -> list[str]:
     return requirements or [text]
 
 
+def _selected_single_choice_texts(text: str) -> list[str] | None:
+    if not any(prefix in text for prefix in ("是否允许联合体", "是否允许分包", "响应文件的质询")):
+        return None
+    if "不允许" not in text and "不质询" not in text:
+        return None
+    selected = OPTION_MARKER_RE.split(text, maxsplit=1)[0].strip(" ；;。")
+    if not selected:
+        return None
+    return [selected if selected.endswith("。") else f"{selected}。"]
+
+
+def _project_manager_requirement_texts(text: str) -> list[str] | None:
+    if "拟派项目负责人" not in text or "☑" not in text:
+        return None
+
+    requirements: list[str] = []
+    qualification_match = re.search(r"拟派项目负责人[：:]\s*(具有.*?资格)", text)
+    if qualification_match:
+        requirements.append(f"资质要求：拟派项目负责人{qualification_match.group(1)}。")
+
+    for selected in re.findall(r"☑\s*([^□☐☑\uf0a3]+)", text):
+        cleaned = re.split(r"说明[:：]", selected, maxsplit=1)[0]
+        cleaned = re.sub(r"发包人需要增加的、符合法律法规的其他要求.*$", "", cleaned).strip(" ；;。")
+        if cleaned:
+            requirements.append(cleaned if cleaned.endswith("。") else f"{cleaned}。")
+
+    return requirements or None
+
+
+def _response_file_composition_texts(text: str) -> list[str] | None:
+    if "响应文件的组成" not in text or "☑" not in text:
+        return None
+    selected_match = re.search(r"☑\s*(.+)$", text)
+    if selected_match is None:
+        return None
+    selected = re.split(r"说明[:：]", selected_match.group(1), maxsplit=1)[0]
+    selected = selected.strip(" ；;。")
+    if not selected:
+        return None
+    return [f"响应文件的组成：{selected}。"]
+
+
+def _split_scoring_parameter_texts(text: str) -> list[str]:
+    matches = list(re.finditer(r"\bK\d+--", text, flags=re.IGNORECASE))
+    if len(matches) <= 1:
+        return [text]
+
+    prefix = _context_prefix(text[: matches[0].start()])
+    parts: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        part = text[start:end].strip(" ；;")
+        if part:
+            parts.append(_with_context_prefix(prefix, part))
+    return parts or [text]
+
+
 def _atomic_requirement_texts(text: str) -> list[str]:
+    selected_single_choice = _selected_single_choice_texts(text)
+    if selected_single_choice is not None:
+        return selected_single_choice
+    response_file_composition = _response_file_composition_texts(text)
+    if response_file_composition is not None:
+        return response_file_composition
+    if "响应文件的组成" in text:
+        return [text]
     overview_parts = _split_project_overview(text)
     atomic: list[str] = []
     for overview_part in overview_parts:
-        chinese_marker_parts = _split_by_chinese_markers(overview_part)
-        for chinese_part in chinese_marker_parts:
-            marker_parts = _split_by_markers(chinese_part)
-            for part in marker_parts:
-                atomic.extend(_split_qualification_series(part))
+        chinese_paren_parts = _split_by_inline_markers(overview_part, CHINESE_PAREN_MARKER_RE)
+        for chinese_paren_part in chinese_paren_parts:
+            circled_parts = _split_by_inline_markers(chinese_paren_part, CIRCLED_LIST_MARKER_RE)
+            for circled_part in circled_parts:
+                chinese_marker_parts = _split_by_chinese_markers(circled_part)
+                for chinese_part in chinese_marker_parts:
+                    marker_parts = _split_by_markers(chinese_part)
+                    for part in marker_parts:
+                        for scoring_part in _split_scoring_parameter_texts(part):
+                            project_manager_requirements = _project_manager_requirement_texts(
+                                scoring_part
+                            )
+                            if project_manager_requirements is not None:
+                                atomic.extend(project_manager_requirements)
+                                continue
+                            atomic.extend(_split_qualification_series(scoring_part))
     return [item.strip() for item in atomic if item.strip()]
 
 
 def _risk_level(item_type: str, text: str) -> str:
     if item_type == "reference_info":
         return "low"
+    if item_type == "scoring":
+        return "medium"
     if "类似工程业绩要求：不要求" in text:
         return "low"
     if any(keyword in text for keyword in ("保修要求", "缺陷责任期", "招标范围", "评标办法")):
@@ -759,7 +2360,7 @@ def _risk_level(item_type: str, text: str) -> str:
         return "medium"
     if item_type in {"qualification", "deadline"}:
         return "high"
-    if any(keyword in text for keyword in ("必须", "须", "不得", "最高投标限价", "CA")):
+    if any(keyword in text for keyword in ("必须", "须", "不得", "不允许", "最高投标限价", "CA")):
         return "high"
     return "medium"
 
@@ -824,77 +2425,560 @@ def _rule_extract(chunks: list[DocumentChunk]) -> list[ComplianceCandidate]:
     candidates: list[ComplianceCandidate] = []
     seen: set[str] = set()
     for chunk in chunks:
-        original_text = _clean_requirement_text(chunk.content_text)
-        is_similar_performance_not_required = (
-            original_text == "不要求" and "类似工程业绩要求" in (chunk.heading_path or "")
-        )
-        if not original_text or (len(original_text) < 4 and not is_similar_performance_not_required):
-            continue
-        if chunk.content_text.lstrip().startswith("□"):
-            continue
-        if "□" in chunk.content_text and "？" not in chunk.content_text and "?" not in chunk.content_text:
-            continue
-        if _should_skip_rule_text(original_text, chunk.heading_path):
-            continue
-
-        for text in _atomic_requirement_texts(original_text):
-            if _should_skip_rule_text(text, chunk.heading_path):
+        for source_text in _rule_source_texts(chunk):
+            original_text = _clean_requirement_text(source_text)
+            is_similar_performance_not_required = (
+                original_text == "不要求" and "类似工程业绩要求" in (chunk.heading_path or "")
+            )
+            if not original_text or (len(original_text) < 4 and not is_similar_performance_not_required):
                 continue
-            if text == "采用资格后审方式":
-                text = _contextual_requirement_text(text, chunk.heading_path)
-            elif text == "不要求":
-                text = _contextual_requirement_text(text, chunk.heading_path)
-            elif "不得参加投标" == text and "项目建议书" in (chunk.heading_path or ""):
-                text = _contextual_requirement_text(text, chunk.heading_path)
-            else:
-                text = _contextual_requirement_text(text, chunk.heading_path)
-
-            item_type = _rule_item_type(text, chunk.heading_path)
-            if item_type == "mandatory_response" and not any(
-                keyword in text
-                for keyword in (
-                    "须",
-                    "必须",
-                    "不得",
-                    "最高投标限价",
-                    "质量",
-                    "工期",
-                    "保修",
-                    "缺陷责任期",
-                    "招标范围",
-                    "合同履行期限",
-                )
+            if original_text.lstrip().startswith("□"):
+                continue
+            if (
+                "□" in original_text
+                and "☑" not in original_text
+                and "√" not in original_text
+                and "？" not in original_text
+                and "?" not in original_text
+            ):
+                continue
+            atomic_texts = _atomic_requirement_texts(original_text)
+            if _should_skip_rule_text(original_text, chunk.heading_path) and all(
+                _should_skip_rule_text(text, chunk.heading_path) for text in atomic_texts
             ):
                 continue
 
-            normalized = _semantic_key(text, item_type)
+            for text in atomic_texts:
+                if _should_skip_rule_text(text, chunk.heading_path):
+                    continue
+                if text == "采用资格后审方式":
+                    text = _contextual_requirement_text(text, chunk.heading_path)
+                elif text == "不要求":
+                    text = _contextual_requirement_text(text, chunk.heading_path)
+                elif "不得参加投标" == text and "项目建议书" in (chunk.heading_path or ""):
+                    text = _contextual_requirement_text(text, chunk.heading_path)
+                else:
+                    text = _contextual_requirement_text(text, chunk.heading_path)
+
+                item_type = _rule_item_type(text, chunk.heading_path)
+                if item_type == "mandatory_response" and not any(
+                    keyword in text
+                    for keyword in (
+                        "须",
+                        "必须",
+                        "不得",
+                        "不允许",
+                        "最高投标限价",
+                        "质量",
+                        "工期",
+                        "保修",
+                        "缺陷责任期",
+                        "招标范围",
+                        "合同履行期限",
+                    )
+                ):
+                    continue
+
+                normalized = _semantic_key(text, item_type)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                risk_level = _risk_level(item_type, text)
+                is_mandatory = risk_level == "high" or item_type in {"qualification", "deadline"}
+                candidates.append(
+                    ComplianceCandidate(
+                        source_chunk_index=chunk.chunk_index,
+                        item_type=item_type,
+                        requirement_text=text,
+                        normalized_requirement=normalized,
+                        response_suggestion=_response_suggestion(item_type, text),
+                        risk_level=risk_level,
+                        is_mandatory=is_mandatory,
+                        confidence_score=Decimal("0.6500"),
+                        explanation_json=_candidate_explanation(
+                            item_type=item_type,
+                            text=text,
+                            heading_path=chunk.heading_path,
+                            risk_level=risk_level,
+                            is_mandatory=is_mandatory,
+                            extraction_provider="rules",
+                        ),
+                    )
+                )
+                candidates.extend(_extra_candidates_for_chunk(chunk, text, seen))
+    return candidates
+
+
+def _review_section_coverage(
+    db: Session,
+    task: AsyncTask,
+    semantic_section: DocumentSemanticSection,
+    chunks: list[DocumentChunk],
+    candidates: list[ComplianceCandidate],
+) -> list[dict[str, Any]]:
+    prompt = get_prompt("section_coverage_review", "1.1.0")
+    items_payload = [
+        {
+            "source_chunk_index": item.source_chunk_index,
+            "item_type": item.item_type,
+            "requirement_text": item.requirement_text,
+            "risk_level": item.risk_level,
+            "source_quote": item.explanation_json.get("source_quote"),
+        }
+        for item in candidates
+    ]
+    messages = prompt.render(
+        section_json=json.dumps(_section_record_payload(semantic_section), ensure_ascii=False),
+        chunks_json=json.dumps(_section_chunk_payload(chunks), ensure_ascii=False),
+        items_json=json.dumps(items_payload, ensure_ascii=False),
+    )
+    result = chat_completion(
+        db,
+        tenant_id=task.tenant_id,
+        project_id=task.project_id,
+        section_id=task.section_id,
+        actor_user_id=task.created_by,
+        actor_type="worker",
+        task_type="section_compliance_extract",
+        prompt_version=prompt.prompt_version,
+        messages=messages,
+        complexity="complex" if len(chunks) >= 20 else "simple",
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        timeout_seconds=90.0 if len(chunks) >= 20 else None,
+        evidence_refs={
+            "semantic_section_id": str(semantic_section.id),
+            "chunk_ids": [str(chunk.id) for chunk in chunks],
+            "chunk_indexes": [chunk.chunk_index for chunk in chunks],
+            "candidate_count": len(candidates),
+        },
+    )
+    review = LLMCoverageReview.model_validate(
+        _normalize_coverage_review_payload(_json_from_model_text(result.content))
+    )
+    issues: list[dict[str, Any]] = []
+    for issue in review.issues:
+        issues.append(
+            _quality_issue(
+                code=issue.code,
+                message=issue.message,
+                severity=issue.severity,
+                semantic_section=semantic_section,
+                page_no=issue.page_no,
+                source_chunk_index=issue.source_chunk_index,
+                extra={
+                    "suggested_requirement": issue.suggested_requirement,
+                    "coverage_status": review.status,
+                },
+            )
+        )
+    return issues
+
+
+def _is_boilerplate_semantic_section(section: DocumentSemanticSection) -> bool:
+    if section.section_type != "other":
+        return False
+    marker_text = f"{section.title or ''} {section.evidence or ''}"
+    return any(marker in marker_text for marker in ("封面", "目录", "说明", "示范文本"))
+
+
+def _table_guard_item_type(label: str) -> str | None:
+    compact_label = _compact_for_match(label)
+    if "中小企业" in label:
+        return "qualification"
+    if "响应文件有效期" in compact_label:
+        return "mandatory_response"
+    if "最高" in label and "限价" in label:
+        return "mandatory_response"
+    if "工期" in label or "服务期限" in label:
+        return "mandatory_response"
+    if "交易时间" in compact_label or ("截止" in label and "时间" in label):
+        return "deadline"
+    if "交易方式" in label or "评审办法" in label:
+        return "scoring"
+    if "保证金" in label or "交易担保" in label:
+        return "mandatory_response"
+    if "发包范围" in label or "招标范围" in label or "承包方式" in label:
+        return "mandatory_response"
+    return None
+
+
+def _table_guard_row_pairs(row: list[Any]) -> list[tuple[str, str]]:
+    cells = [_clean_requirement_text(str(cell)) for cell in row if cell is not None and _clean_requirement_text(str(cell))]
+    if len(cells) < 2:
+        return []
+    if re.fullmatch(r"\d{1,2}", cells[0]) and len(cells) >= 3:
+        return [(cells[1], "；".join(cells[2:]))]
+    if len(cells) >= 4 and _table_guard_item_type(cells[0]) and _table_guard_item_type(cells[2]):
+        pairs: list[tuple[str, str]] = []
+        for index in range(0, len(cells) - 1, 2):
+            if _table_guard_item_type(cells[index]):
+                pairs.append((cells[index], cells[index + 1]))
+        return pairs
+    return [(cells[0], "；".join(cells[1:]))]
+
+
+def _table_guard_value(label: str, value: str) -> str:
+    if "中小企业" in label:
+        selected_match = re.search(r"[☑√✓]\s*([^□☐☑√✓\uf0a3]+)", value)
+        if selected_match:
+            selected = re.split(r"说明[:：]", selected_match.group(1), maxsplit=1)[0]
+            return selected.strip(" ；;。") or value
+    return value
+
+
+def _augment_section_candidates_from_table_guards(
+    chunks: list[DocumentChunk],
+    candidates: list[ComplianceCandidate],
+    *,
+    extraction_provider: str,
+) -> list[ComplianceCandidate]:
+    existing_text = "\n".join(_compact_for_match(candidate.requirement_text) for candidate in candidates)
+    seen = {candidate.normalized_requirement for candidate in candidates}
+    augmented = list(candidates)
+    for chunk in chunks:
+        table_json = chunk.table_json or {}
+        rows = table_json.get("rows") if isinstance(table_json, dict) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            for label, value in _table_guard_row_pairs(row):
+                item_type = _table_guard_item_type(label)
+                if item_type is None:
+                    continue
+                value = _table_guard_value(label, value)
+                compact_label = _compact_for_match(label)
+                compact_value = _compact_for_match(value)
+                if (
+                    compact_label
+                    and compact_label in existing_text
+                    and len(compact_value) >= 2
+                    and compact_value in existing_text
+                ):
+                    continue
+                requirement = _clean_requirement_text(f"{label}：{value}")
+                if _should_skip_rule_text(requirement, chunk.heading_path):
+                    continue
+                normalized = _semantic_key(requirement, item_type)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                risk_level = _risk_level(item_type, requirement)
+                if (
+                    item_type == "deadline"
+                    or ("最高" in label and "限价" in label)
+                    or "工期" in label
+                    or "服务期限" in label
+                    or "有效期" in label
+                    or "保证金" in label
+                    or "交易担保" in label
+                ):
+                    risk_level = "high"
+                augmented.append(
+                    ComplianceCandidate(
+                        source_chunk_index=chunk.chunk_index,
+                        item_type=item_type,
+                        requirement_text=requirement,
+                        normalized_requirement=normalized,
+                        response_suggestion=_response_suggestion(item_type, requirement),
+                        risk_level=risk_level,
+                        is_mandatory=True,
+                        confidence_score=Decimal("0.7200"),
+                        explanation_json={
+                            **_candidate_explanation(
+                                item_type=item_type,
+                                text=requirement,
+                                heading_path=chunk.heading_path,
+                                risk_level=risk_level,
+                                is_mandatory=True,
+                                extraction_provider=extraction_provider,
+                            ),
+                            "source_quote": requirement[:300],
+                            "needs_human_review": True,
+                            "review_hint": "模型未覆盖该关键表格字段，由结构化表格守卫补齐，请人工核对。",
+                            "classification_reason": "结构化表格守卫识别关键字段。",
+                            "split_reason": "字段-值表格行形成单条可审核要求。",
+                            "table_guard": True,
+                        },
+                    )
+                )
+    return augmented
+
+
+COMMITMENT_BASIC_ABILITY_REQUIREMENTS = (
+    "具有独立承担民事责任的能力",
+    "具有良好的商业信誉和健全的财务会计制度",
+    "具有履行合同所必需的设备和专业技术能力",
+    "有依法缴纳税收和社会保障资金的良好记录",
+    "参加活动前三年内，在经营活动中没有重大违法记录",
+    "具有法律、行政法规规定的其他条件",
+)
+
+
+def _commitment_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
+    source_text = _clean_requirement_text(chunk.content_text or "")
+    if not all(signal in source_text for signal in ("诚信承诺书", "基本能力方面")):
+        return []
+
+    guarded_items: list[tuple[str, str, str]] = []
+    for phrase in COMMITMENT_BASIC_ABILITY_REQUIREMENTS:
+        pattern = rf"(?:\d+[.．、]\s*)?{re.escape(phrase)}[；;。]?"
+        match = re.search(pattern, source_text)
+        if not match:
+            continue
+        source_quote = _clean_requirement_text(match.group(0))
+        requirement_body = re.sub(r"^\d+[.．、]\s*", "", source_quote).rstrip("；;")
+        requirement = _clean_requirement_text(f"诚信承诺书：{requirement_body}")
+        guarded_items.append(("qualification", requirement, source_quote))
+    return guarded_items
+
+
+def _contract_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
+    source_text = _clean_requirement_text(chunk.content_text or "")
+    guarded_items: list[tuple[str, str, str]] = []
+
+    defect_match = re.search(
+        r"工程缺陷责任期为\s*24\s*个月，缺陷责任期自工程通过竣工验收之日起计算[。；;]?",
+        source_text,
+    )
+    if defect_match:
+        source_quote = _clean_requirement_text(defect_match.group(0))
+        guarded_items.append(("mandatory_response", f"缺陷责任期：{source_quote}", source_quote))
+
+    price_form_match = re.search(
+        r"合同价格形式：[\s\ue000-\uf8ff]*固定单价合同[\s\ue000-\uf8ff]*[。；;]?",
+        source_text,
+    )
+    if price_form_match:
+        source_quote = _clean_requirement_text(price_form_match.group(0))
+        guarded_items.append(("mandatory_response", source_quote, source_quote))
+
+    project_manager_match = re.search(
+        r"3\.2\.1\s*项目经理：.*?身份证号：.*?建造师执业资格等级：.*?[；;]",
+        source_text,
+    )
+    if project_manager_match:
+        source_quote = _clean_requirement_text(project_manager_match.group(0))
+        guarded_items.append(
+            (
+                "qualification",
+                "项目经理信息：须填写姓名、身份证号、建造师执业资格等级。",
+                source_quote,
+            )
+        )
+
+    return guarded_items
+
+
+def _response_form_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
+    source_text = _clean_requirement_text(chunk.content_text or "")
+    if "响应函" not in source_text:
+        return []
+
+    guarded_items: list[tuple[str, str, str]] = []
+    project_manager_match = re.search(
+        r"本项目拟派项目负责人姓名：\s*，身份证\s*号：\s*。",
+        source_text,
+    )
+    if project_manager_match:
+        source_quote = _clean_requirement_text(project_manager_match.group(0))
+        guarded_items.append(
+            (
+                "qualification",
+                "响应函：须填写本项目拟派项目负责人姓名、身份证号。",
+                source_quote,
+            )
+        )
+    duration_match = re.search(r"工期\s*[(（]服务期[)）]\s*个日历天[。；;]?", source_text)
+    if duration_match:
+        source_quote = _clean_requirement_text(duration_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "响应函：须填写工期(服务期)日历天。",
+                source_quote,
+            )
+        )
+    return guarded_items
+
+
+def _augment_section_candidates_from_text_guards(
+    chunks: list[DocumentChunk],
+    candidates: list[ComplianceCandidate],
+    *,
+    extraction_provider: str,
+) -> list[ComplianceCandidate]:
+    existing_text = "\n".join(_compact_for_match(candidate.requirement_text) for candidate in candidates)
+    seen = {candidate.normalized_requirement for candidate in candidates}
+    augmented = list(candidates)
+    for chunk in chunks:
+        text_guard_items = [
+            *_commitment_text_guard_items(chunk),
+            *_contract_text_guard_items(chunk),
+            *_response_form_text_guard_items(chunk),
+        ]
+        for item_type, requirement, source_quote in text_guard_items:
+            guarded_phrase = _compact_for_match(requirement.replace("诚信承诺书：", ""))
+            if guarded_phrase and guarded_phrase in existing_text:
+                continue
+            normalized = _semantic_key(requirement, item_type)
             if normalized in seen:
                 continue
             seen.add(normalized)
-            risk_level = _risk_level(item_type, text)
-            is_mandatory = risk_level == "high" or item_type in {"qualification", "deadline"}
-            candidates.append(
+            risk_level = _risk_level(item_type, requirement)
+            augmented.append(
                 ComplianceCandidate(
                     source_chunk_index=chunk.chunk_index,
                     item_type=item_type,
-                    requirement_text=text,
+                    requirement_text=requirement,
                     normalized_requirement=normalized,
-                    response_suggestion=_response_suggestion(item_type, text),
+                    response_suggestion=_response_suggestion(item_type, requirement),
                     risk_level=risk_level,
-                    is_mandatory=is_mandatory,
-                    confidence_score=Decimal("0.6500"),
-                    explanation_json=_candidate_explanation(
-                        item_type=item_type,
-                        text=text,
-                        heading_path=chunk.heading_path,
-                        risk_level=risk_level,
-                        is_mandatory=is_mandatory,
-                        extraction_provider="rules",
-                    ),
+                    is_mandatory=True,
+                    confidence_score=Decimal("0.7200"),
+                    explanation_json={
+                        **_candidate_explanation(
+                            item_type=item_type,
+                            text=requirement,
+                            heading_path=chunk.heading_path,
+                            risk_level=risk_level,
+                            is_mandatory=True,
+                            extraction_provider=extraction_provider,
+                        ),
+                        "source_quote": source_quote[:300],
+                        "needs_human_review": True,
+                        "review_hint": "模型未覆盖该诚信承诺关键资格条款，由文本守卫补齐，请人工核对。",
+                        "classification_reason": "诚信承诺书基本能力承诺属于资格响应要求。",
+                        "split_reason": "诚信承诺书基本能力条款逐条形成可审核要求。",
+                        "text_guard": True,
+                    },
                 )
             )
-            candidates.extend(_extra_candidates_for_chunk(chunk, text, seen))
-    return candidates
+    return augmented
+
+
+def extract_sectioned_compliance_candidates(
+    db: Session,
+    task: AsyncTask,
+    document: Document,
+    version: DocumentVersion,
+    chunks: list[DocumentChunk],
+    *,
+    force_sections: bool = False,
+) -> tuple[str, list[ComplianceCandidate], list[dict[str, Any]], dict[str, Any]]:
+    sections = ensure_document_section_plan(
+        db,
+        task,
+        document,
+        version,
+        chunks,
+        force=force_sections,
+    )
+    providers: list[str] = []
+    all_candidates: list[ComplianceCandidate] = []
+    issues: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    section_summaries: list[dict[str, Any]] = []
+
+    for semantic_section in sections:
+        if _is_boilerplate_semantic_section(semantic_section):
+            semantic_section.status = "verified"
+            section_summaries.append(
+                {
+                    "semantic_section_id": str(semantic_section.id),
+                    "section_index": semantic_section.section_index,
+                    "title": semantic_section.title,
+                    "page_range": [semantic_section.start_page, semantic_section.end_page],
+                    "candidate_count": 0,
+                    "accepted_count": 0,
+                    "coverage_issue_count": 0,
+                    "skipped_reason": "boilerplate_section",
+                }
+            )
+            continue
+        current_chunks = _section_chunks(semantic_section, chunks)
+        if not current_chunks:
+            issues.append(
+                _quality_issue(
+                    code="SECTION_HAS_NO_CHUNKS",
+                    message=f"章节“{semantic_section.title}”页码范围内没有解析分块。",
+                    severity="high",
+                    semantic_section=semantic_section,
+                )
+            )
+            continue
+        provider, candidates = _call_section_llm(db, task, semantic_section, current_chunks)
+        candidates = _augment_section_candidates_from_table_guards(
+            current_chunks,
+            candidates,
+            extraction_provider=f"{provider}:table_guard",
+        )
+        candidates = _augment_section_candidates_from_text_guards(
+            current_chunks,
+            candidates,
+            extraction_provider=f"{provider}:text_guard",
+        )
+        providers.append(provider)
+        coverage_issues = _review_section_coverage(
+            db,
+            task,
+            semantic_section,
+            current_chunks,
+            candidates,
+        )
+        issues.extend(coverage_issues)
+        accepted_count = 0
+        for candidate in candidates:
+            if candidate.normalized_requirement in seen:
+                continue
+            seen.add(candidate.normalized_requirement)
+            all_candidates.append(candidate)
+            accepted_count += 1
+        section_summaries.append(
+            {
+                "semantic_section_id": str(semantic_section.id),
+                "section_index": semantic_section.section_index,
+                "title": semantic_section.title,
+                "page_range": [semantic_section.start_page, semantic_section.end_page],
+                "candidate_count": len(candidates),
+                "accepted_count": accepted_count,
+                "coverage_issue_count": len(coverage_issues),
+            }
+        )
+
+    high_issues = [issue for issue in issues if issue.get("severity") == "high"]
+    summary = {
+        "document_id": str(document.id),
+        "document_version_id": str(version.id),
+        "section_count": len(sections),
+        "candidate_count": len(all_candidates),
+        "issue_count": len(issues),
+        "high_issue_count": len(high_issues),
+        "sections": section_summaries,
+    }
+    if high_issues:
+        raise ComplianceQualityGateError(
+            "覆盖性复核发现严重漏抽或来源质量问题",
+            code="QUALITY_GATE_BLOCKED",
+            issues=issues,
+            summary=summary,
+        )
+    if not all_candidates:
+        raise ComplianceQualityGateError(
+            "章节抽取未生成合规矩阵候选项",
+            code="NO_COMPLIANCE_CANDIDATES",
+            issues=[
+                _quality_issue(
+                    code="NO_COMPLIANCE_CANDIDATES",
+                    message="章节规划和模型抽取均完成，但没有生成任何可入库候选项。",
+                    severity="high",
+                )
+            ],
+            summary=summary,
+        )
+    return ",".join(sorted(set(providers))) or "ai_sectioned", all_candidates, issues, summary
 
 
 def extract_compliance_candidates(
@@ -902,14 +2986,10 @@ def extract_compliance_candidates(
     task: AsyncTask,
     chunks: list[DocumentChunk],
 ) -> tuple[str, list[ComplianceCandidate]]:
-    relevant = _relevant_chunks(chunks)
-    try:
-        provider, candidates = _call_llm(db, task, relevant)
-        if candidates:
-            return provider, candidates
-    except (LLMGatewayError, KeyError, TypeError, ValidationError, json.JSONDecodeError):
-        pass
-    return "rules", _rule_extract(relevant)
+    provider, candidates = _call_llm(db, task, chunks)
+    if not candidates:
+        raise ComplianceGenerationError("模型未返回合规矩阵候选项", code="NO_COMPLIANCE_CANDIDATES")
+    return provider, candidates
 
 
 def _select_document_version(
@@ -975,6 +3055,39 @@ def _add_generation_audit(
     )
 
 
+SYSTEM_MATRIX_MODIFY_REASONS = {
+    "重新生成合规矩阵候选项",
+    "强制重新生成合规矩阵，旧候选项自动淘汰",
+}
+
+
+def _is_human_touched_compliance_item(item: ComplianceItem) -> bool:
+    if item.status == "confirmed":
+        return True
+    if item.source_create_method in {"manual_selection", "similar_candidate"}:
+        return True
+    if item.selected_text:
+        return True
+    if item.modified_by is not None and (item.modify_reason or "") not in SYSTEM_MATRIX_MODIFY_REASONS:
+        return True
+    return False
+
+
+def _source_create_method(explanation_json: dict[str, Any], default: str) -> str:
+    provider = str(explanation_json.get("extraction_provider") or "").strip()
+    if not provider:
+        return default
+    if "table_guard" in provider:
+        return "table_guard"
+    if "text_guard" in provider:
+        return "text_guard"
+    if provider == "rules":
+        return "rule"
+    if ":" in provider:
+        return "ai_sectioned"
+    return provider[:32]
+
+
 def execute_compliance_matrix_generation_task(
     db: Session,
     task_id: uuid.UUID | str,
@@ -990,8 +3103,15 @@ def execute_compliance_matrix_generation_task(
     task.progress = 20
     db.commit()
 
+    document: Document | None = None
+    version: DocumentVersion | None = None
+    document_id_for_report: uuid.UUID | None = None
+    version_id_for_report: uuid.UUID | None = None
+    write_started = False
     try:
         document, version = _select_document_version(db, task)
+        document_id_for_report = document.id
+        version_id_for_report = version.id
         chunks = db.scalars(
             select(DocumentChunk)
             .where(
@@ -1003,13 +3123,21 @@ def execute_compliance_matrix_generation_task(
         if not chunks:
             raise ComplianceGenerationError("文档版本没有解析分块", code="NO_DOCUMENT_CHUNKS")
 
-        provider, candidates = extract_compliance_candidates(db, task, list(chunks))
+        provider, candidates, quality_issues, quality_summary = extract_sectioned_compliance_candidates(
+            db,
+            task,
+            document,
+            version,
+            list(chunks),
+            force_sections=bool((task.input_json or {}).get("force")),
+        )
         chunk_by_index = {chunk.chunk_index: chunk for chunk in chunks}
         created_count = 0
         updated_count = 0
         skipped_count = 0
         superseded_count = 0
 
+        write_started = True
         if (task.input_json or {}).get("force"):
             stale_items = db.scalars(
                 select(ComplianceItem).where(
@@ -1020,12 +3148,17 @@ def execute_compliance_matrix_generation_task(
                 )
             ).all()
             for item in stale_items:
+                if _is_human_touched_compliance_item(item):
+                    skipped_count += 1
+                    continue
                 item.status = "superseded"
                 item.deleted_at = now
                 item.modified_by = task.created_by
                 item.modified_at = now
                 item.modify_reason = "强制重新生成合规矩阵，旧候选项自动淘汰"
                 superseded_count += 1
+
+        current_candidate_keys = {candidate.normalized_requirement for candidate in candidates}
 
         for candidate in candidates:
             chunk = chunk_by_index.get(candidate.source_chunk_index)
@@ -1046,6 +3179,8 @@ def execute_compliance_matrix_generation_task(
             is_batch_confirm_allowed = (
                 candidate.risk_level != "high" and not candidate.is_mandatory
             )
+            source_quote = str(candidate.explanation_json.get("source_quote") or "").strip()
+            evidence_text = source_quote or chunk.content_text
             if existing is None:
                 db.add(
                     ComplianceItem(
@@ -1061,9 +3196,9 @@ def execute_compliance_matrix_generation_task(
                         normalized_requirement=candidate.normalized_requirement,
                         dedup_key=candidate.normalized_requirement[:160],
                         response_suggestion=candidate.response_suggestion,
-                        evidence_text=chunk.content_text,
+                        evidence_text=evidence_text,
                         explanation_json=candidate.explanation_json,
-                        source_create_method=candidate.explanation_json.get("extraction_provider") or "rule",
+                        source_create_method=_source_create_method(candidate.explanation_json, "rule"),
                         status="pending_confirm",
                         risk_level=candidate.risk_level,
                         is_mandatory=candidate.is_mandatory,
@@ -1074,15 +3209,20 @@ def execute_compliance_matrix_generation_task(
                 )
                 created_count += 1
             else:
+                if _is_human_touched_compliance_item(existing):
+                    skipped_count += 1
+                    continue
                 existing.source_chunk_id = chunk.id
                 existing.source_page_no = chunk.page_no
                 existing.item_type = candidate.item_type
                 existing.requirement_text = candidate.requirement_text
                 existing.dedup_key = candidate.normalized_requirement[:160]
                 existing.response_suggestion = candidate.response_suggestion
-                existing.evidence_text = chunk.content_text
+                existing.evidence_text = evidence_text
                 existing.explanation_json = candidate.explanation_json
-                existing.source_create_method = candidate.explanation_json.get("extraction_provider") or "rule"
+                existing.source_create_method = _source_create_method(candidate.explanation_json, "rule")
+                existing.status = "pending_confirm"
+                existing.deleted_at = None
                 existing.risk_level = candidate.risk_level
                 existing.is_mandatory = candidate.is_mandatory
                 existing.is_batch_confirm_allowed = is_batch_confirm_allowed
@@ -1092,6 +3232,45 @@ def execute_compliance_matrix_generation_task(
                 existing.modify_reason = "重新生成合规矩阵候选项"
                 updated_count += 1
 
+        stale_items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == task.tenant_id,
+                ComplianceItem.project_id == task.project_id,
+                ComplianceItem.section_id == task.section_id,
+                ComplianceItem.source_version_id == version.id,
+                ComplianceItem.deleted_at.is_(None),
+                ComplianceItem.normalized_requirement.not_in(current_candidate_keys),
+            )
+        ).all()
+        for item in stale_items:
+            if _is_human_touched_compliance_item(item):
+                skipped_count += 1
+                continue
+            item.status = "superseded"
+            item.deleted_at = now
+            item.modified_by = task.created_by
+            item.modified_at = now
+            item.modify_reason = "强制重新生成合规矩阵，旧候选项自动淘汰"
+            superseded_count += 1
+
+        quality_summary.update(
+            {
+                "created_count": created_count,
+                "updated_count": updated_count,
+                "skipped_count": skipped_count,
+                "superseded_count": superseded_count,
+                "provider": provider,
+            }
+        )
+        report = _write_quality_report(
+            db,
+            task,
+            document,
+            version,
+            status="passed",
+            issues=quality_issues,
+            summary=quality_summary,
+        )
         task.status = "succeeded"
         task.progress = 100
         task.output_json = {
@@ -1103,6 +3282,8 @@ def execute_compliance_matrix_generation_task(
             "updated_count": updated_count,
             "skipped_count": skipped_count,
             "superseded_count": superseded_count,
+            "quality_report_id": str(report.id),
+            "section_count": quality_summary.get("section_count"),
         }
         task.finished_at = datetime.now(UTC)
         _add_generation_audit(
@@ -1121,7 +3302,43 @@ def execute_compliance_matrix_generation_task(
             "superseded_count": superseded_count,
         }
     except Exception as exc:
-        error_code = exc.code if isinstance(exc, ComplianceGenerationError) else "COMPLIANCE_GENERATION_FAILED"
+        if write_started or not db.is_active:
+            db.rollback()
+        error_code = getattr(exc, "code", "COMPLIANCE_GENERATION_FAILED")
+        if isinstance(exc, ValidationError):
+            error_code = "LLM_SCHEMA_VALIDATION_FAILED"
+        elif isinstance(exc, json.JSONDecodeError):
+            error_code = "LLM_JSON_PARSE_FAILED"
+        issues: list[dict[str, Any]]
+        summary: dict[str, Any]
+        if isinstance(exc, ComplianceQualityGateError):
+            issues = exc.issues
+            summary = exc.summary
+        else:
+            issues = [
+                _quality_issue(
+                    code=error_code,
+                    message=str(exc),
+                    severity="high",
+                )
+            ]
+            summary = {
+                "document_id": str(document_id_for_report) if document_id_for_report else None,
+                "document_version_id": str(version_id_for_report) if version_id_for_report else None,
+            }
+        if document_id_for_report is not None and version_id_for_report is not None:
+            document = db.get(Document, document_id_for_report)
+            version = db.get(DocumentVersion, version_id_for_report)
+        if document is not None and version is not None:
+            _write_quality_report(
+                db,
+                task,
+                document,
+                version,
+                status="blocked",
+                issues=issues,
+                summary=summary,
+            )
         task.status = "failed"
         task.progress = 100
         task.error_code = error_code
@@ -1134,5 +3351,241 @@ def execute_compliance_matrix_generation_task(
             after_json={"error_code": error_code, "error_message": str(exc)},
             severity="warning",
         )
+        db.commit()
+        return {"status": "failed", "error_code": error_code}
+
+
+def execute_section_compliance_extract_task(
+    db: Session,
+    task_id: uuid.UUID | str,
+) -> dict[str, str | int]:
+    task_uuid = _coerce_task_id(task_id)
+    task = db.get(AsyncTask, task_uuid)
+    if task is None or task.task_type != "section_compliance_extract":
+        raise ComplianceGenerationError("章节合规抽取任务不存在", code="TASK_NOT_FOUND")
+
+    now = datetime.now(UTC)
+    task.status = "running"
+    task.started_at = task.started_at or now
+    task.progress = 20
+    db.commit()
+
+    document: Document | None = None
+    version: DocumentVersion | None = None
+    document_id_for_report: uuid.UUID | None = None
+    version_id_for_report: uuid.UUID | None = None
+    write_started = False
+    try:
+        semantic_section_id = (task.input_json or {}).get("semantic_section_id")
+        if not semantic_section_id:
+            raise ComplianceGenerationError("缺少语义段 ID", code="SEMANTIC_SECTION_ID_REQUIRED")
+        semantic_section = db.get(DocumentSemanticSection, uuid.UUID(str(semantic_section_id)))
+        if semantic_section is None or semantic_section.tenant_id != task.tenant_id:
+            raise ComplianceGenerationError("语义段不存在", code="SEMANTIC_SECTION_NOT_FOUND")
+        document = db.get(Document, semantic_section.document_id)
+        version = db.get(DocumentVersion, semantic_section.document_version_id)
+        if document is None or version is None:
+            raise ComplianceGenerationError("语义段关联文档不存在", code="DOCUMENT_NOT_FOUND")
+        document_id_for_report = document.id
+        version_id_for_report = version.id
+
+        chunks = db.scalars(
+            select(DocumentChunk)
+            .where(
+                DocumentChunk.tenant_id == task.tenant_id,
+                DocumentChunk.document_version_id == version.id,
+            )
+            .order_by(DocumentChunk.chunk_index)
+        ).all()
+        current_chunks = _section_chunks(semantic_section, list(chunks))
+        if not current_chunks:
+            raise ComplianceQualityGateError(
+                "语义段页码范围内没有解析分块",
+                code="SECTION_HAS_NO_CHUNKS",
+                issues=[
+                    _quality_issue(
+                        code="SECTION_HAS_NO_CHUNKS",
+                        message=f"章节“{semantic_section.title}”页码范围内没有解析分块。",
+                        severity="high",
+                        semantic_section=semantic_section,
+                    )
+                ],
+                summary={"semantic_section_id": str(semantic_section.id)},
+            )
+
+        provider, candidates = _call_section_llm(db, task, semantic_section, current_chunks)
+        candidates = _augment_section_candidates_from_table_guards(
+            current_chunks,
+            candidates,
+            extraction_provider=f"{provider}:table_guard",
+        )
+        issues = _review_section_coverage(db, task, semantic_section, current_chunks, candidates)
+        high_issues = [issue for issue in issues if issue.get("severity") == "high"]
+        if high_issues:
+            raise ComplianceQualityGateError(
+                "单段覆盖性复核发现严重漏抽",
+                code="QUALITY_GATE_BLOCKED",
+                issues=issues,
+                summary={"semantic_section_id": str(semantic_section.id), "candidate_count": len(candidates)},
+            )
+
+        chunk_by_index = {chunk.chunk_index: chunk for chunk in chunks}
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
+        superseded_count = 0
+        section_marker = str(semantic_section.id)
+        write_started = True
+        stale_items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == task.tenant_id,
+                ComplianceItem.project_id == task.project_id,
+                ComplianceItem.section_id == task.section_id,
+                ComplianceItem.source_version_id == version.id,
+                ComplianceItem.deleted_at.is_(None),
+            )
+        ).all()
+        for item in stale_items:
+            if (item.explanation_json or {}).get("semantic_section_id") != section_marker:
+                continue
+            if _is_human_touched_compliance_item(item):
+                skipped_count += 1
+                continue
+            item.status = "superseded"
+            item.deleted_at = now
+            item.modified_by = task.created_by
+            item.modified_at = now
+            item.modify_reason = "强制重新生成合规矩阵，旧候选项自动淘汰"
+            superseded_count += 1
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate.normalized_requirement in seen:
+                continue
+            seen.add(candidate.normalized_requirement)
+            chunk = chunk_by_index.get(candidate.source_chunk_index)
+            if chunk is None:
+                skipped_count += 1
+                continue
+            existing = db.scalar(
+                select(ComplianceItem).where(
+                    ComplianceItem.tenant_id == task.tenant_id,
+                    ComplianceItem.project_id == task.project_id,
+                    ComplianceItem.section_id == task.section_id,
+                    ComplianceItem.source_version_id == version.id,
+                    ComplianceItem.normalized_requirement == candidate.normalized_requirement,
+                    ComplianceItem.deleted_at.is_(None),
+                )
+            )
+            is_batch_confirm_allowed = candidate.risk_level != "high" and not candidate.is_mandatory
+            source_quote = str(candidate.explanation_json.get("source_quote") or "").strip()
+            evidence_text = source_quote or chunk.content_text
+            if existing is None:
+                db.add(
+                    ComplianceItem(
+                        tenant_id=task.tenant_id,
+                        project_id=task.project_id,
+                        section_id=task.section_id,
+                        source_document_id=document.id,
+                        source_version_id=version.id,
+                        source_chunk_id=chunk.id,
+                        source_page_no=chunk.page_no,
+                        item_type=candidate.item_type,
+                        requirement_text=candidate.requirement_text,
+                        normalized_requirement=candidate.normalized_requirement,
+                        dedup_key=candidate.normalized_requirement[:160],
+                        response_suggestion=candidate.response_suggestion,
+                        evidence_text=evidence_text,
+                        explanation_json=candidate.explanation_json,
+                        source_create_method=_source_create_method(candidate.explanation_json, "ai_sectioned"),
+                        status="pending_confirm",
+                        risk_level=candidate.risk_level,
+                        is_mandatory=candidate.is_mandatory,
+                        is_batch_confirm_allowed=is_batch_confirm_allowed,
+                        confidence_score=candidate.confidence_score,
+                        created_by=task.created_by,
+                    )
+                )
+                created_count += 1
+            else:
+                if _is_human_touched_compliance_item(existing):
+                    skipped_count += 1
+                    continue
+                existing.source_chunk_id = chunk.id
+                existing.source_page_no = chunk.page_no
+                existing.item_type = candidate.item_type
+                existing.requirement_text = candidate.requirement_text
+                existing.dedup_key = candidate.normalized_requirement[:160]
+                existing.response_suggestion = candidate.response_suggestion
+                existing.evidence_text = evidence_text
+                existing.explanation_json = candidate.explanation_json
+                existing.source_create_method = _source_create_method(candidate.explanation_json, "ai_sectioned")
+                existing.status = "pending_confirm"
+                existing.deleted_at = None
+                existing.risk_level = candidate.risk_level
+                existing.is_mandatory = candidate.is_mandatory
+                existing.is_batch_confirm_allowed = is_batch_confirm_allowed
+                existing.confidence_score = candidate.confidence_score
+                existing.modified_by = task.created_by
+                existing.modified_at = datetime.now(UTC)
+                existing.modify_reason = "重新生成合规矩阵候选项"
+                updated_count += 1
+
+        summary = {
+            "provider": provider,
+            "semantic_section_id": str(semantic_section.id),
+            "candidate_count": len(candidates),
+            "created_count": created_count,
+            "updated_count": updated_count,
+            "skipped_count": skipped_count,
+            "superseded_count": superseded_count,
+        }
+        report = _write_quality_report(
+            db,
+            task,
+            document,
+            version,
+            status="passed",
+            issues=issues,
+            summary=summary,
+        )
+        task.status = "succeeded"
+        task.progress = 100
+        task.output_json = {**summary, "quality_report_id": str(report.id)}
+        task.finished_at = datetime.now(UTC)
+        db.commit()
+        return {"status": "succeeded", **summary}
+    except Exception as exc:
+        if write_started or not db.is_active:
+            db.rollback()
+        error_code = getattr(exc, "code", "SECTION_COMPLIANCE_EXTRACT_FAILED")
+        if isinstance(exc, ValidationError):
+            error_code = "LLM_SCHEMA_VALIDATION_FAILED"
+        elif isinstance(exc, json.JSONDecodeError):
+            error_code = "LLM_JSON_PARSE_FAILED"
+        if isinstance(exc, ComplianceQualityGateError):
+            issues = exc.issues
+            summary = exc.summary
+        else:
+            issues = [_quality_issue(code=error_code, message=str(exc), severity="high")]
+            summary = {}
+        if document_id_for_report is not None and version_id_for_report is not None:
+            document = db.get(Document, document_id_for_report)
+            version = db.get(DocumentVersion, version_id_for_report)
+        if document is not None and version is not None:
+            _write_quality_report(
+                db,
+                task,
+                document,
+                version,
+                status="blocked",
+                issues=issues,
+                summary=summary,
+            )
+        task.status = "failed"
+        task.progress = 100
+        task.error_code = error_code
+        task.error_message = str(exc)
+        task.finished_at = datetime.now(UTC)
         db.commit()
         return {"status": "failed", "error_code": error_code}

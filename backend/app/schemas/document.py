@@ -64,6 +64,51 @@ class DocumentChunkRead(BaseModel):
     created_at: datetime
 
 
+class QualityIssueRead(BaseModel):
+    severity: str = "medium"
+    code: str
+    message: str
+    section_id: uuid.UUID | None = None
+    section_index: int | None = None
+    page_no: int | None = None
+    source_chunk_index: int | None = None
+
+
+class DocumentSemanticSectionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    document_id: uuid.UUID
+    document_version_id: uuid.UUID
+    section_id: uuid.UUID | None
+    section_index: int
+    title: str
+    section_type: str
+    start_page: int
+    end_page: int
+    confidence_score: float | None
+    evidence: str | None
+    status: str
+    model_invocation_log_id: uuid.UUID | None
+    raw_json: dict[str, Any] | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DocumentExtractionQualityReportRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    task_id: uuid.UUID | None
+    document_id: uuid.UUID
+    document_version_id: uuid.UUID
+    section_id: uuid.UUID | None
+    status: str
+    issues_json: list[dict[str, Any]]
+    summary_json: dict[str, Any]
+    created_at: datetime
+
+
 class DocumentManualRevisionChunk(BaseModel):
     chunk_index: int = Field(ge=1)
     page_no: int | None = Field(default=None, ge=1)

@@ -77,11 +77,14 @@ import {
   createProject,
   deleteProject,
   decideApprovalTask,
+  extractDocumentSemanticSectionCompliance,
   listDocumentChunks,
+  listDocumentSemanticSections,
   exportBusinessDraftWord,
   exportComplianceMatrixExcel,
   generateBusinessDraftChapters,
   generateComplianceMatrix,
+  getDocumentExtractionQualityReport,
   getPreflightCheck,
   getMatrixReview,
   generateQualificationDecision,
@@ -101,6 +104,7 @@ import {
   listQualificationEvaluations,
   listProjects,
   listSections,
+  replanDocumentSemanticSections,
   requestPublicUrlAcquisition,
   runBusinessDraftFactChecks,
   runQualificationEvaluation,
@@ -132,6 +136,8 @@ import type {
   ComplianceItemFromSourceResult,
   ComplianceItem,
   DocumentChunk,
+  DocumentExtractionQualityReport,
+  DocumentSemanticSection,
   EnterpriseMaterial,
   EnterpriseMaterialSearchResult,
   EnterpriseProfile,
@@ -774,6 +780,10 @@ export function App() {
   const [deletingProjects, setDeletingProjects] = useState(false);
   const [importProcessing, setImportProcessing] = useState<ImportProcessingState | null>(null);
   const [documentBusy, setDocumentBusy] = useState(false);
+  const [semanticSections, setSemanticSections] = useState<DocumentSemanticSection[]>([]);
+  const [extractionQualityReport, setExtractionQualityReport] = useState<DocumentExtractionQualityReport | null>(null);
+  const [sectionPlanLoading, setSectionPlanLoading] = useState(false);
+  const [sectionExtractingId, setSectionExtractingId] = useState("");
   const [revisionDrawerOpen, setRevisionDrawerOpen] = useState(false);
   const [revisionDocument, setRevisionDocument] = useState<ProjectDocument | null>(null);
   const [revisionChunks, setRevisionChunks] = useState<DocumentChunk[]>([]);
@@ -1077,6 +1087,34 @@ export function App() {
       null,
     [documents]
   );
+
+  const reloadExtractionQuality = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId || !reviewDocument?.current_version_id) {
+      setSemanticSections([]);
+      setExtractionQualityReport(null);
+      return;
+    }
+    const [sections, report] = await Promise.all([
+      listDocumentSemanticSections(
+        selectedProjectId,
+        selectedSectionId,
+        reviewDocument.id,
+        reviewDocument.current_version_id
+      ).catch(() => []),
+      getDocumentExtractionQualityReport(
+        selectedProjectId,
+        selectedSectionId,
+        reviewDocument.id,
+        reviewDocument.current_version_id
+      ).catch(() => null)
+    ]);
+    setSemanticSections(sections);
+    setExtractionQualityReport(report);
+  }, [reviewDocument?.current_version_id, reviewDocument?.id, selectedProjectId, selectedSectionId]);
+
+  useEffect(() => {
+    reloadExtractionQuality().catch(() => undefined);
+  }, [reloadExtractionQuality, complianceItems.length]);
 
   useEffect(() => {
     if (!selectedProjectId || !selectedSectionId) return;
@@ -1400,6 +1438,9 @@ export function App() {
     importProcessing &&
       [importProcessing.parseTask, importProcessing.matrixTask].some((task) => task?.status === "failed")
   );
+  const extractionBlocked = extractionQualityReport?.status === "blocked";
+  const extractionBlockReason =
+    extractionQualityReport?.issues_json?.[0]?.message || "章节规划或合规抽取质量门禁未通过。";
 
   const workflowSteps = useMemo<WorkflowStep[]>(() => {
     const parsedDocuments = documents.filter((document) => isUsableParseStatus(document.current_version?.parse_status));
@@ -1413,11 +1454,11 @@ export function App() {
     const hasDraft = businessDraftChapters.length > 0;
     const hasSelectedScope = Boolean(selectedProjectId && selectedSectionId);
     const canOpenDocuments = hasSelectedScope;
-    const canOpenMatrix = parsedDocuments.length > 0;
-    const canOpenMatrixDerived = matrixRows.length > 0;
-    const canOpenReview = matrixRows.length > 0;
-    const canOpenChapter = hasDecision || hasDraft;
-    const canOpenApproval = hasDraft || approvalTasks.length > 0 || exportFiles.length > 0;
+    const canOpenMatrix = parsedDocuments.length > 0 && !extractionBlocked;
+    const canOpenMatrixDerived = matrixRows.length > 0 && !extractionBlocked;
+    const canOpenReview = matrixRows.length > 0 && !extractionBlocked;
+    const canOpenChapter = (hasDecision || hasDraft) && !extractionBlocked;
+    const canOpenApproval = (hasDraft || approvalTasks.length > 0 || exportFiles.length > 0) && !extractionBlocked;
 
     return [
       {
@@ -1470,11 +1511,13 @@ export function App() {
 	          ? unresolvedMatrixCount
 	            ? `当前有 ${matrixRows.length} 条矩阵项，${unresolvedMatrixCount} 条仍需确认或补材料。`
 	            : "合规矩阵已全部人工确认，可以进入证据绑定和资格预评估。"
-	          : parsedDocuments.length
+            : extractionBlocked
+              ? "合规抽取质量门禁已阻断，需要处理章节计划或抽取问题。"
+              : parsedDocuments.length
 	            ? "文件已解析，可以生成合规矩阵。"
 	            : "需要先完成文件解析。",
 	        disabled: !canOpenMatrix,
-	        disabledReason: canOpenMatrix ? null : "请先完成文件解析，形成可用解析版本。"
+	        disabledReason: canOpenMatrix ? null : extractionBlocked ? extractionBlockReason : "请先完成文件解析，形成可用解析版本。"
 	      },
       {
         key: "review",
@@ -1497,7 +1540,7 @@ export function App() {
           ? `已生成 ${matrixRows.length} 条矩阵项，可在原文对照视图中核验来源。`
           : "需要先生成合规矩阵。",
         disabled: !canOpenReview,
-        disabledReason: canOpenReview ? null : "请先生成合规矩阵。"
+        disabledReason: canOpenReview ? null : extractionBlocked ? extractionBlockReason : "请先生成合规矩阵。"
       },
       {
         key: "evidence",
@@ -1516,7 +1559,7 @@ export function App() {
 	            : "矩阵项已绑定企业资料证据。"
 	          : "需要先生成合规矩阵。",
 	        disabled: !canOpenMatrixDerived,
-	        disabledReason: canOpenMatrixDerived ? null : "请先生成合规矩阵。"
+	        disabledReason: canOpenMatrixDerived ? null : extractionBlocked ? extractionBlockReason : "请先生成合规矩阵。"
 	      },
       {
         key: "technical",
@@ -1543,7 +1586,7 @@ export function App() {
 	            ? "当前矩阵暂无明确技术响应项，产品选型和技术标生成将在 1.1 完成。"
 	            : "需要先生成合规矩阵。",
 	        disabled: !canOpenMatrixDerived,
-	        disabledReason: canOpenMatrixDerived ? null : "请先生成合规矩阵。"
+	        disabledReason: canOpenMatrixDerived ? null : extractionBlocked ? extractionBlockReason : "请先生成合规矩阵。"
 	      },
       {
         key: "qualification",
@@ -1566,7 +1609,7 @@ export function App() {
 	            ? "矩阵已有候选项，可以运行资格预评估并生成参标建议。"
 	            : "需要先生成合规矩阵。",
 	        disabled: !canOpenMatrixDerived,
-	        disabledReason: canOpenMatrixDerived ? null : "请先生成合规矩阵。"
+	        disabledReason: canOpenMatrixDerived ? null : extractionBlocked ? extractionBlockReason : "请先生成合规矩阵。"
 	      },
       {
         key: "chapter",
@@ -1581,7 +1624,7 @@ export function App() {
 	            ? "参标建议已有结果，可以生成商务标草稿。"
 	            : "需要先完成资格预评估。",
 	        disabled: !canOpenChapter,
-	        disabledReason: canOpenChapter ? null : "请先完成资格预评估，生成参标建议。"
+	        disabledReason: canOpenChapter ? null : extractionBlocked ? extractionBlockReason : "请先完成资格预评估，生成参标建议。"
 	      },
       {
         key: "approval",
@@ -1596,7 +1639,7 @@ export function App() {
 	            ? "草稿已生成，可以创建提交确认任务。"
 	            : "需要先生成商务标草稿。",
 	        disabled: !canOpenApproval,
-	        disabledReason: canOpenApproval ? null : "请先生成商务标草稿或审批任务。"
+	        disabledReason: canOpenApproval ? null : extractionBlocked ? extractionBlockReason : "请先生成商务标草稿或审批任务。"
 	      }
 	    ];
 	  }, [
@@ -1604,6 +1647,8 @@ export function App() {
 	    businessDraftChapters,
 	    documents,
 	    evidenceRows.length,
+      extractionBlocked,
+      extractionBlockReason,
 	    exportFiles.length,
       matrixTaskActive,
 	    matrixRows,
@@ -2647,6 +2692,7 @@ export function App() {
             const [items] = await Promise.all([
               listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 }),
               reloadDocumentsAndExports(),
+              reloadExtractionQuality(),
               reloadAuditLogs(),
               getPreflightCheck(selectedProjectId, selectedSectionId).then(setPreflightCheck).catch(() => undefined),
               activeTab === "review" ? reloadMatrixReview() : Promise.resolve()
@@ -3562,6 +3608,58 @@ export function App() {
       setApiError(error instanceof Error ? error.message : "重新解析失败");
     } finally {
       setDocumentBusy(false);
+    }
+  };
+
+  const handleReplanSemanticSections = async () => {
+    if (!selectedProjectId || !selectedSectionId || !reviewDocument?.current_version_id) {
+      Modal.warning({ title: "当前没有可重新规划的解析版本" });
+      return;
+    }
+    setSectionPlanLoading(true);
+    try {
+      const sections = await replanDocumentSemanticSections(
+        selectedProjectId,
+        selectedSectionId,
+        reviewDocument.id,
+        reviewDocument.current_version_id
+      );
+      setSemanticSections(sections);
+      await reloadExtractionQuality();
+      appendLog(`重新规划章节：${sections.length} 段`);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "重新规划章节失败");
+      await reloadExtractionQuality();
+    } finally {
+      setSectionPlanLoading(false);
+    }
+  };
+
+  const handleExtractSemanticSection = async (semanticSection: DocumentSemanticSection) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    setSectionExtractingId(semanticSection.id);
+    try {
+      const task = await extractDocumentSemanticSectionCompliance(
+        selectedProjectId,
+        selectedSectionId,
+        semanticSection.id
+      );
+      if (task.status === "failed") {
+        throw new Error(task.error_message || "单段合规抽取失败");
+      }
+      appendLog(`重抽章节：${semanticSection.title}`);
+      const [items] = await Promise.all([
+        listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 }),
+        reloadExtractionQuality(),
+        activeTab === "review" ? reloadMatrixReview() : Promise.resolve(),
+        getPreflightCheck(selectedProjectId, selectedSectionId).then(setPreflightCheck).catch(() => undefined)
+      ]);
+      setComplianceItems(items);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "单段合规抽取失败");
+      await reloadExtractionQuality();
+    } finally {
+      setSectionExtractingId("");
     }
   };
 
@@ -4905,6 +5003,107 @@ export function App() {
                             }
                           ]}
                         />
+                        {reviewDocument?.current_version_id && (
+                          <div className="section-plan-panel">
+                            <div className="section-plan-header">
+                              <div>
+                                <Text strong>AI 章节计划与抽取质量</Text>
+                                <p>
+                                  {semanticSections.length
+                                    ? `当前解析版本已规划 ${semanticSections.length} 个语义段。`
+                                    : "当前解析版本尚未生成章节计划。"}
+                                </p>
+                              </div>
+                              <Space>
+                                {extractionQualityReport && (
+                                  <Tag color={extractionQualityReport.status === "blocked" ? "red" : "green"}>
+                                    {extractionQualityReport.status === "blocked" ? "质量阻断" : "质量通过"}
+                                  </Tag>
+                                )}
+                                <Button loading={sectionPlanLoading} onClick={handleReplanSemanticSections}>
+                                  重新规划章节
+                                </Button>
+                              </Space>
+                            </div>
+                            {extractionQualityReport?.status === "blocked" && (
+                              <Alert
+                                type="error"
+                                showIcon
+                                message="合规抽取质量门禁未通过"
+                                description={
+                                  extractionQualityReport.issues_json?.[0]?.message ||
+                                  "请重新规划章节或重抽对应语义段后再继续。"
+                                }
+                              />
+                            )}
+                            <Table<DocumentSemanticSection>
+                              size="small"
+                              pagination={false}
+                              rowKey="id"
+                              loading={sectionPlanLoading}
+                              dataSource={semanticSections}
+                              locale={{
+                                emptyText: (
+                                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无章节计划" />
+                                )
+                              }}
+                              columns={[
+                                {
+                                  title: "段",
+                                  dataIndex: "section_index",
+                                  width: 64,
+                                  render: (value) => <Tag>{value}</Tag>
+                                },
+                                {
+                                  title: "标题",
+                                  dataIndex: "title",
+                                  render: (value, record) => (
+                                    <div className="document-name-cell">
+                                      <Text strong>{value}</Text>
+                                      <Text type="secondary">{record.evidence || record.section_type}</Text>
+                                    </div>
+                                  )
+                                },
+                                {
+                                  title: "页码",
+                                  width: 110,
+                                  render: (_, record) => `${record.start_page}-${record.end_page}`
+                                },
+                                {
+                                  title: "置信度",
+                                  width: 100,
+                                  render: (_, record) =>
+                                    record.confidence_score == null
+                                      ? "-"
+                                      : `${Math.round(record.confidence_score * 100)}%`
+                                },
+                                {
+                                  title: "状态",
+                                  dataIndex: "status",
+                                  width: 120,
+                                  render: (value) => (
+                                    <Tag color={value === "verified" ? "green" : value === "low_confidence" ? "orange" : "blue"}>
+                                      {value}
+                                    </Tag>
+                                  )
+                                },
+                                {
+                                  title: "操作",
+                                  width: 130,
+                                  render: (_, record) => (
+                                    <Button
+                                      size="small"
+                                      loading={sectionExtractingId === record.id}
+                                      onClick={() => handleExtractSemanticSection(record)}
+                                    >
+                                      重抽当前段
+                                    </Button>
+                                  )
+                                }
+                              ]}
+                            />
+                          </div>
+                        )}
                         {exportFiles.length > 0 && (
                           <div className="export-list">
                             <Text strong>归档快照</Text>

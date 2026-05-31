@@ -8,7 +8,13 @@ from app.models.audit import AuditLog
 from app.models.ai_config import AIModelConfig
 from app.models.compliance import ComplianceEvidenceBinding, ComplianceItem
 from app.models.decision import QualificationDecision
-from app.models.document import Document, DocumentChunk, DocumentVersion
+from app.models.document import (
+    Document,
+    DocumentChunk,
+    DocumentExtractionQualityReport,
+    DocumentSemanticSection,
+    DocumentVersion,
+)
 from app.models.draft import BusinessDraftChapter, BusinessDraftEvidenceRef, DraftFactCheck
 from app.models.enterprise import EnterpriseMaterial, EnterpriseProfile
 from app.models.export import ExportFile
@@ -32,6 +38,8 @@ __all__ = [
     "DraftFactCheck",
     "Document",
     "DocumentChunk",
+    "DocumentExtractionQualityReport",
+    "DocumentSemanticSection",
     "DocumentVersion",
     "EnterpriseMaterial",
     "EnterpriseMaterialChunk",

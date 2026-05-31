@@ -20,14 +20,18 @@ from app.models import (
     AuditLog,
     Document,
     DocumentChunk,
+    DocumentExtractionQualityReport,
+    DocumentSemanticSection,
     DocumentVersion,
     FileAcquisitionTask,
     ParseTask,
 )
 from app.schemas.document import (
     DocumentChunkRead,
+    DocumentExtractionQualityReportRead,
     DocumentManualRevisionRequest,
     DocumentManualRevisionResult,
+    DocumentSemanticSectionRead,
     AsyncTaskRead,
     DocumentRead,
     DocumentVersionRead,
@@ -46,6 +50,12 @@ from app.services.storage import put_object_bytes
 from app.services.url_safety import validate_public_file_url
 from app.services.document_parse import execute_document_parse_task
 from app.services.file_acquisition import execute_file_acquisition_task
+from app.services.compliance_generation import (
+    ComplianceGenerationError,
+    ensure_document_section_plan,
+    execute_section_compliance_extract_task,
+    latest_extraction_quality_report,
+)
 
 router = APIRouter()
 
@@ -600,6 +610,228 @@ def list_document_version_chunks(
         .order_by(DocumentChunk.chunk_index.asc())
     ).all()
     return [DocumentChunkRead.model_validate(chunk) for chunk in chunks]
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/documents/{document_id}/versions/{version_id}/semantic-sections",
+    response_model=list[DocumentSemanticSectionRead],
+)
+def list_document_semantic_sections(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    document_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> list[DocumentSemanticSectionRead]:
+    get_section_or_404(db, ctx, project_id, section_id)
+    document = get_document_or_404(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        document_id=document_id,
+    )
+    get_document_version_or_404(db, ctx, document=document, version_id=version_id)
+    sections = db.scalars(
+        select(DocumentSemanticSection)
+        .where(
+            DocumentSemanticSection.tenant_id == ctx.tenant_id,
+            DocumentSemanticSection.document_id == document.id,
+            DocumentSemanticSection.document_version_id == version_id,
+        )
+        .order_by(DocumentSemanticSection.section_index)
+    ).all()
+    return [DocumentSemanticSectionRead.model_validate(section) for section in sections]
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/documents/{document_id}/versions/{version_id}/semantic-sections/replan",
+    response_model=list[DocumentSemanticSectionRead],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def replan_document_semantic_sections(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    document_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> list[DocumentSemanticSectionRead]:
+    get_section_or_404(db, ctx, project_id, section_id)
+    document = get_document_or_404(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        document_id=document_id,
+    )
+    version = get_document_version_or_404(db, ctx, document=document, version_id=version_id)
+    chunks = db.scalars(
+        select(DocumentChunk)
+        .where(
+            DocumentChunk.tenant_id == ctx.tenant_id,
+            DocumentChunk.document_id == document.id,
+            DocumentChunk.document_version_id == version.id,
+        )
+        .order_by(DocumentChunk.chunk_index)
+    ).all()
+    if not chunks:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Document version has no chunks")
+
+    task = AsyncTask(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        task_type="document_section_plan",
+        status="running",
+        idempotency_key=f"document-section-plan:{version.id}:{uuid.uuid4().hex}",
+        progress=20,
+        input_json={"document_id": str(document.id), "document_version_id": str(version.id), "force": True},
+        retry_count=0,
+        max_retries=0,
+        created_by=ctx.user_id,
+        started_at=datetime.now(UTC),
+    )
+    db.add(task)
+    db.flush()
+    try:
+        sections = ensure_document_section_plan(db, task, document, version, list(chunks), force=True)
+        task.status = "succeeded"
+        task.progress = 100
+        task.output_json = {
+            "document_id": str(document.id),
+            "document_version_id": str(version.id),
+            "section_count": len(sections),
+        }
+        task.finished_at = datetime.now(UTC)
+        add_audit_log(
+            db,
+            ctx,
+            project_id=project_id,
+            section_id=section_id,
+            action="document.semantic_sections_replanned",
+            object_type="document_version",
+            object_id=version.id,
+            after_json=task.output_json,
+            reason="用户重新规划招标文件章节",
+        )
+        db.commit()
+        return [DocumentSemanticSectionRead.model_validate(section) for section in sections]
+    except Exception as exc:
+        error_code = getattr(exc, "code", "DOCUMENT_SECTION_PLAN_FAILED")
+        task.status = "failed"
+        task.progress = 100
+        task.error_code = error_code
+        task.error_message = str(exc)
+        task.finished_at = datetime.now(UTC)
+        db.add(
+            DocumentExtractionQualityReport(
+                tenant_id=ctx.tenant_id,
+                task_id=task.id,
+                document_id=document.id,
+                document_version_id=version.id,
+                section_id=section_id,
+                status="blocked",
+                issues_json=[
+                    {
+                        "severity": "high",
+                        "code": error_code,
+                        "message": str(exc),
+                    }
+                ],
+                summary_json={
+                    "document_id": str(document.id),
+                    "document_version_id": str(version.id),
+                },
+            )
+        )
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/document-semantic-sections/{semantic_section_id}/extract-compliance",
+    response_model=AsyncTaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def extract_document_semantic_section_compliance(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    semantic_section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> AsyncTaskRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    semantic_section = db.scalar(
+        select(DocumentSemanticSection).where(
+            DocumentSemanticSection.tenant_id == ctx.tenant_id,
+            DocumentSemanticSection.section_id == section_id,
+            DocumentSemanticSection.id == semantic_section_id,
+        )
+    )
+    if semantic_section is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Semantic section not found")
+
+    task = AsyncTask(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        task_type="section_compliance_extract",
+        status="pending",
+        idempotency_key=f"section-compliance-extract:{semantic_section_id}:{uuid.uuid4().hex}",
+        progress=0,
+        input_json={"semantic_section_id": str(semantic_section_id), "force": True},
+        retry_count=0,
+        max_retries=0,
+        created_by=ctx.user_id,
+    )
+    db.add(task)
+    db.flush()
+    add_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="document.semantic_section_extract_requested",
+        object_type="document_semantic_section",
+        object_id=semantic_section_id,
+        after_json=task.input_json,
+        reason="用户请求重抽当前语义段",
+    )
+    db.commit()
+    execute_section_compliance_extract_task(db, task.id)
+    db.refresh(task)
+    return async_task_read(task)
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/documents/{document_id}/versions/{version_id}/extraction-quality-report",
+    response_model=DocumentExtractionQualityReportRead | None,
+)
+def get_document_extraction_quality_report(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    document_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> DocumentExtractionQualityReportRead | None:
+    get_section_or_404(db, ctx, project_id, section_id)
+    document = get_document_or_404(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        document_id=document_id,
+    )
+    get_document_version_or_404(db, ctx, document=document, version_id=version_id)
+    report = latest_extraction_quality_report(
+        db,
+        tenant_id=ctx.tenant_id,
+        document_version_id=version_id,
+    )
+    return DocumentExtractionQualityReportRead.model_validate(report) if report else None
 
 
 @router.post(
