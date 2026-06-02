@@ -47,6 +47,7 @@ from app.services.document_utils import (
     safe_filename,
 )
 from app.services.storage import put_object_bytes
+from app.services.task_dispatch import TaskDispatchError, enqueue_celery_task
 from app.services.url_safety import validate_public_file_url
 from app.services.document_parse import execute_document_parse_task
 from app.services.file_acquisition import execute_file_acquisition_task
@@ -432,12 +433,21 @@ def request_public_url_acquisition(
             db.refresh(task)
             db.refresh(acquisition)
         else:
-            try:
-                from app.worker import run_file_acquisition_task
+            from app.worker import run_file_acquisition_task
 
-                run_file_acquisition_task.delay(str(task.id))
-            except Exception:
-                pass
+            try:
+                enqueue_celery_task(
+                    db,
+                    task,
+                    lambda: run_file_acquisition_task.delay(str(task.id)),
+                )
+            except TaskDispatchError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"文件获取任务派发失败：{exc}",
+                ) from exc
+            db.refresh(task)
+            db.refresh(acquisition)
     return acquisition_read(task, acquisition)
 
 
@@ -570,12 +580,21 @@ def create_parse_task(
         db.refresh(task)
         db.refresh(parse_task)
     else:
-        try:
-            from app.worker import run_document_parse_task
+        from app.worker import run_document_parse_task
 
-            run_document_parse_task.delay(str(task.id))
-        except Exception:
-            pass
+        try:
+            enqueue_celery_task(
+                db,
+                task,
+                lambda: run_document_parse_task.delay(str(task.id)),
+            )
+        except TaskDispatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"文档解析任务派发失败：{exc}",
+            ) from exc
+        db.refresh(task)
+        db.refresh(parse_task)
     return parse_task_read(task, parse_task)
 
 

@@ -117,6 +117,7 @@ from app.services.project_import import (
 )
 from app.services.qualification_evaluation import evaluation_snapshot, run_qualification_evaluation
 from app.services.storage import get_object_bytes
+from app.services.task_dispatch import TaskDispatchError, enqueue_celery_task
 from app.services.word_review import (
     WordReviewError,
     build_chunk_fallback_review_document,
@@ -1562,11 +1563,32 @@ def confirm_project_import(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if payload.async_processing and payload.auto_parse and result.parse_task_id is not None:
-        background_tasks.add_task(
-            execute_import_processing_background,
-            parse_task_id=result.parse_task_id,
-            matrix_task_id=result.matrix_task_id if payload.auto_generate_matrix else None,
-        )
+        matrix_task_id = result.matrix_task_id if payload.auto_generate_matrix else None
+        if settings.run_tasks_inline:
+            background_tasks.add_task(
+                execute_import_processing_background,
+                parse_task_id=result.parse_task_id,
+                matrix_task_id=matrix_task_id,
+            )
+        else:
+            parse_task = db.get(AsyncTask, result.parse_task_id)
+            if parse_task is not None:
+                from app.worker import run_import_processing_task
+
+                try:
+                    enqueue_celery_task(
+                        db,
+                        parse_task,
+                        lambda: run_import_processing_task.delay(
+                            str(result.parse_task_id),
+                            str(matrix_task_id) if matrix_task_id is not None else None,
+                        ),
+                    )
+                except TaskDispatchError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=f"导入处理任务派发失败：{exc}",
+                    ) from exc
     return ProjectImportConfirmRead(
         project=get_project(result.project_id, db, ctx),
         section_id=result.section_id,
@@ -1873,12 +1895,20 @@ def create_compliance_matrix_generation_task(
         execute_compliance_matrix_generation_task(db, task.id)
         db.refresh(task)
     else:
-        try:
-            from app.worker import run_compliance_matrix_generation_task
+        from app.worker import run_compliance_matrix_generation_task
 
-            run_compliance_matrix_generation_task.delay(str(task.id))
-        except Exception:
-            pass
+        try:
+            enqueue_celery_task(
+                db,
+                task,
+                lambda: run_compliance_matrix_generation_task.delay(str(task.id)),
+            )
+        except TaskDispatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"合规矩阵生成任务派发失败：{exc}",
+            ) from exc
+        db.refresh(task)
     return AsyncTaskRead.model_validate(task)
 
 
@@ -1938,12 +1968,20 @@ def create_compliance_matrix_excel_export_task(
         execute_compliance_matrix_excel_export_task(db, task.id)
         db.refresh(task)
     else:
-        try:
-            from app.worker import run_compliance_matrix_excel_export_task
+        from app.worker import run_compliance_matrix_excel_export_task
 
-            run_compliance_matrix_excel_export_task.delay(str(task.id))
-        except Exception:
-            pass
+        try:
+            enqueue_celery_task(
+                db,
+                task,
+                lambda: run_compliance_matrix_excel_export_task.delay(str(task.id)),
+            )
+        except TaskDispatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Excel 导出任务派发失败：{exc}",
+            ) from exc
+        db.refresh(task)
     return AsyncTaskRead.model_validate(task)
 
 

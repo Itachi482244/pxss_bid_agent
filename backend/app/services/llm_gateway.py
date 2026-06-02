@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import queue
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -137,40 +135,32 @@ def _usage_value(usage: dict[str, Any], *keys: str) -> int | None:
     return None
 
 
-def _post_chat_completion_with_wall_timeout(
+def _post_chat_completion(
     *,
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    result_queue: queue.Queue[tuple[str, dict[str, Any] | Exception]] = queue.Queue(maxsize=1)
+    """Call the chat completion endpoint with httpx's native timeouts.
 
-    def run_request() -> None:
-        try:
-            timeout = httpx.Timeout(
-                timeout_seconds,
-                connect=min(20.0, timeout_seconds),
-                write=min(30.0, timeout_seconds),
-                pool=min(10.0, timeout_seconds),
-            )
-            with httpx.Client(timeout=timeout) as client:
-                response = client.post(url, headers=headers, json=payload)
-                response.raise_for_status()
-            result_queue.put(("ok", response.json()))
-        except Exception as exc:  # pragma: no cover - provider/proxy specific error types.
-            result_queue.put(("error", exc))
-
-    thread = threading.Thread(target=run_request, name="llm-chat-completion", daemon=True)
-    thread.start()
-    thread.join(timeout_seconds)
-    if thread.is_alive():
-        raise TimeoutError(f"LLM request exceeded wall timeout of {timeout_seconds:.0f}s")
-
-    status, value = result_queue.get_nowait()
-    if status == "error":
-        raise value
-    return value  # type: ignore[return-value]
+    Relying on httpx's per-operation timeouts (connect/read/write/pool) lets the
+    transport cancel the request and close the socket when a stage exceeds its
+    budget. The previous thread+join "wall timeout" implementation could leave
+    an orphaned daemon thread (and its open HTTP connection) running after the
+    join expired, leaking resources under load.
+    """
+    timeout = httpx.Timeout(
+        timeout_seconds,
+        connect=min(20.0, timeout_seconds),
+        read=timeout_seconds,
+        write=min(30.0, timeout_seconds),
+        pool=min(10.0, timeout_seconds),
+    )
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+    return response.json()
 
 
 def chat_completion(
@@ -264,7 +254,7 @@ def chat_completion(
 
     started_at = time.perf_counter()
     try:
-        response_data = _post_chat_completion_with_wall_timeout(
+        response_data = _post_chat_completion(
             url=f"{runtime_config.base_url.rstrip('/')}/chat/completions",
             headers={
                 "Authorization": f"Bearer {runtime_config.api_key}",

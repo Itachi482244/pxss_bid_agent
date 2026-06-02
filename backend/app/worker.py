@@ -1,3 +1,5 @@
+import uuid
+
 from celery import Celery
 
 from app.core.config import settings
@@ -6,6 +8,7 @@ from app.services.compliance_generation import execute_compliance_matrix_generat
 from app.services.document_parse import execute_document_parse_task
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import execute_file_acquisition_task
+from app.services.project_import import execute_import_processing_background
 
 celery_app = Celery(
     "pxss_bid_agent",
@@ -47,3 +50,11 @@ def run_compliance_matrix_generation_task(task_id: str) -> dict[str, str | int]:
 def run_compliance_matrix_excel_export_task(task_id: str) -> dict[str, str | int]:
     with SessionLocal() as db:
         return execute_compliance_matrix_excel_export_task(db, task_id)
+
+
+@celery_app.task(name="tasks.import_processing")
+def run_import_processing_task(parse_task_id: str, matrix_task_id: str | None = None) -> None:
+    execute_import_processing_background(
+        parse_task_id=uuid.UUID(parse_task_id),
+        matrix_task_id=uuid.UUID(matrix_task_id) if matrix_task_id else None,
+    )
