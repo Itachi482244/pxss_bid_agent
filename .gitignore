@@ -22,6 +22,8 @@ frontend/vite.config.d.ts
 
 # Local data
 data/storage/
+明珠公寓老旧小区综合改造项目建安工程招标文件（模板）.pdf
+招标文件修订版.pdf
 *.log
 
 # OS / IDE

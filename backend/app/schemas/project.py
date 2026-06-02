@@ -226,6 +226,7 @@ class ComplianceMatrixGenerateRequest(BaseModel):
     document_id: uuid.UUID | None = None
     document_version_id: uuid.UUID | None = None
     force: bool = False
+    async_processing: bool = False
 
 
 class PreflightCheckItem(BaseModel):

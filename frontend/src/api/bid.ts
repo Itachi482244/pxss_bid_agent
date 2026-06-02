@@ -1093,7 +1093,9 @@ export async function replanDocumentSemanticSections(
   versionId: string
 ) {
   const response = await apiClient.post<DocumentSemanticSection[]>(
-    `/projects/${projectId}/sections/${sectionId}/documents/${documentId}/versions/${versionId}/semantic-sections/replan`
+    `/projects/${projectId}/sections/${sectionId}/documents/${documentId}/versions/${versionId}/semantic-sections/replan`,
+    undefined,
+    { timeout: 600000 }
   );
   return response.data;
 }
@@ -1104,7 +1106,9 @@ export async function extractDocumentSemanticSectionCompliance(
   semanticSectionId: string
 ) {
   const response = await apiClient.post<AsyncTask>(
-    `/projects/${projectId}/sections/${sectionId}/document-semantic-sections/${semanticSectionId}/extract-compliance`
+    `/projects/${projectId}/sections/${sectionId}/document-semantic-sections/${semanticSectionId}/extract-compliance`,
+    undefined,
+    { timeout: 600000 }
   );
   return response.data;
 }
@@ -1137,6 +1141,17 @@ export async function publishDocumentManualRevision(
 
 export async function getTask(taskId: string) {
   const response = await apiClient.get<AsyncTask>(`/tasks/${taskId}`);
+  return response.data;
+}
+
+export async function listTasks(params?: {
+  project_id?: string;
+  section_id?: string;
+  task_type?: string;
+  active?: boolean;
+  limit?: number;
+}) {
+  const response = await apiClient.get<AsyncTask[]>("/tasks", { params });
   return response.data;
 }
 
@@ -1401,11 +1416,13 @@ export async function generateComplianceMatrix(
     document_id?: string;
     document_version_id?: string;
     force?: boolean;
+    async_processing?: boolean;
   }
 ) {
   const response = await apiClient.post<AsyncTask>(
     `/projects/${projectId}/sections/${sectionId}/compliance-items/generate`,
-    payload ?? {}
+    payload ?? {},
+    { timeout: 1500000 }
   );
   return response.data;
 }

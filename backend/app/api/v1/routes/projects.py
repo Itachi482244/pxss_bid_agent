@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, aliased
 
 from app.api.deps import RequestContext, get_request_context
 from app.core.config import settings
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models import (
     AsyncTask,
     AuditLog,
@@ -1806,6 +1806,7 @@ def create_compliance_matrix_generation_task(
     project_id: uuid.UUID,
     section_id: uuid.UUID,
     payload: ComplianceMatrixGenerateRequest,
+    background_tasks: BackgroundTasks,
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> AsyncTaskRead:
@@ -1866,7 +1867,9 @@ def create_compliance_matrix_generation_task(
     db.commit()
     db.refresh(task)
 
-    if settings.run_tasks_inline:
+    if payload.async_processing and settings.run_tasks_inline:
+        background_tasks.add_task(_execute_matrix_generation_background, task.id)
+    elif settings.run_tasks_inline:
         execute_compliance_matrix_generation_task(db, task.id)
         db.refresh(task)
     else:
@@ -1877,6 +1880,11 @@ def create_compliance_matrix_generation_task(
         except Exception:
             pass
     return AsyncTaskRead.model_validate(task)
+
+
+def _execute_matrix_generation_background(task_id: uuid.UUID) -> None:
+    with SessionLocal() as db:
+        execute_compliance_matrix_generation_task(db, task_id)
 
 
 @router.post(

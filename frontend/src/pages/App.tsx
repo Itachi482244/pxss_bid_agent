@@ -94,6 +94,7 @@ import {
   getTask,
   listApprovalTasks,
   listBusinessDraftChapters,
+  listTasks,
   listEnterpriseMaterials,
   listComplianceEvidenceBindings,
   listDocuments,
@@ -147,6 +148,7 @@ import type {
   ProjectDetail,
   PreflightCheck,
   ProjectSummary,
+  QualityIssue,
   QualificationDecision,
   QualificationEvaluation,
   SectionSummary,
@@ -236,6 +238,8 @@ type KeyInfoDraft = {
 type ProjectCreateMode = "manual" | "file" | "url";
 type WorkflowStepKey =
   | "documents"
+  | "tasks"
+  | "quality"
   | "matrix"
   | "review"
   | "technical"
@@ -310,6 +314,49 @@ type ImportProcessingState = {
   matrixTask: AsyncTask | null;
 };
 
+const IMPORT_PROCESSING_STORAGE_KEY = "pxss_bid_agent_import_processing";
+
+function loadImportProcessingState() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(IMPORT_PROCESSING_STORAGE_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<ImportProcessingState>;
+    if (typeof value.projectId !== "string") return null;
+    const parseTaskId = typeof value.parseTaskId === "string" ? value.parseTaskId : null;
+    const matrixTaskId = typeof value.matrixTaskId === "string" ? value.matrixTaskId : null;
+    if (!parseTaskId && !matrixTaskId) return null;
+    return {
+      projectId: value.projectId,
+      sectionId: typeof value.sectionId === "string" ? value.sectionId : null,
+      parseTaskId,
+      matrixTaskId,
+      parseTask: null,
+      matrixTask: null
+    };
+  } catch {
+    window.localStorage.removeItem(IMPORT_PROCESSING_STORAGE_KEY);
+    return null;
+  }
+}
+
+function saveImportProcessingState(value: ImportProcessingState | null) {
+  if (typeof window === "undefined") return;
+  if (!value || (!value.parseTaskId && !value.matrixTaskId)) {
+    window.localStorage.removeItem(IMPORT_PROCESSING_STORAGE_KEY);
+    return;
+  }
+  window.localStorage.setItem(
+    IMPORT_PROCESSING_STORAGE_KEY,
+    JSON.stringify({
+      projectId: value.projectId,
+      sectionId: value.sectionId,
+      parseTaskId: value.parseTaskId,
+      matrixTaskId: value.matrixTaskId
+    })
+  );
+}
+
 const quickPrompts = ["解释当前条款", "查看技术响应", "检查缺项", "整理审批意见"];
 
 const statusLabels: Record<string, string> = {
@@ -349,6 +396,15 @@ const asyncTaskStatusColors: Record<string, string> = {
   failed: "red",
   canceled: "default"
 };
+
+const qualityGateTaskErrorCodes = new Set([
+  "QUALITY_GATE_BLOCKED",
+  "SOURCE_CHUNK_NOT_FOUND",
+  "SOURCE_QUOTE_NOT_FOUND",
+  "COVERAGE_REVIEW_ISSUE",
+  "SECTION_HAS_NO_CHUNKS",
+  "NO_COMPLIANCE_CANDIDATES"
+]);
 
 const riskLabels: Record<string, string> = {
   high: "高",
@@ -489,6 +545,87 @@ function preflightLabel(value: string) {
   return "已通过";
 }
 
+function qualityIssueSeverityColor(value: string) {
+  if (value === "high") return "red";
+  if (value === "medium") return "gold";
+  return "blue";
+}
+
+function qualityIssueActionText(issue: QualityIssue) {
+  if (issue.code === "SOURCE_QUOTE_NOT_FOUND") {
+    return "模型摘录和解析文本没有精确回链；优先重抽该语义段，仍失败时重新解析或人工修正原文。";
+  }
+  if (issue.code === "COVERAGE_REVIEW_ISSUE") {
+    return "覆盖复核认为该段有关键条款漏抽；请打开对应页核对，重抽该段或重新生成全量矩阵。";
+  }
+  if (issue.code.includes("SECTION")) {
+    return "章节计划可能不完整；请先重新规划章节，再重新生成矩阵。";
+  }
+  return "请核对对应章节和页码，处理后重新生成矩阵。";
+}
+
+function qualityIssueSearchTerms(issue: QualityIssue) {
+  const message = issue.message || "";
+  const terms = new Set<string>();
+  const sourceQuote = typeof issue.source_quote === "string" ? issue.source_quote.trim() : "";
+  if (sourceQuote.length >= 2) terms.add(sourceQuote);
+
+  for (const match of message.matchAll(/[（(]([^（）()]{2,80})[）)]/g)) {
+    match[1]
+      .split(/[，,、；;。]|\s+|如/)
+      .map((term) => term.trim())
+      .filter((term) => term.length >= 2)
+      .forEach((term) => terms.add(term));
+  }
+  if (message.includes("单价合同")) {
+    terms.add("单价合同");
+    terms.add("合同价格形式");
+  }
+  if (message.includes("质量保证金")) {
+    terms.add("质量保证金");
+  }
+  if (message.includes("1.5%")) {
+    terms.add("1.5%");
+  }
+  if (message.includes("履约保证金")) {
+    terms.add("履约保证金");
+  }
+  return Array.from(terms).sort((left, right) => right.length - left.length);
+}
+
+function qualityIssueSourceChunk(
+  issue: QualityIssue,
+  semanticSection: DocumentSemanticSection | undefined,
+  chunks: ReviewChunk[]
+) {
+  if (typeof issue.source_chunk_index === "number") {
+    const exactChunk = chunks.find((chunk) => chunk.chunk_index === issue.source_chunk_index);
+    if (exactChunk) return exactChunk;
+  }
+  const terms = qualityIssueSearchTerms(issue);
+  const sectionChunks = semanticSection
+    ? chunks.filter((chunk) => {
+        const pageNo = chunk.page_no ?? 0;
+        return pageNo >= semanticSection.start_page && pageNo <= semanticSection.end_page;
+      })
+    : chunks;
+  return (
+    sectionChunks.find((chunk) => terms.some((term) => chunk.content_text.includes(term))) ??
+    sectionChunks[0] ??
+    null
+  );
+}
+
+function qualityIssueSourceExcerpt(chunk: ReviewChunk | null, terms: string[], maxChars = 360) {
+  if (!chunk) return "";
+  const text = chunk.content_text.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const matchIndex = terms.map((term) => text.indexOf(term)).find((index) => index >= 0) ?? 0;
+  const start = Math.max(0, matchIndex - 90);
+  const excerpt = text.slice(start, start + maxChars);
+  return `${start > 0 ? "..." : ""}${excerpt}${start + maxChars < text.length ? "..." : ""}`;
+}
+
 function isAsyncTaskActive(task: AsyncTask | null, taskId: string | null) {
   if (!taskId) return false;
   if (!task) return true;
@@ -507,8 +644,10 @@ function isUsableParseStatus(value: string | null | undefined) {
 function asyncTaskProgress(task: AsyncTask | null, taskId: string | null) {
   if (!taskId) return 0;
   if (!task) return 5;
-  if (task.status === "pending") return Math.max(task.progress, 8);
-  return task.progress;
+  const progress = Math.max(0, Math.min(100, Math.round(task.progress || 0)));
+  if (task.status === "pending") return Math.max(progress, 8);
+  if (isAsyncTaskActive(task, taskId)) return Math.min(progress || 8, 99);
+  return progress;
 }
 
 function formatDateTime(value: string | null) {
@@ -531,6 +670,82 @@ function truncateText(value: string, length = 24) {
 function summaryNumber(source: Record<string, unknown> | null, key: string) {
   const value = source?.[key];
   return typeof value === "number" ? value : Number(value ?? 0) || 0;
+}
+
+function taskOutputText(task: AsyncTask | null, key: string) {
+  const value = task?.output_json?.[key];
+  return typeof value === "string" && value.trim() ? value : "";
+}
+
+function asyncTaskStatusText(task: AsyncTask | null, taskId: string | null) {
+  if (!taskId) return "";
+  if (!task) return "排队中";
+  return asyncTaskStatusLabels[task.status] ?? "处理中";
+}
+
+function isQualityGateTaskError(code: string | null | undefined) {
+  if (!code) return false;
+  return qualityGateTaskErrorCodes.has(code) || code.startsWith("SECTION_PLAN_");
+}
+
+function matrixTaskStageTitle(task: AsyncTask | null) {
+  if (!task) return "合规矩阵排队中";
+  if (task.status === "succeeded") return "合规矩阵已生成";
+  if (task.status === "failed") return "合规矩阵生成失败";
+  const output = task.output_json ?? null;
+  const stage = taskOutputText(task, "progress_stage");
+  const sectionPosition = summaryNumber(output, "section_position");
+  const sectionCount = summaryNumber(output, "section_count");
+  const retryIndex = summaryNumber(output, "retry_index");
+  const retryCount = summaryNumber(output, "retry_count");
+  const stageLabel =
+    stage === "section_plan_done"
+      ? "章节规划完成"
+      : stage === "section_fork_join"
+        ? "并发抽取条款"
+      : stage === "section_extract"
+        ? "准备抽取章节"
+        : stage === "section_llm_extract"
+          ? "模型抽取条款"
+          : stage === "section_llm_extract_retry"
+            ? "模型拆分重试"
+            : stage === "section_coverage_review"
+              ? "覆盖率复核"
+              : stage === "section_review"
+                ? "章节复核完成"
+                : "合规矩阵生成中";
+  const sectionText = sectionPosition && sectionCount ? `第 ${sectionPosition}/${sectionCount} 段` : "";
+  const retryText = retryIndex && retryCount ? `子段 ${retryIndex}/${retryCount}` : "";
+  return [stageLabel, sectionText, retryText].filter(Boolean).join(" · ");
+}
+
+function taskProgressMessage(task: AsyncTask | null, activeFallback: string, doneFallback: string) {
+  if (task?.error_message) return task.error_message;
+  const progressMessage = taskOutputText(task, "progress_message");
+  if (progressMessage) return progressMessage;
+  if (task?.status === "succeeded") return doneFallback;
+  return activeFallback;
+}
+
+function importProcessingProgress(processing: ImportProcessingState | null) {
+  if (!processing) return 0;
+  const parseProgress = asyncTaskProgress(processing.parseTask, processing.parseTaskId);
+  const matrixProgress = asyncTaskProgress(processing.matrixTask, processing.matrixTaskId);
+  if (processing.parseTaskId && processing.matrixTaskId) {
+    return Math.round(parseProgress * 0.25 + matrixProgress * 0.75);
+  }
+  return processing.matrixTaskId ? matrixProgress : parseProgress;
+}
+
+function taskShortId(value: string | null | undefined) {
+  return value ? value.slice(0, 8) : "";
+}
+
+function taskTimeRange(task: AsyncTask | null) {
+  if (!task) return "尚未开始";
+  const start = task.started_at ? formatDateTime(task.started_at) : "排队中";
+  const end = task.finished_at ? formatDateTime(task.finished_at) : "处理中";
+  return `${start} / ${end}`;
 }
 
 function blockingSummary(source: Record<string, unknown> | null) {
@@ -687,6 +902,8 @@ export function App() {
   const [matrixReviewFilter, setMatrixReviewFilter] = useState<MatrixReviewFilter>("all");
   const [reviewChunks, setReviewChunks] = useState<ReviewChunk[]>([]);
   const [loadingReviewChunks, setLoadingReviewChunks] = useState(false);
+  const [qualityChunks, setQualityChunks] = useState<ReviewChunk[]>([]);
+  const [loadingQualityChunks, setLoadingQualityChunks] = useState(false);
   const [activeReviewItemId, setActiveReviewItemId] = useState("");
   const [locatingReviewItemId, setLocatingReviewItemId] = useState("");
   const [reviewOpenXmlDocument, setReviewOpenXmlDocument] = useState<MatrixReviewDocument | null>(null);
@@ -778,7 +995,7 @@ export function App() {
   const [approvalBusyId, setApprovalBusyId] = useState("");
   const [savingProject, setSavingProject] = useState(false);
   const [deletingProjects, setDeletingProjects] = useState(false);
-  const [importProcessing, setImportProcessing] = useState<ImportProcessingState | null>(null);
+  const [importProcessing, setImportProcessing] = useState<ImportProcessingState | null>(() => loadImportProcessingState());
   const [documentBusy, setDocumentBusy] = useState(false);
   const [semanticSections, setSemanticSections] = useState<DocumentSemanticSection[]>([]);
   const [extractionQualityReport, setExtractionQualityReport] = useState<DocumentExtractionQualityReport | null>(null);
@@ -1117,6 +1334,42 @@ export function App() {
   }, [reloadExtractionQuality, complianceItems.length]);
 
   useEffect(() => {
+    if (activeTab !== "quality" || !selectedProjectId || !selectedSectionId || !reviewDocument?.current_version_id) {
+      return;
+    }
+    let active = true;
+    setLoadingQualityChunks(true);
+    listDocumentChunks(
+      selectedProjectId,
+      selectedSectionId,
+      reviewDocument.id,
+      reviewDocument.current_version_id
+    )
+      .then((chunks) => {
+        if (!active) return;
+        setQualityChunks(
+          chunks.map((chunk) => ({
+            id: chunk.id,
+            chunk_index: chunk.chunk_index,
+            page_no: chunk.page_no,
+            heading_path: chunk.heading_path,
+            content_text: chunk.content_text,
+            document_version_id: chunk.document_version_id
+          }))
+        );
+      })
+      .catch(() => {
+        if (active) setQualityChunks([]);
+      })
+      .finally(() => {
+        if (active) setLoadingQualityChunks(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeTab, reviewDocument?.current_version_id, reviewDocument?.id, selectedProjectId, selectedSectionId]);
+
+  useEffect(() => {
     if (!selectedProjectId || !selectedSectionId) return;
     let active = true;
     getPreflightCheck(selectedProjectId, selectedSectionId)
@@ -1238,6 +1491,7 @@ export function App() {
     if (activeTab === "evidence") return "证据处理";
     if (activeTab === "technical") return "技术响应预览";
     if (activeTab === "review") return "矩阵审阅";
+    if (activeTab === "quality") return "质量门禁";
     if (activeTab === "documents") return "文件解析视图";
     return "合规矩阵";
   }, [activeTab]);
@@ -1299,6 +1553,7 @@ export function App() {
     return Array.from(new Map(pairs).values()).sort((left, right) => left.chunk_index - right.chunk_index);
   }, [matrixRows]);
   const reviewDisplayChunks = reviewChunks.length ? reviewChunks : reviewFallbackChunks;
+  const qualityDisplayChunks = qualityChunks.length ? qualityChunks : reviewDisplayChunks;
   const reviewChunkById = useMemo(
     () => new Map(reviewDisplayChunks.map((chunk) => [chunk.id, chunk])),
     [reviewDisplayChunks]
@@ -1429,6 +1684,7 @@ export function App() {
       (!importProcessing.sectionId || importProcessing.sectionId === selectedSectionId) &&
       (importProcessing.parseTaskId || importProcessing.matrixTaskId)
   );
+  const importProcessingHasActiveTask = Boolean(importProcessingVisible && (parseTaskActive || matrixTaskActive));
   const importProcessingDone = Boolean(
     importProcessing &&
       isAsyncTaskTerminal(importProcessing.parseTask, importProcessing.parseTaskId) &&
@@ -1439,8 +1695,51 @@ export function App() {
       [importProcessing.parseTask, importProcessing.matrixTask].some((task) => task?.status === "failed")
   );
   const extractionBlocked = extractionQualityReport?.status === "blocked";
+  const extractionQualityIssues = extractionQualityReport?.issues_json ?? [];
+  const extractionQualityIssueCount = extractionQualityIssues.length || (extractionBlocked ? 1 : 0);
   const extractionBlockReason =
-    extractionQualityReport?.issues_json?.[0]?.message || "章节规划或合规抽取质量门禁未通过。";
+    extractionQualityIssues[0]?.message || "章节规划或合规抽取质量门禁未通过。";
+  const importProcessingQualityBlocked = Boolean(
+    importProcessingFailed &&
+      (extractionBlocked || isQualityGateTaskError(importProcessing?.matrixTask?.error_code))
+  );
+  const importProcessingPercent = importProcessingProgress(importProcessing);
+  const importProcessingStageTitle = importProcessingQualityBlocked
+    ? "质量门禁需要处理"
+    : importProcessingFailed
+    ? "后台处理失败"
+    : importProcessingDone
+      ? "后台处理已完成"
+      : parseTaskActive
+        ? "正在解析招标文件"
+        : matrixTaskActive
+          ? matrixTaskStageTitle(importProcessing?.matrixTask ?? null)
+          : "后台任务排队中";
+  const importProcessingStageMessage = importProcessingQualityBlocked
+    ? "本轮结果已暂停写入，请先进入质量门禁页处理阻断项。"
+    : importProcessingFailed
+    ? "查看失败原因后重新解析或重新生成矩阵。"
+    : importProcessingDone
+      ? "解析版本和合规矩阵已刷新，可以继续审阅和确认。"
+      : parseTaskActive
+        ? taskProgressMessage(importProcessing?.parseTask ?? null, "正在读取文件、识别页码并切分条款。", "解析版本已生成。")
+        : matrixTaskActive
+          ? taskProgressMessage(
+              importProcessing?.matrixTask ?? null,
+              "正在抽取资格项、强制响应项和风险点。",
+              "矩阵已生成并刷新。"
+            )
+          : "任务已提交，正在等待后台 worker 接手。";
+  const matrixTaskOutput = importProcessing?.matrixTask?.output_json ?? null;
+  const matrixForkJoinTotal = summaryNumber(matrixTaskOutput, "fork_join_total") || summaryNumber(matrixTaskOutput, "section_count");
+  const matrixForkJoinCompleted = summaryNumber(matrixTaskOutput, "fork_join_completed");
+  const matrixForkJoinPending = summaryNumber(matrixTaskOutput, "fork_join_pending");
+  const matrixForkJoinWorkers = summaryNumber(matrixTaskOutput, "fork_join_max_workers");
+  const matrixForkJoinPendingSections = Array.isArray(matrixTaskOutput?.fork_join_pending_sections)
+    ? matrixTaskOutput.fork_join_pending_sections
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .slice(0, 4)
+    : [];
 
   const workflowSteps = useMemo<WorkflowStep[]>(() => {
     const parsedDocuments = documents.filter((document) => isUsableParseStatus(document.current_version?.parse_status));
@@ -1454,9 +1753,11 @@ export function App() {
     const hasDraft = businessDraftChapters.length > 0;
     const hasSelectedScope = Boolean(selectedProjectId && selectedSectionId);
     const canOpenDocuments = hasSelectedScope;
-    const canOpenMatrix = parsedDocuments.length > 0 && !extractionBlocked;
-    const canOpenMatrixDerived = matrixRows.length > 0 && !extractionBlocked;
-    const canOpenReview = matrixRows.length > 0 && !extractionBlocked;
+    const canOpenTasks = hasSelectedScope;
+    const canOpenQuality = parsedDocuments.length > 0 || Boolean(extractionQualityReport);
+    const canOpenMatrix = parsedDocuments.length > 0;
+    const canOpenMatrixDerived = matrixRows.length > 0;
+    const canOpenReview = matrixRows.length > 0;
     const canOpenChapter = (hasDecision || hasDraft) && !extractionBlocked;
     const canOpenApproval = (hasDraft || approvalTasks.length > 0 || exportFiles.length > 0) && !extractionBlocked;
 
@@ -1478,6 +1779,70 @@ export function App() {
 	        disabled: !canOpenDocuments,
 	        disabledReason: canOpenDocuments ? null : "请先选择项目和标段。"
 	      },
+      {
+        key: "tasks",
+        title: "任务中心",
+        description: "查看文件解析和矩阵生成的后台进度。",
+        status: importProcessingFailed
+          ? "risk"
+          : importProcessingHasActiveTask
+            ? "todo"
+            : importProcessingDone || parsedDocuments.length || matrixRows.length
+              ? "done"
+              : documents.length
+                ? "todo"
+                : "not_started",
+        statusText: importProcessingFailed
+          ? "需要处理"
+          : importProcessingHasActiveTask
+            ? `${importProcessingPercent}%`
+            : importProcessingDone
+              ? "已完成"
+              : documents.length || parsedDocuments.length || matrixRows.length
+                ? "可查看"
+                : "未开始",
+        actionText: "进入任务中心",
+        reason: importProcessingHasActiveTask
+          ? importProcessingStageMessage
+          : importProcessingFailed
+            ? "后台任务失败，请查看原因后重试或处理质量门禁。"
+            : "集中查看解析、并发抽取、质量门禁和下一步动作。",
+        disabled: !canOpenTasks,
+        disabledReason: canOpenTasks ? null : "请先选择项目和标段。"
+      },
+      {
+        key: "quality",
+        title: "质量门禁",
+        description: "处理章节规划、来源回链和漏抽覆盖等生成阻断。",
+        status: matrixTaskActive
+          ? "todo"
+          : extractionBlocked
+          ? "risk"
+          : extractionQualityReport?.status === "passed"
+            ? "done"
+            : parsedDocuments.length
+              ? "todo"
+              : "not_started",
+        statusText: matrixTaskActive
+          ? "生成中"
+          : extractionBlocked
+            ? `${extractionQualityIssueCount} 个阻断`
+            : extractionQualityReport?.status === "passed"
+              ? "已通过"
+              : parsedDocuments.length
+                ? "待生成"
+                : "未开始",
+        actionText: extractionBlocked ? "处理质量门禁" : "查看质量门禁",
+        reason: extractionBlocked
+          ? `发现 ${extractionQualityIssueCount} 个关键条款漏抽。建议点击“按建议处理”重新生成矩阵；上一版矩阵会保留。`
+          : extractionQualityReport?.status === "passed"
+            ? "最近一次抽取质量门禁已通过。"
+            : parsedDocuments.length
+              ? "生成矩阵时会自动执行质量门禁；如被阻断，可在这里逐项处理。"
+              : "需要先完成文件解析。",
+        disabled: !canOpenQuality,
+        disabledReason: canOpenQuality ? null : "请先完成文件解析，形成可用解析版本。"
+      },
       {
         key: "matrix",
         title: "合规矩阵",
@@ -1509,15 +1874,13 @@ export function App() {
             ? "合规矩阵正在后台生成，完成后会自动刷新矩阵和提交前核验。"
             : matrixRows.length
 	          ? unresolvedMatrixCount
-	            ? `当前有 ${matrixRows.length} 条矩阵项，${unresolvedMatrixCount} 条仍需确认或补材料。`
+	            ? `当前有 ${matrixRows.length} 条矩阵项，${unresolvedMatrixCount} 条仍需确认或补材料。${extractionBlocked ? " 质量门禁问题请到专门页面处理。" : ""}`
 	            : "合规矩阵已全部人工确认，可以进入证据绑定和资格预评估。"
-            : extractionBlocked
-              ? "合规抽取质量门禁已阻断，需要处理章节计划或抽取问题。"
               : parsedDocuments.length
 	            ? "文件已解析，可以生成合规矩阵。"
 	            : "需要先完成文件解析。",
 	        disabled: !canOpenMatrix,
-	        disabledReason: canOpenMatrix ? null : extractionBlocked ? extractionBlockReason : "请先完成文件解析，形成可用解析版本。"
+	        disabledReason: canOpenMatrix ? null : "请先完成文件解析，形成可用解析版本。"
 	      },
       {
         key: "review",
@@ -1540,7 +1903,7 @@ export function App() {
           ? `已生成 ${matrixRows.length} 条矩阵项，可在原文对照视图中核验来源。`
           : "需要先生成合规矩阵。",
         disabled: !canOpenReview,
-        disabledReason: canOpenReview ? null : extractionBlocked ? extractionBlockReason : "请先生成合规矩阵。"
+        disabledReason: canOpenReview ? null : "请先生成合规矩阵。"
       },
       {
         key: "evidence",
@@ -1649,6 +2012,13 @@ export function App() {
 	    evidenceRows.length,
       extractionBlocked,
       extractionBlockReason,
+      extractionQualityIssues.length,
+      extractionQualityReport?.status,
+      importProcessingDone,
+      importProcessingFailed,
+      importProcessingHasActiveTask,
+      importProcessingPercent,
+      importProcessingStageMessage,
 	    exportFiles.length,
       matrixTaskActive,
 	    matrixRows,
@@ -1741,6 +2111,7 @@ export function App() {
     });
     return [...actionLogs, ...persistedLogs].slice(0, 6);
   }, [actionLogs, auditLogs]);
+  const focusQualityAssistant = activeTab === "quality" && extractionBlocked;
 
   const appendLog = useCallback((content: string) => {
     setActionLogs((logs) => [`刚刚 ${content}`, ...logs].slice(0, 5));
@@ -1853,6 +2224,53 @@ export function App() {
     reloadQualificationDecision,
     reloadQualificationEvaluations,
     reloadWorkspaceSummary
+  ]);
+
+  useEffect(() => {
+    saveImportProcessingState(importProcessing);
+  }, [
+    importProcessing?.projectId,
+    importProcessing?.sectionId,
+    importProcessing?.parseTaskId,
+    importProcessing?.matrixTaskId
+  ]);
+
+  useEffect(() => {
+    if (!selectedProjectId || !selectedSectionId || importProcessingHasActiveTask) return;
+    let active = true;
+
+    const recoverActiveTasks = async () => {
+      const tasks = await listTasks({
+        project_id: selectedProjectId,
+        section_id: selectedSectionId,
+        active: true,
+        limit: 10
+      });
+      if (!active) return;
+      const parseTask = tasks.find((task) => task.task_type === "document_parse") ?? null;
+      const matrixTask = tasks.find((task) => task.task_type === "matrix_generate") ?? null;
+      if (!parseTask && !matrixTask) return;
+      setImportProcessing({
+        projectId: selectedProjectId,
+        sectionId: selectedSectionId,
+        parseTaskId: parseTask?.id ?? null,
+        matrixTaskId: matrixTask?.id ?? null,
+        parseTask,
+        matrixTask
+      });
+    };
+
+    void recoverActiveTasks().catch(() => {
+      // Best-effort recovery; normal polling continues when this tab started the task.
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    importProcessingHasActiveTask,
+    selectedProjectId,
+    selectedSectionId
   ]);
 
   useEffect(() => {
@@ -2682,7 +3100,8 @@ export function App() {
           const task = await generateComplianceMatrix(selectedProjectId, selectedSectionId, {
             document_id: source?.id,
             document_version_id: version?.id,
-            force: true
+            force: true,
+            async_processing: true
           });
           appendLog(`提交合规矩阵生成任务：${task.id.slice(0, 8)}`);
           if (task.status === "failed") {
@@ -2707,14 +3126,17 @@ export function App() {
           }
           Modal.info({
             title: "矩阵生成任务已提交",
-            content: "任务正在后台队列中等待处理；请启动 worker 或稍后刷新任务状态。"
+            content: "任务正在后台处理，可在流程状态中查看进度；完成后会自动刷新矩阵。"
           });
-          window.setTimeout(() => {
-            listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 })
-              .then((data) => setComplianceItems(data))
-              .catch(() => undefined)
-              .finally(() => setLoadingMatrix(false));
-          }, 1200);
+          setImportProcessing({
+            projectId: selectedProjectId,
+            sectionId: selectedSectionId,
+            parseTaskId: null,
+            matrixTaskId: task.id,
+            parseTask: null,
+            matrixTask: task
+          });
+          setLoadingMatrix(false);
         } catch (error) {
           setLoadingMatrix(false);
           setApiError(error instanceof Error ? error.message : "合规矩阵生成失败");
@@ -2763,8 +3185,18 @@ export function App() {
       activateWorkflowStep("documents");
       return;
     }
+    if (stepKey === "tasks") {
+      activateWorkflowStep("tasks");
+      return;
+    }
+    if (stepKey === "quality") {
+      activateWorkflowStep("quality");
+      return;
+    }
     if (stepKey === "matrix") {
-      if (matrixTaskActive) {
+      if (extractionBlocked && !matrixRows.length) {
+        activateWorkflowStep("quality");
+      } else if (matrixTaskActive) {
         activateWorkflowStep("matrix");
       } else if (matrixRows.length) {
         activateWorkflowStep("matrix");
@@ -3239,7 +3671,7 @@ export function App() {
   const openWorkspace = (tab = "matrix") => {
     setViewMode("workspace");
     setActiveTab(tab);
-    const workspaceTabs = new Set(["approval", "chapter", "evidence", "review", "documents", "qualification"]);
+    const workspaceTabs = new Set(["approval", "chapter", "evidence", "review", "documents", "tasks", "quality", "qualification"]);
     setWorkspaceNode(workspaceTabs.has(tab) ? tab : "matrix");
   };
 
@@ -4680,21 +5112,49 @@ export function App() {
                   <Alert
                     showIcon
                     type={importProcessingFailed ? "error" : importProcessingDone ? "success" : "info"}
-                    message={
-                      importProcessingFailed
-                        ? "后台处理失败"
-                        : importProcessingDone
-                          ? "后台处理已完成"
-                          : "后台正在处理导入项目"
-                    }
+                    message={importProcessingStageTitle}
                     description={
-                      importProcessingFailed
+                      importProcessingQualityBlocked
+                        ? "系统已暂停本轮写入，上一版矩阵仍保留。请进入质量门禁页按建议处理阻断项。"
+                        : importProcessingFailed
                         ? "解析或矩阵生成失败，请查看下方任务状态后重新解析或重新生成矩阵。"
                         : importProcessingDone
                           ? "文件解析和合规矩阵已刷新，可继续处理风险、证据和确认项。"
-                          : "项目已创建成功，文件解析和合规矩阵生成正在后台执行，请勿重复创建项目。"
+                          : "这是后台异步任务，可以切换页面继续查看项目；完成后会自动刷新。"
                     }
                   />
+                  <div className="background-task-overview">
+                    <div className="background-task-overview-header">
+                      <div>
+                        <Text strong>后台解析/生成进度</Text>
+                        <Text type="secondary">{importProcessingStageMessage}</Text>
+                      </div>
+                      <Tag color={importProcessingFailed ? "red" : importProcessingDone ? "green" : "blue"}>
+                        {importProcessingPercent}%
+                      </Tag>
+                    </div>
+                    <Progress
+                      percent={importProcessingPercent}
+                      status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : "active"}
+                    />
+                    {!importProcessingDone && !importProcessingFailed && (
+                      <Text type="secondary" className="background-task-hint">
+                        当前不需要人工操作；如果质量门禁拦截，系统会在完成后引导到专门处理页。
+                      </Text>
+                    )}
+                    {(importProcessingHasActiveTask || importProcessingQualityBlocked || importProcessingFailed) && (
+                      <Space className="background-task-actions" wrap>
+                        <Button onClick={() => openWorkspace("tasks")}>
+                          进入任务中心
+                        </Button>
+                        {importProcessingQualityBlocked && (
+                          <Button type="primary" onClick={() => openWorkspace("quality")}>
+                            处理质量门禁
+                          </Button>
+                        )}
+                      </Space>
+                    )}
+                  </div>
                   <div className="background-task-grid">
                     {importProcessing.parseTaskId && (
                       <div className="background-task-card">
@@ -4710,8 +5170,11 @@ export function App() {
                           status={importProcessing.parseTask?.status === "failed" ? "exception" : undefined}
                         />
                         <Text type="secondary">
-                          {importProcessing.parseTask?.error_message ??
-                            (parseTaskActive ? "正在读取文件并切分条款..." : "解析版本已生成。")}
+                          {taskProgressMessage(
+                            importProcessing.parseTask,
+                            "正在读取文件并切分条款...",
+                            "解析版本已生成。"
+                          )}
                         </Text>
                       </div>
                     )}
@@ -4723,14 +5186,18 @@ export function App() {
                             {asyncTaskStatusLabels[importProcessing.matrixTask?.status ?? "pending"] ?? "处理中"}
                           </Tag>
                         </div>
+                        <Text type="secondary">{matrixTaskStageTitle(importProcessing.matrixTask)}</Text>
                         <Progress
                           percent={asyncTaskProgress(importProcessing.matrixTask, importProcessing.matrixTaskId)}
                           size="small"
                           status={importProcessing.matrixTask?.status === "failed" ? "exception" : undefined}
                         />
                         <Text type="secondary">
-                          {importProcessing.matrixTask?.error_message ??
-                            (matrixTaskActive ? "正在抽取资格项、强制响应项和风险点..." : "矩阵已生成并刷新。")}
+                          {taskProgressMessage(
+                            importProcessing.matrixTask,
+                            "正在抽取资格项、强制响应项和风险点...",
+                            "矩阵已生成并刷新。"
+                          )}
                         </Text>
                       </div>
                     )}
@@ -4882,7 +5349,7 @@ export function App() {
                 <div className="metric-item approval-metric">
                   <Text type="secondary">待审批</Text>
                   <strong>{approvalTasks.filter((task) => task.status === "pending").length}</strong>
-                  <Button size="small" onClick={() => activateWorkflowStep("approval")}>
+                  <Button size="small" onClick={() => activateWorkflowStep("tasks")}>
                     进入任务中心
                   </Button>
                 </div>
@@ -4896,6 +5363,162 @@ export function App() {
                   activateWorkflowStep(key as WorkflowStepKey);
                 }}
                 items={[
+                  {
+                    key: "tasks",
+                    label: "任务中心",
+                    children: (
+                      <div className="workspace-panel task-center-panel">
+                        <div className="tab-intro">
+                          <div>
+                            <Text strong>后台任务中心</Text>
+                            <p>集中查看文件解析、并发抽取、质量门禁和下一步动作。</p>
+                          </div>
+                          <Tag color={importProcessingFailed ? "red" : importProcessingHasActiveTask ? "blue" : "green"}>
+                            {importProcessingHasActiveTask ? `${importProcessingPercent}%` : importProcessingFailed ? "需要处理" : "当前空闲"}
+                          </Tag>
+                        </div>
+
+                        <div className="task-center-status">
+                          <div className="task-center-status-main">
+                            <div>
+                              <Text strong>{importProcessingStageTitle}</Text>
+                              <p>{importProcessingStageMessage}</p>
+                            </div>
+                            <Tag color={importProcessingFailed ? "red" : importProcessingDone ? "green" : "blue"}>
+                              {importProcessingPercent}%
+                            </Tag>
+                          </div>
+                          <Progress
+                            percent={importProcessingPercent}
+                            status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : importProcessingHasActiveTask ? "active" : "normal"}
+                          />
+                          <div className="task-center-actions">
+                            {importProcessingQualityBlocked ? (
+                              <Button type="primary" icon={<WarningOutlined />} onClick={() => activateWorkflowStep("quality")}>
+                                处理质量门禁
+                              </Button>
+                            ) : importProcessingFailed ? (
+                              <Button type="primary" icon={<RobotOutlined />} onClick={() => handleGenerateMatrix(reviewDocument ?? undefined)}>
+                                重新生成矩阵
+                              </Button>
+                            ) : matrixTaskActive ? (
+                              <Button icon={<ClockCircleOutlined />} disabled>
+                                等待后台完成
+                              </Button>
+                            ) : matrixRows.length ? (
+                              <Button type="primary" icon={<FileSearchOutlined />} onClick={() => activateWorkflowStep("matrix")}>
+                                进入合规矩阵
+                              </Button>
+                            ) : reviewDocument?.current_version_id ? (
+                              <Button type="primary" icon={<RobotOutlined />} onClick={() => handleGenerateMatrix(reviewDocument)}>
+                                生成合规矩阵
+                              </Button>
+                            ) : (
+                              <Button type="primary" icon={<FileTextOutlined />} onClick={() => activateWorkflowStep("documents")}>
+                                去上传/解析文件
+                              </Button>
+                            )}
+                            <Button onClick={() => activateWorkflowStep("documents")}>查看文件解析</Button>
+                          </div>
+                        </div>
+
+                        {importProcessing?.parseTaskId || importProcessing?.matrixTaskId ? (
+                          <div className="task-center-grid">
+                            {importProcessing.parseTaskId && (
+                              <div className="task-center-card">
+                                <div className="task-center-card-head">
+                                  <div>
+                                    <Text strong>文件解析</Text>
+                                    <Text type="secondary">任务 {taskShortId(importProcessing.parseTaskId)}</Text>
+                                  </div>
+                                  <Tag color={asyncTaskStatusColors[importProcessing.parseTask?.status ?? "pending"]}>
+                                    {asyncTaskStatusText(importProcessing.parseTask, importProcessing.parseTaskId)}
+                                  </Tag>
+                                </div>
+                                <Progress
+                                  percent={asyncTaskProgress(importProcessing.parseTask, importProcessing.parseTaskId)}
+                                  size="small"
+                                  status={importProcessing.parseTask?.status === "failed" ? "exception" : importProcessing.parseTask?.status === "succeeded" ? "success" : "active"}
+                                />
+                                <Text type="secondary">
+                                  {taskProgressMessage(
+                                    importProcessing.parseTask,
+                                    "正在读取文件、识别页码并切分条款。",
+                                    "解析版本已生成。"
+                                  )}
+                                </Text>
+                                <Text type="secondary">{taskTimeRange(importProcessing.parseTask)}</Text>
+                              </div>
+                            )}
+
+                            {importProcessing.matrixTaskId && (
+                              <div className="task-center-card">
+                                <div className="task-center-card-head">
+                                  <div>
+                                    <Text strong>合规矩阵</Text>
+                                    <Text type="secondary">任务 {taskShortId(importProcessing.matrixTaskId)}</Text>
+                                  </div>
+                                  <Tag color={asyncTaskStatusColors[importProcessing.matrixTask?.status ?? "pending"]}>
+                                    {asyncTaskStatusText(importProcessing.matrixTask, importProcessing.matrixTaskId)}
+                                  </Tag>
+                                </div>
+                                <Text type="secondary">{matrixTaskStageTitle(importProcessing.matrixTask)}</Text>
+                                <Progress
+                                  percent={asyncTaskProgress(importProcessing.matrixTask, importProcessing.matrixTaskId)}
+                                  size="small"
+                                  status={importProcessing.matrixTask?.status === "failed" ? "exception" : importProcessing.matrixTask?.status === "succeeded" ? "success" : "active"}
+                                />
+                                <Text type="secondary">
+                                  {taskProgressMessage(
+                                    importProcessing.matrixTask,
+                                    "正在抽取资格项、强制响应项和风险点。",
+                                    "矩阵已生成并刷新。"
+                                  )}
+                                </Text>
+                                <div className="task-center-stats">
+                                  {matrixForkJoinWorkers ? <Tag color="blue">并发 {matrixForkJoinWorkers}</Tag> : null}
+                                  {matrixForkJoinTotal ? (
+                                    <Tag color="geekblue">
+                                      已完成 {matrixForkJoinCompleted || 0}/{matrixForkJoinTotal} 段
+                                    </Tag>
+                                  ) : null}
+                                  {matrixForkJoinPending ? <Tag color="gold">剩余 {matrixForkJoinPending} 段</Tag> : null}
+                                </div>
+                                {matrixForkJoinPendingSections.length > 0 && (
+                                  <div className="task-center-pending-list">
+                                    <Text type="secondary">正在处理或排队</Text>
+                                    {matrixForkJoinPendingSections.map((section, index) => (
+                                      <span key={`${section.section_index ?? index}-${section.section_title ?? "section"}`}>
+                                        {section.section_index ? `${section.section_index}/` : ""}
+                                        {matrixForkJoinTotal ? `${matrixForkJoinTotal} ` : ""}
+                                        {String(section.section_title ?? "未命名章节")}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                                <Text type="secondary">{taskTimeRange(importProcessing.matrixTask)}</Text>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前没有后台任务" />
+                        )}
+
+                        <div className="task-center-next">
+                          <Text strong>用户下一步</Text>
+                          <Text type="secondary">
+                            {importProcessingHasActiveTask
+                              ? "不用在矩阵里找问题，等后台完成即可；如果被质量门禁拦截，系统会在这里给出处理按钮。"
+                              : importProcessingQualityBlocked
+                                ? "点击“处理质量门禁”，按建议重新生成或只重抽问题段。"
+                                : matrixRows.length
+                                  ? "进入合规矩阵，优先确认高风险和强制响应条款。"
+                                  : "先完成文件解析，再生成合规矩阵。"}
+                          </Text>
+                        </div>
+                      </div>
+                    )
+                  },
                   {
                     key: "documents",
                     label: "文件解析",
@@ -5027,12 +5650,18 @@ export function App() {
                             </div>
                             {extractionQualityReport?.status === "blocked" && (
                               <Alert
-                                type="error"
+                                type="warning"
                                 showIcon
-                                message="合规抽取质量门禁未通过"
+                                message="存在质量门禁阻断"
                                 description={
-                                  extractionQualityReport.issues_json?.[0]?.message ||
-                                  "请重新规划章节或重抽对应语义段后再继续。"
+                                  <Space direction="vertical" size={8}>
+                                    <Text>
+                                      本轮生成结果未写入，{matrixRows.length ? "上一版矩阵仍可查看。" : "请处理后重新生成矩阵。"}
+                                    </Text>
+                                    <Button size="small" type="primary" onClick={() => activateWorkflowStep("quality")}>
+                                      进入质量门禁
+                                    </Button>
+                                  </Space>
                                 }
                               />
                             )}
@@ -5121,10 +5750,166 @@ export function App() {
                           </div>
                         )}
                       </div>
+	                    )
+	                  },
+                  {
+                    key: "quality",
+                    label: "质量门禁",
+                    children: (
+                      <div className="workspace-panel quality-gate-panel">
+                        <div className="tab-intro">
+                          <div>
+                            <Text strong>{extractionBlocked ? "处理质量门禁" : "抽取质量门禁"}</Text>
+                            <p>
+                              {extractionBlocked
+                                ? "系统已拦截本轮生成结果，按建议重新生成即可。"
+                                : "生成矩阵时自动检查章节规划、来源回链和关键条款覆盖。"}
+                            </p>
+                          </div>
+                          <Tag color={extractionBlocked ? "red" : extractionQualityReport ? "green" : "default"}>
+                            {extractionBlocked ? `${extractionQualityIssueCount} 个阻断` : extractionQualityReport ? "质量通过" : "待生成"}
+                          </Tag>
+                        </div>
+
+                        {!reviewDocument?.current_version_id ? (
+                          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="请先上传并解析招标文件" />
+                        ) : !extractionQualityReport ? (
+                          <Alert
+                            type="info"
+                            showIcon
+                            message="尚未形成质量报告"
+                            description={
+                              <Space direction="vertical" size={8}>
+                                <Text>先生成合规矩阵；系统会自动检查是否漏抽关键条款。</Text>
+                                <Button type="primary" icon={<RobotOutlined />} onClick={() => handleGenerateMatrix(reviewDocument)}>
+                                  生成合规矩阵
+                                </Button>
+                              </Space>
+                            }
+                          />
+                        ) : extractionQualityReport.status === "passed" ? (
+                          <Alert
+                            type="success"
+                            showIcon
+                            message="质量门禁已通过"
+                            description={
+                              <Space direction="vertical" size={8}>
+                                <Text>最近一次抽取未发现阻断项，可以继续处理合规矩阵。</Text>
+                                <Button type="primary" icon={<FileSearchOutlined />} onClick={() => activateWorkflowStep("matrix")}>
+                                  进入合规矩阵
+                                </Button>
+                              </Space>
+                            }
+                          />
+                        ) : (
+                          <>
+                            <div className="quality-recommendation-card">
+                              <div className="quality-recommendation-main">
+                                <span className="quality-recommendation-icon">
+                                  <WarningOutlined />
+                                </span>
+                                <div>
+                                  <Text strong>现在只需要做一件事</Text>
+                                  <p>
+                                    点击“按建议处理”，系统会用已补齐的漏抽规则重新生成全量矩阵。通过后再回到矩阵审阅。
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="quality-recommendation-actions">
+                                <Button
+                                  type="primary"
+                                  icon={<RobotOutlined />}
+                                  loading={loadingMatrix || matrixTaskActive}
+                                  disabled={matrixTaskActive}
+                                  onClick={() => handleGenerateMatrix(reviewDocument)}
+                                >
+                                  {matrixTaskActive ? "正在重新生成" : "按建议处理"}
+                                </Button>
+                                <Button
+                                  icon={<FileSearchOutlined />}
+                                  disabled={!matrixRows.length}
+                                  onClick={() => activateWorkflowStep("matrix")}
+                                >
+                                  查看上一版矩阵
+                                </Button>
+                              </div>
+                              <div className="quality-safety-notes">
+                                <span>失败结果未写入</span>
+                                <span>上一版矩阵保留</span>
+                                <span>{extractionQualityIssueCount} 个阻断会重新校验</span>
+                              </div>
+                            </div>
+                            <details className="quality-details">
+                              <summary>技术诊断（可选）：查看 {extractionQualityIssueCount} 个阻断</summary>
+                              <div className="quality-detail-intro">
+                                <Text strong>系统定位到的漏抽位置</Text>
+                                <p>
+                                  这些内容只用于核查原因。正常处理时不需要逐条操作，直接使用上方“按建议处理”即可。
+                                </p>
+                              </div>
+                              <Spin spinning={loadingQualityChunks}>
+                                <div className="quality-issue-list quality-issue-list-standalone">
+                                  {extractionQualityIssues.length ? (
+                                    extractionQualityIssues.map((issue, index) => {
+                                      const semanticSection = semanticSections.find((section) => section.id === issue.section_id);
+                                      const terms = qualityIssueSearchTerms(issue);
+                                      const sourceChunk = qualityIssueSourceChunk(issue, semanticSection, qualityDisplayChunks);
+                                      const sourceExcerpt = qualityIssueSourceExcerpt(sourceChunk, terms);
+                                      return (
+                                        <div className="quality-issue-item" key={`${issue.code}-${issue.section_id ?? "unknown"}-${index}`}>
+                                          <div className="quality-issue-title">
+                                            <Space size={6} wrap>
+                                              <Tag color={qualityIssueSeverityColor(issue.severity)}>{issue.severity}</Tag>
+                                              <Text strong>{issue.section_title ?? semanticSection?.title ?? "未定位章节"}</Text>
+                                              {semanticSection && <Tag>{semanticSection.start_page}-{semanticSection.end_page} 页</Tag>}
+                                              {issue.page_no && <Tag>第 {issue.page_no} 页</Tag>}
+                                              {issue.source_chunk_index && <Tag>chunk {issue.source_chunk_index}</Tag>}
+                                            </Space>
+                                          </div>
+                                          <Text>{issue.message}</Text>
+                                          <Text type="secondary">{qualityIssueActionText(issue)}</Text>
+                                          {sourceExcerpt && (
+                                            <div className="quality-source-snippet">
+                                              <Text type="secondary">
+                                                原文定位：第 {sourceChunk?.page_no ?? "-"} 页
+                                                {sourceChunk?.chunk_index ? ` · chunk ${sourceChunk.chunk_index}` : ""}
+                                              </Text>
+                                              <p>{sourceExcerpt}</p>
+                                            </div>
+                                          )}
+                                          <Button
+                                            size="small"
+                                            disabled={!semanticSection}
+                                            loading={Boolean(semanticSection && sectionExtractingId === semanticSection.id)}
+                                            onClick={() => semanticSection && handleExtractSemanticSection(semanticSection)}
+                                          >
+                                            只重抽这一段
+                                          </Button>
+                                        </div>
+                                      );
+                                    })
+                                  ) : (
+                                    <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无可展示的阻断明细" />
+                                  )}
+                                </div>
+                              </Spin>
+                              <div className="quality-gate-toolbar">
+                                <Text type="secondary">高级操作</Text>
+                                <Button size="small" loading={sectionPlanLoading} onClick={handleReplanSemanticSections}>
+                                  重新规划章节
+                                </Button>
+                                <Button size="small" disabled={!matrixRows.length} onClick={() => activateWorkflowStep("review")}>
+                                  打开审阅台
+                                </Button>
+                              </div>
+                            </details>
+                          </>
+                        )}
+                      </div>
                     )
                   },
-                  {
-                    key: "evidence",
+	                  {
+	                    key: "evidence",
                     label: "证据处理",
                     children: (
                       <div className="workspace-panel evidence-work-panel">
@@ -6458,39 +7243,42 @@ export function App() {
                       </div>
                     )}
 
-                    <div className="quick-prompts compact">
-                      {quickPrompts.map((prompt) => (
-                        <Button size="small" key={prompt} onClick={() => handleQuickPrompt(prompt)}>
-                          {prompt}
-                        </Button>
-                      ))}
-                    </div>
-
-                    {assistantMessages.map((item) => (
-                      <div className="assistant-message" key={item.key}>
-                        <div className="message-title-row">
-                          <Text strong>{item.title}</Text>
-                          <Button type="text" size="small" icon={<CloseOutlined />} />
-                        </div>
-                        <p>{item.content}</p>
-                        <Space size={8}>
-                          <Button
-                            size="small"
-                            type="primary"
-                            onClick={() => handleAssistantMessageAction(item)}
-                          >
-                            {item.action}
+                    {!focusQualityAssistant && (
+                      <div className="quick-prompts compact">
+                        {quickPrompts.map((prompt) => (
+                          <Button size="small" key={prompt} onClick={() => handleQuickPrompt(prompt)}>
+                            {prompt}
                           </Button>
-                          <Button size="small">转为任务</Button>
-                        </Space>
+                        ))}
                       </div>
-                    ))}
+                    )}
+
+                    {!focusQualityAssistant &&
+                      assistantMessages.map((item) => (
+                        <div className="assistant-message" key={item.key}>
+                          <div className="message-title-row">
+                            <Text strong>{item.title}</Text>
+                            <Button type="text" size="small" icon={<CloseOutlined />} />
+                          </div>
+                          <p>{item.content}</p>
+                          <Space size={8}>
+                            <Button
+                              size="small"
+                              type="primary"
+                              onClick={() => handleAssistantMessageAction(item)}
+                            >
+                              {item.action}
+                            </Button>
+                            <Button size="small">转为任务</Button>
+                          </Space>
+                        </div>
+                      ))}
 
                     <div className="operation-log">
                       <Text strong>操作日志</Text>
                       {displayedLogs.length ? (
-                        displayedLogs.map((log) => (
-                          <div className="log-line" key={log}>
+                        displayedLogs.map((log, index) => (
+                          <div className="log-line" key={`${log}-${index}`}>
                             {log}
                           </div>
                         ))

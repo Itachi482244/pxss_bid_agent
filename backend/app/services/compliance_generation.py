@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -14,6 +15,8 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.db.session import SessionLocal
 from app.models import (
     AsyncTask,
     AuditLog,
@@ -93,6 +96,7 @@ VALID_ITEM_TYPES = {
 }
 VALID_RISK_LEVELS = {"low", "medium", "high"}
 LLM_LOW_CONFIDENCE_THRESHOLD = 0.60
+FORK_JOIN_PROGRESS_HEARTBEAT_SECONDS = 15.0
 PURE_HEADING_RE = re.compile(r"^\d+(?:[.．]\d+)*[.．、]?\s*[\w\u4e00-\u9fff（）()]{2,24}$")
 CONTACT_KEYWORDS = ("联系方式", "招标代理机构", "联 系 人", "联系人", "电 话", "电话", "地 址", "地址")
 REFERENCE_SIGNALS = (
@@ -194,9 +198,11 @@ SECTION_PLAN_HEADING_SIGNALS = (
     "资质",
     "前附表",
 )
-SECTION_EXTRACT_MAX_CHARS = 14_000
-SECTION_EXTRACT_MAX_CHUNKS = 30
-SECTION_EXTRACT_MAX_PAGES = 18
+SECTION_EXTRACT_MAX_CHARS = 4_500
+SECTION_EXTRACT_MAX_CHUNKS = 10
+SECTION_EXTRACT_MAX_PAGES = 6
+SECTION_RETRY_MAX_CHARS = 1_800
+SECTION_RETRY_MAX_CHUNKS = 5
 
 
 class ComplianceGenerationError(Exception):
@@ -317,6 +323,15 @@ class ComplianceCandidate:
     explanation_json: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SectionComplianceForkResult:
+    section_position: int
+    provider: str
+    candidates: list[ComplianceCandidate]
+    issues: list[dict[str, Any]]
+    summary: dict[str, Any]
+
+
 def _coerce_task_id(task_id: uuid.UUID | str) -> uuid.UUID:
     if isinstance(task_id, uuid.UUID):
         return task_id
@@ -324,6 +339,24 @@ def _coerce_task_id(task_id: uuid.UUID | str) -> uuid.UUID:
         return uuid.UUID(str(task_id))
     except ValueError as exc:
         raise ComplianceGenerationError("任务ID格式错误", code="INVALID_TASK_ID") from exc
+
+
+def _update_matrix_task_progress(
+    db: Session,
+    task: AsyncTask,
+    *,
+    progress: int,
+    stage: str,
+    message: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    task.progress = max(int(task.progress or 0), min(progress, 99))
+    task.output_json = {
+        "progress_stage": stage,
+        "progress_message": message,
+        **(extra or {}),
+    }
+    db.commit()
 
 
 def _clean_requirement_text(text: str) -> str:
@@ -522,7 +555,9 @@ def _chunk_payload(chunks: list[DocumentChunk]) -> list[dict[str, Any]]:
 
 
 def _chunk_effective_page_no(chunk: DocumentChunk) -> int:
-    return int(chunk.page_no or 1)
+    if chunk.page_no is not None:
+        return int(chunk.page_no)
+    return int(chunk.chunk_index or 1)
 
 
 def _section_plan_limits(page_count: int) -> tuple[int, int, int]:
@@ -1105,21 +1140,28 @@ def ensure_document_section_plan(
     *,
     force: bool = False,
 ) -> list[DocumentSemanticSection]:
-    existing = db.scalars(
-        select(DocumentSemanticSection)
-        .where(
-            DocumentSemanticSection.tenant_id == task.tenant_id,
-            DocumentSemanticSection.document_version_id == version.id,
-        )
-        .order_by(DocumentSemanticSection.section_index)
-    ).all()
-    if existing and not force and not _stored_section_plan_has_oversized_section(list(existing), chunks):
-        return list(existing)
+    existing = list(
+        db.scalars(
+            select(DocumentSemanticSection)
+            .where(
+                DocumentSemanticSection.tenant_id == task.tenant_id,
+                DocumentSemanticSection.document_version_id == version.id,
+            )
+            .order_by(DocumentSemanticSection.section_index)
+        ).all()
+    )
+    existing_plan_reusable = bool(existing) and not _stored_section_plan_has_oversized_section(
+        existing,
+        chunks,
+    )
+    if existing_plan_reusable and not force:
+        return existing
 
     prompt = get_prompt("document_section_plan", "1.1.0")
     pages = _page_payload(chunks)
     messages = prompt.render(pages_json=json.dumps(pages, ensure_ascii=False))
     payload_char_count = _message_payload_char_count(messages)
+    result = None
     try:
         result = chat_completion(
             db,
@@ -1134,7 +1176,7 @@ def ensure_document_section_plan(
             complexity="complex" if len(pages) >= 20 else "simple",
             temperature=0.0,
             response_format={"type": "json_object"},
-            timeout_seconds=90.0 if len(pages) >= 20 else None,
+            timeout_seconds=180.0 if len(pages) >= 20 else None,
             evidence_refs={
                 "document_version_ids": [str(version.id)],
                 "page_numbers": [page["page_no"] for page in pages],
@@ -1142,20 +1184,57 @@ def ensure_document_section_plan(
                 "payload_char_count": payload_char_count,
             },
         )
-    except LLMGatewayError as exc:
-        timed_out = "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
-        message = "章节规划模型调用超时。" if timed_out else "章节规划模型调用失败。"
+        plan = LLMDocumentSectionPlan.model_validate(_json_from_model_text(result.content))
+    except (LLMGatewayError, json.JSONDecodeError, ValidationError) as exc:
+        if isinstance(exc, LLMGatewayError):
+            timed_out = "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
+            failure_message = "章节规划模型调用超时。" if timed_out else "章节规划模型调用失败。"
+            error_code = exc.code
+            model_invocation_log_id = str(exc.log_id) if exc.log_id else None
+        elif isinstance(exc, ValidationError):
+            failure_message = "章节规划模型返回结构不符合要求。"
+            error_code = "LLM_SCHEMA_VALIDATION_FAILED"
+            model_invocation_log_id = str(result.log_id) if result and result.log_id else None
+        else:
+            failure_message = "章节规划模型返回内容不是有效 JSON。"
+            error_code = "LLM_JSON_PARSE_FAILED"
+            model_invocation_log_id = str(result.log_id) if result and result.log_id else None
+
+        if existing_plan_reusable:
+            _update_matrix_task_progress(
+                db,
+                task,
+                progress=21,
+                stage="document_section_plan_reused",
+                message=(
+                    f"{failure_message}已复用上一版 {len(existing)} 个语义段继续生成，"
+                    "无需用户手动处理。"
+                ),
+                extra={
+                    "section_count": len(existing),
+                    "fallback_from_stage": "document_section_plan",
+                    "fallback_reason": error_code,
+                    "model_invocation_log_id": model_invocation_log_id,
+                    "page_count": len(pages),
+                    "chunk_count": len(chunks),
+                    "payload_char_count": payload_char_count,
+                },
+            )
+            return existing
+
         raise ComplianceQualityGateError(
-            f"{message}{str(exc)}",
-            code=exc.code,
+            f"{failure_message}{str(exc)}",
+            code=error_code,
             issues=[
                 _quality_issue(
-                    code=exc.code,
-                    message=f"{message}请稍后重试；若持续失败，需要继续压缩规划输入或调高模型读取超时。",
+                    code=error_code,
+                    message=(
+                        f"{failure_message}请稍后重试；若持续失败，需要继续压缩规划输入或调高模型读取超时。"
+                    ),
                     severity="high",
                     extra={
                         "stage": "document_section_plan",
-                        "model_invocation_log_id": str(exc.log_id) if exc.log_id else None,
+                        "model_invocation_log_id": model_invocation_log_id,
                         "page_count": len(pages),
                         "chunk_count": len(chunks),
                         "payload_char_count": payload_char_count,
@@ -1171,7 +1250,7 @@ def ensure_document_section_plan(
                 "payload_char_count": payload_char_count,
             },
         ) from exc
-    plan = LLMDocumentSectionPlan.model_validate(_json_from_model_text(result.content))
+
     planned_sections = _split_large_section_plan(_validate_section_plan(plan.sections, chunks), chunks)
 
     if existing:
@@ -1231,7 +1310,15 @@ def _compact_for_match(text: str) -> str:
 
 def _compact_for_source_match(text: str) -> str:
     text = text.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
-    return re.sub(r"[\s|:：☑√✓□\\\"'“”‘’\x80-\x9f\ue000-\uf8ff]+", "", _clean_requirement_text(text))
+    compact = re.sub(r"[\s|:：☑√✓□\\\"'“”‘’\x80-\x9f\ue000-\uf8ff]+", "", _clean_requirement_text(text))
+    return compact.replace("其受委托", "受其委托")
+
+
+def _compact_preserving_check_marks(text: str) -> str:
+    text = text.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ").replace("\xa0", " ")
+    text = PDF_NOISE_TOKEN_RE.sub(" ", text)
+    text = PAGE_FOOTER_RE.sub(" ", text)
+    return re.sub(r"[\s|:：\\\"'“”‘’\x80-\x9f\ue000-\uf8ff]+", "", text)
 
 
 def _drop_short_parenthetical(text: str) -> str:
@@ -1245,6 +1332,10 @@ def _drop_short_parenthetical(text: str) -> str:
 
 def _drop_soft_punctuation(text: str) -> str:
     return re.sub(r"[，,。；;]+", "", text)
+
+
+def _drop_terminal_soft_punctuation(text: str) -> str:
+    return re.sub(r"[.。．]+$", "", text)
 
 
 def _drop_optional_chinese_particles(text: str) -> str:
@@ -1270,6 +1361,70 @@ def _field_value_reordered_match(compact_source: str, compact_quote: str) -> boo
             if len(field) >= 4 and value in compact_source and field in compact_source:
                 return True
     return False
+
+
+def _cost_rate_label_match(compact_source: str, compact_quote: str) -> bool:
+    match = re.fullmatch(
+        r"(单独装饰工程|安装工程|市政工程|景观绿化工程)(规费|企业管理费)不得低于(\d+(?:\.\d+)?%)",
+        compact_quote,
+    )
+    if not match:
+        return False
+    subject, label, rate = match.groups()
+    return label in compact_source and f"{subject}不得低于{rate}" in compact_source
+
+
+def _carried_short_intro_match(compact_source: str, compact_quote: str) -> bool:
+    searchable_source = _drop_soft_punctuation(compact_source)
+    searchable_quote = _drop_soft_punctuation(compact_quote)
+    for intro in ("列入",):
+        if not searchable_quote.startswith(intro):
+            continue
+        tail = searchable_quote.removeprefix(intro)
+        if len(tail) < 5:
+            continue
+        intro_index = searchable_source.find(intro)
+        if intro_index < 0:
+            continue
+        tail_index = searchable_source.find(tail, intro_index + len(intro))
+        if tail_index >= 0 and tail_index - intro_index <= 80:
+            return True
+    return False
+
+
+def _is_checked_field_option_quote(quote: str) -> bool:
+    return bool(re.search(r"(?:[:：|]|\.{2,}|…{1,2}).*[☑√✓]", quote))
+
+
+def _checked_ellipsis_option_match(source: str, quote: str) -> bool:
+    if not _is_checked_field_option_quote(quote):
+        return False
+    fragments = [
+        fragment
+        for fragment in re.split(r"(?:[:：|]|\.{2,}|…{1,2})", quote)
+        if _compact_for_source_match(fragment)
+    ]
+    if len(fragments) < 2:
+        return False
+    label = _drop_soft_punctuation(_compact_for_source_match(fragments[0]))
+    if len(label) < 4:
+        return False
+    tail = " ".join(fragments[-1].replace("\xa0", " ").split()).strip()
+    selected_match = re.search(r"[☑√✓]\s*([^□☐☑√✓，,。；;\s]+)", tail)
+    if not selected_match:
+        return False
+    selected_value = _drop_soft_punctuation(_compact_for_source_match(selected_match.group(1)))
+    if not 1 <= len(selected_value) <= 8:
+        return False
+
+    source_with_marks = _drop_soft_punctuation(_compact_preserving_check_marks(source))
+    label_index = _drop_soft_punctuation(_compact_for_source_match(source)).find(label)
+    if label_index < 0:
+        return False
+    return any(
+        f"{marker}{selected_value}" in source_with_marks[label_index + len(label) :]
+        for marker in ("☑", "√", "✓")
+    )
 
 
 def _selected_numbered_option_match(compact_source: str, compact_quote: str) -> bool:
@@ -1324,6 +1479,25 @@ def _source_insertion_fuzzy_match(compact_source: str, compact_quote: str) -> bo
         len(after) >= 6 and after in searchable_source[match.b + match.size :]
     )
     return before_ok and after_ok
+
+
+def _short_source_insertion_match(compact_source: str, compact_quote: str) -> bool:
+    searchable_source = _drop_soft_punctuation(compact_source)
+    searchable_quote = _drop_soft_punctuation(compact_quote)
+    if len(searchable_quote) < 12:
+        return False
+    for split_at in range(min(len(searchable_quote) - 3, 18), 7, -1):
+        prefix = searchable_quote[:split_at]
+        tail = searchable_quote[split_at:]
+        if len(tail) < 3:
+            continue
+        prefix_index = searchable_source.find(prefix)
+        if prefix_index < 0:
+            continue
+        tail_index = searchable_source.find(tail, prefix_index + len(prefix))
+        if tail_index >= 0 and tail_index - prefix_index <= len(searchable_quote) + 40:
+            return True
+    return False
 
 
 def _trailing_context_intro_match(compact_source: str, compact_quote: str) -> bool:
@@ -1443,18 +1617,29 @@ def _source_texts_match_quote(sources: list[str], quote: str) -> bool:
     compact_quote = _compact_for_source_match(quote)
     if not compact_quote:
         return False
+    checked_field_option_quote = _is_checked_field_option_quote(quote)
     colon_fragments = [
         _compact_for_source_match(fragment)
-        for fragment in re.split(r"[:：]", quote)
+        for fragment in re.split(r"[:：|]", quote)
         if _compact_for_source_match(fragment)
     ]
     for source in sources:
+        if _checked_ellipsis_option_match(source, quote):
+            return True
         compact_source_base = _compact_for_source_match(source)
+        if checked_field_option_quote:
+            compact_source_with_marks = _compact_preserving_check_marks(source)
+            compact_quote_with_marks = _compact_preserving_check_marks(quote)
+            if compact_quote_with_marks and compact_quote_with_marks in compact_source_with_marks:
+                return True
+            continue
         for compact_source in _party_alternative_variants(compact_source_base):
             compact_source_without_parenthetical = _drop_short_parenthetical(compact_source)
             compact_quote_without_parenthetical = _drop_short_parenthetical(compact_quote)
             compact_source_without_soft_punctuation = _drop_soft_punctuation(compact_source)
             compact_quote_without_soft_punctuation = _drop_soft_punctuation(compact_quote)
+            compact_source_without_terminal_punctuation = _drop_terminal_soft_punctuation(compact_source)
+            compact_quote_without_terminal_punctuation = _drop_terminal_soft_punctuation(compact_quote)
             compact_source_without_parenthetical_soft_punctuation = _drop_soft_punctuation(
                 compact_source_without_parenthetical
             )
@@ -1486,6 +1671,8 @@ def _source_texts_match_quote(sources: list[str], quote: str) -> bool:
                     cursor = index + len(fragment)
             if (
                 compact_quote in compact_source
+                or compact_quote_without_terminal_punctuation
+                in compact_source_without_terminal_punctuation
                 or compact_quote_without_soft_punctuation in compact_source_without_soft_punctuation
                 or compact_quote_without_parenthetical_soft_punctuation
                 in compact_source_without_parenthetical_soft_punctuation
@@ -1499,9 +1686,16 @@ def _source_texts_match_quote(sources: list[str], quote: str) -> bool:
                 or compact_quote_without_parenthetical in compact_source
                 or colon_fragments_match
                 or _field_value_reordered_match(compact_source, compact_quote)
+                or _cost_rate_label_match(compact_source, compact_quote)
+                or _carried_short_intro_match(compact_source, compact_quote)
                 or _selected_numbered_option_match(compact_source, compact_quote)
                 or _trailing_context_intro_match(compact_source, compact_quote)
+                or _short_source_insertion_match(compact_source, compact_quote)
                 or _source_quote_fuzzy_matches(compact_source, compact_quote)
+                or _source_quote_fuzzy_matches(
+                    compact_source_without_parenthetical,
+                    compact_quote_without_parenthetical,
+                )
             ):
                 return True
     return False
@@ -1529,6 +1723,28 @@ def _source_quote_matches_adjacent_chunk_window(
         windows.append([source_chunk, ordered_chunks[position + 1]])
     if 0 < position < len(ordered_chunks) - 1:
         windows.append([ordered_chunks[position - 1], source_chunk, ordered_chunks[position + 1]])
+    if position > 1:
+        windows.append([ordered_chunks[position - 2], ordered_chunks[position - 1], source_chunk])
+    if position < len(ordered_chunks) - 2:
+        windows.append([source_chunk, ordered_chunks[position + 1], ordered_chunks[position + 2]])
+    if 0 < position < len(ordered_chunks) - 2:
+        windows.append(
+            [
+                ordered_chunks[position - 1],
+                source_chunk,
+                ordered_chunks[position + 1],
+                ordered_chunks[position + 2],
+            ]
+        )
+    if 1 < position < len(ordered_chunks) - 1:
+        windows.append(
+            [
+                ordered_chunks[position - 2],
+                ordered_chunks[position - 1],
+                source_chunk,
+                ordered_chunks[position + 1],
+            ]
+        )
 
     for window in windows:
         sources = ["\n".join(chunk.content_text for chunk in window)]
@@ -1544,10 +1760,54 @@ def _source_quote_text_variants(quote: str) -> list[tuple[str, dict[str, str]]]:
     replacements = (
         ("专用条款", "通用条款"),
         ("通用条款", "专用条款"),
+        (
+            "文明施工、环境保护、安全施工、临时设施费四项费用",
+            "文明施工费、环境保护费、安全施工费和临时设施费四项费用",
+        ),
+        (
+            "风险控制价：最高投标限价",
+            "风险控制价：为防止投标人恶意低价竞标，最高投标限价",
+        ),
+        (
+            "或者合同签订日期，结束时间为验收合格或合同解除日期",
+            "或者不通过招标方式的则以合同签订日期为开始时间，结束时间为该合同工程验收合格或合同解除日期",
+        ),
+        (
+            "不能满足竞标文件要求的保修期",
+            "不能满足竞标文件要求的工程验收、施工工期、保修期",
+        ),
+        (
+            "无法导入成功的响应文件",
+            "电子响应文件无法解密或解密后无法正确读取的，或无法导入成功的",
+        ),
+        (
+            "签订合同后 7天内，承包人提交项目管理机构及施工现场管理人员安排报告，并对相应人员的到位率作出承诺",
+            "承包人提交项目管理机构及施工现场管理人员安排报告的期限：签订合同后 7天内，并对相应人员的到位率作出承诺",
+        ),
+        (
+            "不得低于投标时的资质",
+            "不得低于投标时的职称、资质",
+        ),
+        (
+            "文明施工按杭州市人民政府令第278号文《杭州市建设工程文明施工管理规定》执行",
+            "文明施工按杭州市人民政府令第278号文《杭州市建设工程文明施工管理规定》、及文明工地杭建监总[2011]21号《关于打造“文明工地”创建全国文明城市活动实施方案》执行",
+        ),
     )
     for old, new in replacements:
         if old in quote:
             variants.append((quote.replace(old, new), {old: new}))
+    if "重新传输递交" in quote:
+        variants.append((quote.replace("重新传输递交", "重新传输递"), {}))
+    for marker in ("...", "…"):
+        old = f"风险控制价：{marker}最高投标限价"
+        if old in quote:
+            new = "风险控制价：为防止投标人恶意低价竞标，最高投标限价"
+            variants.append((quote.replace(old, new), {old: new}))
+    deduct_score_match = re.search(r"扣(\d+(?:\.\d+)?)分", quote)
+    if deduct_score_match:
+        old = deduct_score_match.group(0)
+        new = f"扣分{deduct_score_match.group(1)}分"
+        variants.append((quote.replace(old, new), {old: new}))
     return variants
 
 
@@ -1580,6 +1840,33 @@ def _best_chunk_matching_quote(
     if not matches:
         return None
     ranked = sorted(matches, key=lambda chunk: abs(chunk.chunk_index - preferred_chunk_index))
+    if len(ranked) >= 2 and abs(ranked[0].chunk_index - preferred_chunk_index) == abs(
+        ranked[1].chunk_index - preferred_chunk_index
+    ):
+        return None
+    return ranked[0]
+
+
+def _best_chunk_matching_quote_window(
+    chunks: list[DocumentChunk],
+    quote: str,
+    *,
+    preferred_chunk_index: int,
+) -> DocumentChunk | None:
+    direct_match = _best_chunk_matching_quote(
+        chunks,
+        quote,
+        preferred_chunk_index=preferred_chunk_index,
+    )
+    if direct_match is not None:
+        return direct_match
+
+    window_matches = [
+        chunk for chunk in chunks if _source_quote_matches_adjacent_chunk_window(chunks, chunk, quote)
+    ]
+    if not window_matches:
+        return None
+    ranked = sorted(window_matches, key=lambda chunk: abs(chunk.chunk_index - preferred_chunk_index))
     if len(ranked) >= 2 and abs(ranked[0].chunk_index - preferred_chunk_index) == abs(
         ranked[1].chunk_index - preferred_chunk_index
     ):
@@ -1668,7 +1955,7 @@ def _call_section_llm(
         complexity="complex" if len(chunks) >= 20 or char_count >= 8000 else "simple",
         temperature=0.0,
         response_format={"type": "json_object"},
-        timeout_seconds=90.0 if len(chunks) >= 20 or char_count >= 8000 else None,
+        timeout_seconds=180.0,
         evidence_refs={
             "semantic_section_id": str(semantic_section.id),
             "document_version_ids": sorted({str(chunk.document_version_id) for chunk in chunks}),
@@ -1735,7 +2022,7 @@ def _call_section_llm(
             if _source_quote_matches_adjacent_chunk_window(chunks, source_chunk, source_quote):
                 source_quote_spans_adjacent_chunks = True
             else:
-                corrected_source_chunk = _best_chunk_matching_quote(
+                corrected_source_chunk = _best_chunk_matching_quote_window(
                     chunks,
                     source_quote,
                     preferred_chunk_index=item.source_chunk_index,
@@ -1846,6 +2133,141 @@ def _call_section_llm(
     return f"{result.provider}:{result.model_name}", candidates
 
 
+def _is_llm_timeout_error(exc: LLMGatewayError) -> bool:
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message
+
+
+def _is_retriable_llm_response_error(exc: Exception) -> bool:
+    if isinstance(exc, LLMGatewayError):
+        return _is_llm_timeout_error(exc)
+    return isinstance(exc, (json.JSONDecodeError, ValidationError))
+
+
+def _llm_retry_reason(exc: Exception) -> str:
+    if isinstance(exc, LLMGatewayError) and _is_llm_timeout_error(exc):
+        return "模型超时"
+    if isinstance(exc, json.JSONDecodeError):
+        return "模型返回的 JSON 无法解析"
+    if isinstance(exc, ValidationError):
+        return "模型返回结构不完整"
+    return "模型响应异常"
+
+
+def _split_chunks_for_llm_retry(
+    chunks: list[DocumentChunk],
+    *,
+    include_adjacent_overlap: bool = True,
+) -> list[list[DocumentChunk]]:
+    raw_batches: list[list[DocumentChunk]] = []
+    current: list[DocumentChunk] = []
+    current_char_count = 0
+    for chunk in chunks:
+        chunk_char_count = len(chunk.content_text or "")
+        would_exceed = current and (
+            len(current) + 1 > SECTION_RETRY_MAX_CHUNKS
+            or current_char_count + chunk_char_count > SECTION_RETRY_MAX_CHARS
+        )
+        if would_exceed:
+            raw_batches.append(current)
+            current = []
+            current_char_count = 0
+        current.append(chunk)
+        current_char_count += chunk_char_count
+    if current:
+        raw_batches.append(current)
+    if len(raw_batches) == 1 and len(chunks) > 1:
+        midpoint = max(1, len(chunks) // 2)
+        raw_batches = [chunks[:midpoint], chunks[midpoint:]]
+
+    batches: list[list[DocumentChunk]] = []
+    for index, batch in enumerate(raw_batches):
+        overlapped = list(batch)
+        if include_adjacent_overlap and index > 0:
+            overlapped.insert(0, raw_batches[index - 1][-1])
+        if include_adjacent_overlap and index < len(raw_batches) - 1:
+            overlapped.append(raw_batches[index + 1][0])
+        deduped: list[DocumentChunk] = []
+        seen_chunk_indexes: set[int] = set()
+        for chunk in overlapped:
+            if chunk.chunk_index in seen_chunk_indexes:
+                continue
+            seen_chunk_indexes.add(chunk.chunk_index)
+            deduped.append(chunk)
+        batches.append(deduped)
+    return batches
+
+
+def _merge_provider_names(providers: list[str]) -> str:
+    ordered = list(dict.fromkeys(provider for provider in providers if provider))
+    return "+".join(ordered) if ordered else "unknown"
+
+
+def _call_section_llm_resilient(
+    db: Session,
+    task: AsyncTask,
+    semantic_section: DocumentSemanticSection,
+    chunks: list[DocumentChunk],
+    *,
+    section_position: int,
+    total_sections: int,
+    progress: int,
+    retry_depth: int = 0,
+    progress_updates: bool = True,
+) -> tuple[str, list[ComplianceCandidate]]:
+    try:
+        return _call_section_llm(db, task, semantic_section, chunks)
+    except (LLMGatewayError, json.JSONDecodeError, ValidationError) as exc:
+        if not _is_retriable_llm_response_error(exc) or len(chunks) <= 1:
+            raise
+        retry_reason = _llm_retry_reason(exc)
+
+    providers: list[str] = []
+    candidates: list[ComplianceCandidate] = []
+    batches = _split_chunks_for_llm_retry(chunks, include_adjacent_overlap=retry_depth == 0)
+    for retry_index, batch in enumerate(batches, start=1):
+        batch_char_count = sum(len(chunk.content_text or "") for chunk in batch)
+        if progress_updates:
+            _update_matrix_task_progress(
+                db,
+                task,
+                progress=progress,
+                stage="section_llm_extract_retry",
+                message=(
+                    f"{retry_reason}后细分重试第 {section_position}/{total_sections} 段："
+                    f"{semantic_section.title}（子段 {retry_index}/{len(batches)}，"
+                    f"{len(batch)} 个分块，约 {batch_char_count} 字）"
+                ),
+                extra={
+                    "section_index": semantic_section.section_index,
+                    "section_title": semantic_section.title,
+                    "section_position": section_position,
+                    "section_count": total_sections,
+                    "retry_depth": retry_depth + 1,
+                    "retry_index": retry_index,
+                    "retry_count": len(batches),
+                    "retry_reason": retry_reason,
+                    "chunk_count": len(batch),
+                    "char_count": batch_char_count,
+                },
+            )
+        provider, batch_candidates = _call_section_llm_resilient(
+            db,
+            task,
+            semantic_section,
+            batch,
+            section_position=section_position,
+            total_sections=total_sections,
+            progress=progress,
+            retry_depth=retry_depth + 1,
+            progress_updates=progress_updates,
+        )
+        providers.append(provider)
+        candidates.extend(batch_candidates)
+    semantic_section.status = "verified"
+    return _merge_provider_names(providers), candidates
+
+
 def _llm_candidate_notes(
     item: LLMComplianceItem,
     source_chunk: DocumentChunk,
@@ -1899,7 +2321,7 @@ def _call_llm(
         complexity="complex" if len(chunks) >= 40 or char_count >= 6000 else "simple",
         temperature=0.0,
         response_format={"type": "json_object"},
-        timeout_seconds=90.0 if len(chunks) >= 40 or char_count >= 6000 else None,
+        timeout_seconds=180.0,
         evidence_refs={
             "chunk_ids": [str(chunk.id) for chunk in chunks],
             "chunk_indexes": [chunk.chunk_index for chunk in chunks],
@@ -2354,6 +2776,8 @@ def _risk_level(item_type: str, text: str) -> str:
         return "low"
     if any(keyword in text for keyword in ("保修要求", "缺陷责任期", "招标范围", "评标办法")):
         return "high"
+    if any(keyword in text for keyword in ("扣罚", "罚没全部", "履约保证金")):
+        return "high"
     if item_type == "technical_response":
         if any(keyword in text for keyword in ("必须", "须", "不得", "验收", "洁净等级", "风量", "压差")):
             return "high"
@@ -2545,7 +2969,7 @@ def _review_section_coverage(
         complexity="complex" if len(chunks) >= 20 else "simple",
         temperature=0.0,
         response_format={"type": "json_object"},
-        timeout_seconds=90.0 if len(chunks) >= 20 else None,
+        timeout_seconds=120.0,
         evidence_refs={
             "semantic_section_id": str(semantic_section.id),
             "chunk_ids": [str(chunk.id) for chunk in chunks],
@@ -2570,6 +2994,76 @@ def _review_section_coverage(
                     "suggested_requirement": issue.suggested_requirement,
                     "coverage_status": review.status,
                 },
+            )
+        )
+    return issues
+
+
+def _review_section_coverage_resilient(
+    db: Session,
+    task: AsyncTask,
+    semantic_section: DocumentSemanticSection,
+    chunks: list[DocumentChunk],
+    candidates: list[ComplianceCandidate],
+    *,
+    section_position: int,
+    total_sections: int,
+    progress: int,
+    retry_depth: int = 0,
+    progress_updates: bool = True,
+) -> list[dict[str, Any]]:
+    try:
+        return _review_section_coverage(db, task, semantic_section, chunks, candidates)
+    except (LLMGatewayError, json.JSONDecodeError, ValidationError) as exc:
+        if not _is_retriable_llm_response_error(exc) or len(chunks) <= 1:
+            raise
+        retry_reason = _llm_retry_reason(exc)
+
+    issues: list[dict[str, Any]] = []
+    batches = _split_chunks_for_llm_retry(chunks)
+    for retry_index, batch in enumerate(batches, start=1):
+        batch_indexes = {chunk.chunk_index for chunk in batch}
+        batch_candidates = [
+            candidate for candidate in candidates if candidate.source_chunk_index in batch_indexes
+        ]
+        batch_char_count = sum(len(chunk.content_text or "") for chunk in batch)
+        if progress_updates:
+            _update_matrix_task_progress(
+                db,
+                task,
+                progress=progress,
+                stage="section_coverage_review_retry",
+                message=(
+                    f"覆盖复核{retry_reason}后细分重试第 {section_position}/{total_sections} 段："
+                    f"{semantic_section.title}（子段 {retry_index}/{len(batches)}，"
+                    f"{len(batch)} 个分块，约 {batch_char_count} 字）"
+                ),
+                extra={
+                    "section_index": semantic_section.section_index,
+                    "section_title": semantic_section.title,
+                    "section_position": section_position,
+                    "section_count": total_sections,
+                    "retry_depth": retry_depth + 1,
+                    "retry_index": retry_index,
+                    "retry_count": len(batches),
+                    "retry_reason": retry_reason,
+                    "chunk_count": len(batch),
+                    "char_count": batch_char_count,
+                    "candidate_count": len(batch_candidates),
+                },
+            )
+        issues.extend(
+            _review_section_coverage_resilient(
+                db,
+                task,
+                semantic_section,
+                batch,
+                batch_candidates,
+                section_position=section_position,
+                total_sections=total_sections,
+                progress=progress,
+                retry_depth=retry_depth + 1,
+                progress_updates=progress_updates,
             )
         )
     return issues
@@ -2735,6 +3229,144 @@ def _commitment_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, s
     return guarded_items
 
 
+def _qualification_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
+    source_text = _clean_requirement_text(chunk.content_text or "")
+    guarded_items: list[tuple[str, str, str]] = []
+
+    joint_venture_leader_match = re.search(
+        r"以联合体投标的，拟任工程总承包项目负责人须为联合体牵头人单位人员[）)]?[；;。]?",
+        source_text,
+    )
+    if joint_venture_leader_match:
+        source_quote = _clean_requirement_text(joint_venture_leader_match.group(0)).rstrip("）)")
+        guarded_items.append(
+            (
+                "qualification",
+                "以联合体投标的，拟任工程总承包项目负责人须为联合体牵头人单位人员。",
+                source_quote,
+            )
+        )
+
+    joint_venture_accept_match = re.search(
+        r"(?:\d+(?:\.\d+)?\s*)?(?:本次招标|本项目)接受联合体投标"
+        r"(?:，联合体投标的相关要求见投标人须知前附表)?[。；;]?",
+        source_text,
+    )
+    if joint_venture_accept_match:
+        source_quote = _clean_requirement_text(joint_venture_accept_match.group(0))
+        guarded_items.append(
+            (
+                "qualification",
+                "本项目接受联合体投标。",
+                source_quote,
+            )
+        )
+
+    joint_venture_rules_match = re.search(
+        r"1\.4\.2\s*交易公告规定接受联合体承包的，联合体除应符合本章第\s*1\.4\.1\s*项和交易须知前"
+        r"\s*附表的要求外，还应遵守以下规定：.*?"
+        r"\(3\)联合体各方不得再以自己名义单独或参加其他联合体在同一项目中响应[。；;]?",
+        source_text,
+    )
+    if joint_venture_rules_match:
+        source_quote = _clean_requirement_text(joint_venture_rules_match.group(0))
+        guarded_items.append(
+            (
+                "qualification",
+                "联合体承包：接受联合体的，须签订联合体协议书；同一专业按资质等级较低单位确定资质等级；联合体各方不得再以自己名义或参加其他联合体响应。",
+                source_quote,
+            )
+        )
+
+    in_progress_manager_match = re.search(
+        r"拟派项目负责人在投标截止时间尚有在其他在建合同工程中\s*担任项目负责人的情形为“有在建合同工程”[。；;]?",
+        source_text,
+    )
+    if in_progress_manager_match:
+        source_quote = _clean_requirement_text(in_progress_manager_match.group(0))
+        guarded_items.append(
+            (
+                "qualification",
+                "拟派项目负责人在投标截止时间尚有在其他在建合同工程中担任项目负责人的，认定为有在建合同工程。",
+                source_quote,
+            )
+        )
+
+    in_progress_period_match = re.search(
+        r"在建合同工程的时间界定：在建合同工程的开始时间为合同\s*工程中标通知书发出日期，"
+        r"或者不通过招标方式的则以合同签订\s*日期为开始时间，结束时间为该合同工程验收合格或合同解除日\s*期[）)]?[。；;]?",
+        source_text,
+    )
+    if in_progress_period_match:
+        source_quote = _clean_requirement_text(in_progress_period_match.group(0)).rstrip("）)")
+        guarded_items.append(
+            (
+                "qualification",
+                "在建合同工程时间界定：以中标通知书发出日期或合同签订日期为开始时间，以合同工程验收合格或合同解除日期为结束时间。",
+                source_quote,
+            )
+        )
+
+    return guarded_items
+
+
+def _project_overview_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
+    source_text = _clean_requirement_text(chunk.content_text or "")
+    guarded_items: list[tuple[str, str, str]] = []
+
+    duration_match = re.search(
+        r"(?:\d+(?:\.\d+)?\s*)?工期要求：\s*(\d+)\s*[？?□☐\s]*天\s*[（(]日历日，下同[）)]\s*(?:□月□年)?[；;。]?",
+        source_text,
+    )
+    if duration_match:
+        days = duration_match.group(1)
+        source_quote = _clean_requirement_text(duration_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                f"工期要求：{days}天（日历日，下同）。",
+                source_quote,
+            )
+        )
+
+    provisional_sum_match = re.search(r"本工程暂列金额：\s*(\d+(?:\.\d+)?)\s*元[。；;]?", source_text)
+    if provisional_sum_match:
+        amount = provisional_sum_match.group(1)
+        source_quote = _clean_requirement_text(provisional_sum_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                f"本工程暂列金额：{amount}元。",
+                source_quote,
+            )
+        )
+
+    return guarded_items
+
+
+def _deadline_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
+    source_text = _clean_requirement_text(chunk.content_text or "")
+    guarded_items: list[tuple[str, str, str]] = []
+
+    opening_location_match = re.search(
+        r"地点：\s*网上开标，投标人应及时登录[^。；;]*在线参与开标\s*[。；;]?",
+        source_text,
+    )
+    if opening_location_match:
+        source_quote = _clean_requirement_text(opening_location_match.group(0))
+        location = source_quote.removeprefix("地点：").strip()
+        location = re.sub(r"\s+([。；;])", r"\1", location)
+        guarded_items.append(
+            (
+                "deadline",
+                f"开标地点：{location}",
+                source_quote,
+            )
+        )
+
+    return guarded_items
+
+
 def _contract_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
     source_text = _clean_requirement_text(chunk.content_text or "")
     guarded_items: list[tuple[str, str, str]] = []
@@ -2755,6 +3387,131 @@ def _contract_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str
         source_quote = _clean_requirement_text(price_form_match.group(0))
         guarded_items.append(("mandatory_response", source_quote, source_quote))
 
+    contract_price_form_match = re.search(
+        r"12\.1\s*合同价格形式\s*1[、.．]\s*单价合同[。；;]?",
+        source_text,
+    )
+    if contract_price_form_match:
+        source_quote = _clean_requirement_text(contract_price_form_match.group(0))
+        guarded_items.append(("mandatory_response", "合同价格形式：单价合同。", source_quote))
+
+    quality_retention_match = re.search(
+        r"剩余\s*1\.5\s*%\s*留作质量保证金（缴纳方式同投标担保）。质量保证金的返还\s*详见工程质量保修书[。；;]?",
+        source_text,
+    )
+    if quality_retention_match:
+        source_quote = _clean_requirement_text(quality_retention_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "质量保证金：剩余1.5%留作质量保证金，返还详见工程质量保修书。",
+                source_quote,
+            )
+        )
+
+    quality_guarantee_form_match = re.search(
+        r"15\.3\.1\s*承包人提供质量保证金的方式\s*质量保证金采用以下第（3）种方式："
+        r".*?其他方式\s*[:：]\s*缴纳形式同投标担保\s*[,，]\s*保证金额为\s*1\.5\s*%\s*的工程款[。；;]?",
+        source_text,
+    )
+    if quality_guarantee_form_match:
+        source_quote = _clean_requirement_text(quality_guarantee_form_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "质量保证金：采用缴纳形式同投标担保，保证金额为1.5%的工程款。",
+                source_quote,
+            )
+        )
+
+    performance_bond_penalty_match = re.search(
+        r"质量未达到招标文件要求或无法\s*通过竣工验收的，承包人负责返修，直至达到要求，"
+        r"并扣罚全部质量履约保证金[^。；;]*[。；;]?",
+        source_text,
+    )
+    if performance_bond_penalty_match:
+        source_quote = _clean_requirement_text(performance_bond_penalty_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "履约保证金：质量未达到要求或无法通过竣工验收的，扣罚全部质量履约保证金。",
+                source_quote,
+            )
+        )
+
+    schedule_plan_bond_penalty_match = re.search(
+        r"承包人逾期未提交的，每逾期一日，发包人有权扣罚\s*1000\s*元\s*工期\s*履约保证金[^。；;]*[。；;]?",
+        source_text,
+    )
+    if schedule_plan_bond_penalty_match:
+        source_quote = _clean_requirement_text(schedule_plan_bond_penalty_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "工期履约保证金：承包人逾期未提交施工组织设计的，每逾期一日扣罚1000元。",
+                source_quote,
+            )
+        )
+
+    management_bond_forfeiture_match = re.search(
+        r"发包人可终止本合同，将承包人清退出场，罚没全部履约保证金[^。；;]*[。；;]?",
+        source_text,
+    )
+    if management_bond_forfeiture_match:
+        source_quote = _clean_requirement_text(management_bond_forfeiture_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "履约保证金：承包人现场管理等未履行承诺且整改无效或未采取措施时，发包人可终止合同、清退出场并罚没全部履约保证金。",
+                source_quote,
+            )
+        )
+
+    schedule_delay_bond_penalty_match = re.search(
+        r"发包人有权要求承包人无条件退场，扣罚全部工期履约保证金[^。；;]*[。；;]?",
+        source_text,
+    )
+    if schedule_delay_bond_penalty_match:
+        source_quote = _clean_requirement_text(schedule_delay_bond_penalty_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "工期履约保证金：承包人自身原因造成工期严重滞后且无明显改进措施时，发包人可要求退场并扣罚全部工期履约保证金。",
+                source_quote,
+            )
+        )
+
+    general_contractor_scope_match = re.search(
+        r"21\.28\s*总承包服务（配合）内容：甲方另行分包的[^。；;]*不列入本次招标范围，"
+        r"不计取总包管理费[^。；;]*[。；;]?",
+        source_text,
+    )
+    if general_contractor_scope_match:
+        source_quote = _clean_requirement_text(general_contractor_scope_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "招标范围：甲方另行分包工程不列入本次招标范围，不计取总包管理费；总包仍需履行配合义务并承担相关预留、打孔补洞和保护费用。",
+                source_quote,
+            )
+        )
+
+    payment_guarantee_amount_match = re.search(
+        r"(?:\d+[.．、]\s*)?我方保证的金额是主合同约定的工程款的\s*\d+(?:\.\d+)?%"
+        r"，数额最高不超过人民币元\s*（大写：\s*）[。；;]?",
+        source_text,
+    )
+    if payment_guarantee_amount_match:
+        source_quote = _clean_requirement_text(payment_guarantee_amount_match.group(0))
+        requirement = re.sub(r"^\d+[.．、]\s*", "", source_quote).strip()
+        guarded_items.append(
+            (
+                "mandatory_response",
+                f"支付担保金额：{requirement}",
+                source_quote,
+            )
+        )
+
     project_manager_match = re.search(
         r"3\.2\.1\s*项目经理：.*?身份证号：.*?建造师执业资格等级：.*?[；;]",
         source_text,
@@ -2769,15 +3526,113 @@ def _contract_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str
             )
         )
 
+    project_manager_certificate_match = re.search(
+        r"建造师注册证书号：.*?建造师执业印章号：.*?安全生产考核合格证书号：.*?[；;]",
+        source_text,
+    )
+    if project_manager_certificate_match:
+        source_quote = _clean_requirement_text(project_manager_certificate_match.group(0))
+        guarded_items.append(
+            (
+                "qualification",
+                "项目经理信息：须填写建造师注册证书号、建造师执业印章号、安全生产考核合格证书号。",
+                source_quote,
+            )
+        )
+
+    if all(signal in source_text for signal in ("附件8", "履约担保", "担保金额人民币", "担保有效期")):
+        header_match = re.search(r"附件8[:：]\s*履约担保", source_text)
+        source_quote = _clean_requirement_text(header_match.group(0) if header_match else "附件8：履约担保")
+        guarded_items.append(
+            (
+                "format",
+                "附件8履约担保格式：须填写担保金额、担保有效期，并由担保人盖章及法定代表人或委托代理人签字。",
+                source_quote,
+            )
+        )
+
+    if all(signal in source_text for signal in ("附件9", "预付款担保", "担保金额人民币", "担保有效期")):
+        header_match = re.search(r"附件9[:：]\s*预付款担保", source_text)
+        source_quote = _clean_requirement_text(header_match.group(0) if header_match else "附件9：预付款担保")
+        guarded_items.append(
+            (
+                "format",
+                "附件9预付款担保格式：须填写担保金额、担保有效期，并由担保人盖章及法定代表人或委托代理人签字。",
+                source_quote,
+            )
+        )
+
+    if all(signal in source_text for signal in ("附件10", "支付担保", "保证的范围及保证金额", "连带责任保证")):
+        header_match = re.search(r"附件10[:：]\s*支付担保", source_text)
+        source_quote = _clean_requirement_text(header_match.group(0) if header_match else "附件10：支付担保")
+        guarded_items.append(
+            (
+                "format",
+                "附件10支付担保格式：须填写保证范围、保证金额、保证方式、保证期间及代偿安排。",
+                source_quote,
+            )
+        )
+
+    return guarded_items
+
+
+def _review_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
+    source_text = _clean_requirement_text(chunk.content_text or "")
+    guarded_items: list[tuple[str, str, str]] = []
+
+    scoring_method_match = re.search(r"(?:采用|评审办法为|评标办法为)?综合评分法", source_text)
+    if scoring_method_match and any(signal in source_text for signal in ("评审办法", "评标办法", "第四章")):
+        source_quote = _clean_requirement_text(scoring_method_match.group(0))
+        guarded_items.append(
+            (
+                "scoring",
+                "评审办法：本项目采用综合评分法。",
+                source_quote,
+            )
+        )
+
+    business_bid_rejection_match = re.search(
+        r"2\.改变竞标文件提供的工程量清单.*?"
+        r"3\.改变竞标文件规定的暂定内容的[；;。]?.*?"
+        r"4\.经评标委员会认定投标人的投标报价低于成本价的[；;。]?.*?"
+        r"5\.投标人拒绝按评标委员会要求提供报价分析说明和证明材料的[；;。]?.*?"
+        r"6\.工程量清单报价与工、料、机报价及对应的报价分析不相符的.*?理由不成立的[；;。]?",
+        source_text,
+    )
+    if business_bid_rejection_match:
+        source_quote = _clean_requirement_text(business_bid_rejection_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "商务标废标条件：不得改变工程量清单或暂定内容；投标报价不得低于成本价；须按要求提供报价分析说明和证明材料；工程量清单报价须与工料机报价、报价分析及施工组织设计匹配。",
+                source_quote,
+            )
+        )
+
     return guarded_items
 
 
 def _response_form_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str, str]]:
     source_text = _clean_requirement_text(chunk.content_text or "")
-    if "响应函" not in source_text:
-        return []
-
     guarded_items: list[tuple[str, str, str]] = []
+    if "响应函" not in source_text and "授权委托书" not in source_text:
+        return guarded_items
+
+    price_amount_match = re.search(
+        r"我方愿以人民币\s*[(（]\s*大\s*写\s*[)）]\s*[：:]\s*，\s*RMB\s*[：:]\s*¥\s*元，"
+        r"\s*[(（]\s*大小写不一致的以大写金额为准\s*[)）]\s*的报价",
+        source_text,
+    )
+    if price_amount_match:
+        source_quote = _clean_requirement_text(price_amount_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "响应函：须填写报价金额（人民币大写和RMB小写），大小写不一致以大写为准。",
+                source_quote,
+            )
+        )
+
     project_manager_match = re.search(
         r"本项目拟派项目负责人姓名：\s*，身份证\s*号：\s*。",
         source_text,
@@ -2801,6 +3656,35 @@ def _response_form_text_guard_items(chunk: DocumentChunk) -> list[tuple[str, str
                 source_quote,
             )
         )
+    performance_bond_commitment_match = re.search(
+        r"一旦我方成为成交人，我方保证按交易文件要求向贵方递交经贵方认可的履约担保[。；;]?"
+        r"\s*在我方报价低于风险控制价的情况下，我方将按照规定以保函的形式提交成交价与风险控制\s*价之差额[。；;]?",
+        source_text,
+    )
+    if performance_bond_commitment_match:
+        source_quote = _clean_requirement_text(performance_bond_commitment_match.group(0))
+        guarded_items.append(
+            (
+                "mandatory_response",
+                "响应函：成交后须递交履约担保；报价低于风险控制价的，须以保函形式提交成交价与风险控制价之差额。",
+                source_quote,
+            )
+        )
+
+    authorization_match = re.search(
+        r"授权委托书\s*本授权委托书声明：.*?代理时限.*?"
+        r"代理人在代理时间内参加交易活动过程中.*?本人均予以承认。代理人无权转委托。",
+        source_text,
+    )
+    if authorization_match:
+        source_quote = _clean_requirement_text(authorization_match.group(0))
+        guarded_items.append(
+            (
+                "format",
+                "授权委托书：须提供授权委托书，填写代理人信息和代理时限，并附代理人身份证复印件。",
+                source_quote,
+            )
+        )
     return guarded_items
 
 
@@ -2815,11 +3699,17 @@ def _augment_section_candidates_from_text_guards(
     augmented = list(candidates)
     for chunk in chunks:
         text_guard_items = [
+            *_qualification_text_guard_items(chunk),
+            *_project_overview_text_guard_items(chunk),
+            *_deadline_text_guard_items(chunk),
             *_commitment_text_guard_items(chunk),
             *_contract_text_guard_items(chunk),
+            *_review_text_guard_items(chunk),
             *_response_form_text_guard_items(chunk),
         ]
         for item_type, requirement, source_quote in text_guard_items:
+            if "接受联合体投标" in requirement and "接受联合体投标" in existing_text:
+                continue
             guarded_phrase = _compact_for_match(requirement.replace("诚信承诺书：", ""))
             if guarded_phrase and guarded_phrase in existing_text:
                 continue
@@ -2847,19 +3737,19 @@ def _augment_section_candidates_from_text_guards(
                             is_mandatory=True,
                             extraction_provider=extraction_provider,
                         ),
-                        "source_quote": source_quote[:300],
-                        "needs_human_review": True,
-                        "review_hint": "模型未覆盖该诚信承诺关键资格条款，由文本守卫补齐，请人工核对。",
-                        "classification_reason": "诚信承诺书基本能力承诺属于资格响应要求。",
-                        "split_reason": "诚信承诺书基本能力条款逐条形成可审核要求。",
-                        "text_guard": True,
-                    },
-                )
+                            "source_quote": source_quote[:300],
+                            "needs_human_review": True,
+                            "review_hint": "模型未覆盖该关键文本条款，由文本守卫补齐，请人工核对。",
+                            "classification_reason": "文本守卫识别关键资格、合同或响应格式要求。",
+                            "split_reason": "关键文本条款逐条形成可审核要求。",
+                            "text_guard": True,
+                        },
+                    )
             )
     return augmented
 
 
-def extract_sectioned_compliance_candidates(
+def _extract_sectioned_compliance_candidates_serial(
     db: Session,
     task: AsyncTask,
     document: Document,
@@ -2867,8 +3757,9 @@ def extract_sectioned_compliance_candidates(
     chunks: list[DocumentChunk],
     *,
     force_sections: bool = False,
+    planned_sections: list[DocumentSemanticSection] | None = None,
 ) -> tuple[str, list[ComplianceCandidate], list[dict[str, Any]], dict[str, Any]]:
-    sections = ensure_document_section_plan(
+    sections = planned_sections or ensure_document_section_plan(
         db,
         task,
         document,
@@ -2881,8 +3772,31 @@ def extract_sectioned_compliance_candidates(
     issues: list[dict[str, Any]] = []
     seen: set[str] = set()
     section_summaries: list[dict[str, Any]] = []
+    total_sections = max(1, len(sections))
+    _update_matrix_task_progress(
+        db,
+        task,
+        progress=22,
+        stage="section_plan_done",
+        message=f"章节规划完成，共 {len(sections)} 个语义段。",
+        extra={"section_count": len(sections)},
+    )
 
-    for semantic_section in sections:
+    for section_position, semantic_section in enumerate(sections, start=1):
+        section_progress = 25 + int(((section_position - 1) / total_sections) * 65)
+        _update_matrix_task_progress(
+            db,
+            task,
+            progress=section_progress,
+            stage="section_extract",
+            message=f"正在抽取第 {section_position}/{len(sections)} 段：{semantic_section.title}",
+            extra={
+                "section_index": semantic_section.section_index,
+                "section_title": semantic_section.title,
+                "section_position": section_position,
+                "section_count": len(sections),
+            },
+        )
         if _is_boilerplate_semantic_section(semantic_section):
             semantic_section.status = "verified"
             section_summaries.append(
@@ -2909,7 +3823,34 @@ def extract_sectioned_compliance_candidates(
                 )
             )
             continue
-        provider, candidates = _call_section_llm(db, task, semantic_section, current_chunks)
+        current_char_count = sum(len(chunk.content_text or "") for chunk in current_chunks)
+        _update_matrix_task_progress(
+            db,
+            task,
+            progress=section_progress,
+            stage="section_llm_extract",
+            message=(
+                f"正在调用模型抽取第 {section_position}/{len(sections)} 段："
+                f"{semantic_section.title}（{len(current_chunks)} 个分块，约 {current_char_count} 字）"
+            ),
+            extra={
+                "section_index": semantic_section.section_index,
+                "section_title": semantic_section.title,
+                "section_position": section_position,
+                "section_count": len(sections),
+                "chunk_count": len(current_chunks),
+                "char_count": current_char_count,
+            },
+        )
+        provider, candidates = _call_section_llm_resilient(
+            db,
+            task,
+            semantic_section,
+            current_chunks,
+            section_position=section_position,
+            total_sections=len(sections),
+            progress=section_progress,
+        )
         candidates = _augment_section_candidates_from_table_guards(
             current_chunks,
             candidates,
@@ -2921,14 +3862,46 @@ def extract_sectioned_compliance_candidates(
             extraction_provider=f"{provider}:text_guard",
         )
         providers.append(provider)
-        coverage_issues = _review_section_coverage(
+        _update_matrix_task_progress(
+            db,
+            task,
+            progress=min(section_progress + 2, 89),
+            stage="section_coverage_review",
+            message=f"正在复核第 {section_position}/{len(sections)} 段覆盖率：{semantic_section.title}",
+            extra={
+                "section_index": semantic_section.section_index,
+                "section_title": semantic_section.title,
+                "section_position": section_position,
+                "section_count": len(sections),
+                "candidate_count": len(candidates),
+            },
+        )
+        coverage_issues = _review_section_coverage_resilient(
             db,
             task,
             semantic_section,
             current_chunks,
             candidates,
+            section_position=section_position,
+            total_sections=len(sections),
+            progress=min(section_progress + 2, 89),
         )
         issues.extend(coverage_issues)
+        _update_matrix_task_progress(
+            db,
+            task,
+            progress=25 + int((section_position / total_sections) * 65),
+            stage="section_review",
+            message=f"已完成第 {section_position}/{len(sections)} 段覆盖复核：{semantic_section.title}",
+            extra={
+                "section_index": semantic_section.section_index,
+                "section_title": semantic_section.title,
+                "section_position": section_position,
+                "section_count": len(sections),
+                "candidate_count": len(candidates),
+                "coverage_issue_count": len(coverage_issues),
+            },
+        )
         accepted_count = 0
         for candidate in candidates:
             if candidate.normalized_requirement in seen:
@@ -2959,9 +3932,15 @@ def extract_sectioned_compliance_candidates(
         "sections": section_summaries,
     }
     if high_issues:
+        high_issue_codes = {
+            str(issue.get("code") or "").strip()
+            for issue in high_issues
+            if str(issue.get("code") or "").strip()
+        }
+        gate_code = next(iter(high_issue_codes)) if len(high_issue_codes) == 1 else "QUALITY_GATE_BLOCKED"
         raise ComplianceQualityGateError(
             "覆盖性复核发现严重漏抽或来源质量问题",
-            code="QUALITY_GATE_BLOCKED",
+            code=gate_code,
             issues=issues,
             summary=summary,
         )
@@ -2979,6 +3958,431 @@ def extract_sectioned_compliance_candidates(
             summary=summary,
         )
     return ",".join(sorted(set(providers))) or "ai_sectioned", all_candidates, issues, summary
+
+
+def _matrix_fork_join_max_workers() -> int:
+    try:
+        configured = int(settings.matrix_fork_join_max_workers)
+    except (TypeError, ValueError):
+        configured = 4
+    return max(1, min(configured, 12))
+
+
+def _should_use_matrix_fork_join(task: AsyncTask, sections: list[DocumentSemanticSection]) -> bool:
+    input_json = task.input_json or {}
+    if input_json.get("serial_processing") is True or input_json.get("fork_join") is False:
+        return False
+    if not settings.matrix_fork_join_enabled:
+        return False
+    try:
+        min_sections = max(1, int(settings.matrix_fork_join_min_sections))
+    except (TypeError, ValueError):
+        min_sections = 4
+    return len(sections) >= min_sections and _matrix_fork_join_max_workers() > 1
+
+
+def _fork_join_failure_result(
+    semantic_section: DocumentSemanticSection,
+    section_position: int,
+    exc: Exception,
+) -> SectionComplianceForkResult:
+    if isinstance(exc, ComplianceQualityGateError):
+        issues = exc.issues or [
+            _quality_issue(
+                code=exc.code,
+                message=str(exc),
+                severity="high",
+                semantic_section=semantic_section,
+            )
+        ]
+    else:
+        error_code = getattr(exc, "code", "SECTION_FORK_FAILED")
+        if isinstance(exc, ValidationError):
+            error_code = "LLM_SCHEMA_VALIDATION_FAILED"
+        elif isinstance(exc, json.JSONDecodeError):
+            error_code = "LLM_JSON_PARSE_FAILED"
+        issues = [
+            _quality_issue(
+                code=error_code,
+                message=f"章节“{semantic_section.title}”并发抽取失败：{exc}",
+                severity="high",
+                semantic_section=semantic_section,
+            )
+        ]
+    return SectionComplianceForkResult(
+        section_position=section_position,
+        provider="",
+        candidates=[],
+        issues=issues,
+        summary={
+            "semantic_section_id": str(semantic_section.id),
+            "section_index": semantic_section.section_index,
+            "title": semantic_section.title,
+            "page_range": [semantic_section.start_page, semantic_section.end_page],
+            "candidate_count": 0,
+            "accepted_count": 0,
+            "coverage_issue_count": len(issues),
+            "fork_status": "failed",
+            "error_code": issues[0].get("code") if issues else "SECTION_FORK_FAILED",
+        },
+    )
+
+
+def _extract_one_section_for_fork_join(
+    *,
+    task_id: uuid.UUID,
+    semantic_section_id: uuid.UUID,
+    version_id: uuid.UUID,
+    section_position: int,
+    total_sections: int,
+) -> SectionComplianceForkResult:
+    with SessionLocal() as fork_db:
+        task = fork_db.get(AsyncTask, task_id)
+        semantic_section = fork_db.get(DocumentSemanticSection, semantic_section_id)
+        if task is None:
+            raise ComplianceGenerationError("矩阵生成任务不存在", code="TASK_NOT_FOUND")
+        if semantic_section is None:
+            raise ComplianceGenerationError("语义段不存在", code="SEMANTIC_SECTION_NOT_FOUND")
+
+        if _is_boilerplate_semantic_section(semantic_section):
+            semantic_section.status = "verified"
+            fork_db.commit()
+            return SectionComplianceForkResult(
+                section_position=section_position,
+                provider="",
+                candidates=[],
+                issues=[],
+                summary={
+                    "semantic_section_id": str(semantic_section.id),
+                    "section_index": semantic_section.section_index,
+                    "title": semantic_section.title,
+                    "page_range": [semantic_section.start_page, semantic_section.end_page],
+                    "candidate_count": 0,
+                    "accepted_count": 0,
+                    "coverage_issue_count": 0,
+                    "skipped_reason": "boilerplate_section",
+                    "fork_status": "succeeded",
+                },
+            )
+
+        chunks = fork_db.scalars(
+            select(DocumentChunk)
+            .where(
+                DocumentChunk.tenant_id == task.tenant_id,
+                DocumentChunk.document_version_id == version_id,
+            )
+            .order_by(DocumentChunk.chunk_index)
+        ).all()
+        current_chunks = _section_chunks(semantic_section, list(chunks))
+        if not current_chunks:
+            issue = _quality_issue(
+                code="SECTION_HAS_NO_CHUNKS",
+                message=f"章节“{semantic_section.title}”页码范围内没有解析分块。",
+                severity="high",
+                semantic_section=semantic_section,
+            )
+            return SectionComplianceForkResult(
+                section_position=section_position,
+                provider="",
+                candidates=[],
+                issues=[issue],
+                summary={
+                    "semantic_section_id": str(semantic_section.id),
+                    "section_index": semantic_section.section_index,
+                    "title": semantic_section.title,
+                    "page_range": [semantic_section.start_page, semantic_section.end_page],
+                    "candidate_count": 0,
+                    "accepted_count": 0,
+                    "coverage_issue_count": 1,
+                    "fork_status": "failed",
+                    "error_code": "SECTION_HAS_NO_CHUNKS",
+                },
+            )
+
+        section_progress = 25 + int(((section_position - 1) / max(1, total_sections)) * 65)
+        provider, candidates = _call_section_llm_resilient(
+            fork_db,
+            task,
+            semantic_section,
+            current_chunks,
+            section_position=section_position,
+            total_sections=total_sections,
+            progress=section_progress,
+            progress_updates=False,
+        )
+        candidates = _augment_section_candidates_from_table_guards(
+            current_chunks,
+            candidates,
+            extraction_provider=f"{provider}:table_guard",
+        )
+        candidates = _augment_section_candidates_from_text_guards(
+            current_chunks,
+            candidates,
+            extraction_provider=f"{provider}:text_guard",
+        )
+        coverage_issues = _review_section_coverage_resilient(
+            fork_db,
+            task,
+            semantic_section,
+            current_chunks,
+            candidates,
+            section_position=section_position,
+            total_sections=total_sections,
+            progress=min(section_progress + 2, 89),
+            progress_updates=False,
+        )
+        semantic_section.status = "verified"
+        fork_db.commit()
+        return SectionComplianceForkResult(
+            section_position=section_position,
+            provider=provider,
+            candidates=candidates,
+            issues=coverage_issues,
+            summary={
+                "semantic_section_id": str(semantic_section.id),
+                "section_index": semantic_section.section_index,
+                "title": semantic_section.title,
+                "page_range": [semantic_section.start_page, semantic_section.end_page],
+                "candidate_count": len(candidates),
+                "accepted_count": 0,
+                "coverage_issue_count": len(coverage_issues),
+                "fork_status": "succeeded",
+            },
+        )
+
+
+def _extract_sectioned_compliance_candidates_fork_join(
+    db: Session,
+    task: AsyncTask,
+    document: Document,
+    version: DocumentVersion,
+    chunks: list[DocumentChunk],
+    sections: list[DocumentSemanticSection],
+) -> tuple[str, list[ComplianceCandidate], list[dict[str, Any]], dict[str, Any]]:
+    total_sections = max(1, len(sections))
+    max_workers = min(_matrix_fork_join_max_workers(), total_sections)
+    _update_matrix_task_progress(
+        db,
+        task,
+        progress=22,
+        stage="section_plan_done",
+        message=f"章节规划完成，共 {len(sections)} 个语义段；即将并发抽取。",
+        extra={
+            "section_count": len(sections),
+            "execution_mode": "fork_join",
+            "fork_join_max_workers": max_workers,
+        },
+    )
+    _update_matrix_task_progress(
+        db,
+        task,
+        progress=25,
+        stage="section_fork_join",
+        message=f"正在并发抽取合规条款：0/{len(sections)} 段完成，最大并发 {max_workers}。",
+        extra={
+            "section_count": len(sections),
+            "fork_join_completed": 0,
+            "fork_join_total": len(sections),
+            "fork_join_max_workers": max_workers,
+            "execution_mode": "fork_join",
+        },
+    )
+
+    results: list[SectionComplianceForkResult] = []
+    section_by_id = {section.id: section for section in sections}
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="matrix-section") as executor:
+        future_by_section = {
+            executor.submit(
+                _extract_one_section_for_fork_join,
+                task_id=task.id,
+                semantic_section_id=section.id,
+                version_id=version.id,
+                section_position=position,
+                total_sections=len(sections),
+            ): (position, section.id)
+            for position, section in enumerate(sections, start=1)
+        }
+        completed = 0
+        heartbeat_count = 0
+        pending = set(future_by_section)
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=FORK_JOIN_PROGRESS_HEARTBEAT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                heartbeat_count += 1
+                pending_sections = sorted(
+                    (future_by_section[future][0], section_by_id[future_by_section[future][1]])
+                    for future in pending
+                )
+                pending_titles = [
+                    f"{position}/{len(sections)} {semantic_section.title}"
+                    for position, semantic_section in pending_sections[:max_workers]
+                ]
+                progress = 25 + int((completed / total_sections) * 65)
+                _update_matrix_task_progress(
+                    db,
+                    task,
+                    progress=progress,
+                    stage="section_fork_join",
+                    message=(
+                        f"正在并发抽取合规条款：{completed}/{len(sections)} 段完成，"
+                        f"剩余 {len(pending)} 段；正在处理或排队：{'、'.join(pending_titles)}。"
+                    ),
+                    extra={
+                        "section_count": len(sections),
+                        "fork_join_completed": completed,
+                        "fork_join_total": len(sections),
+                        "fork_join_pending": len(pending),
+                        "fork_join_pending_sections": [
+                            {
+                                "section_position": position,
+                                "section_index": semantic_section.section_index,
+                                "section_title": semantic_section.title,
+                            }
+                            for position, semantic_section in pending_sections[:max_workers]
+                        ],
+                        "fork_join_max_workers": max_workers,
+                        "fork_join_heartbeat": heartbeat_count,
+                        "execution_mode": "fork_join",
+                    },
+                )
+                continue
+
+            for future in done:
+                position, section_id = future_by_section[future]
+                semantic_section = section_by_id[section_id]
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001 - converts child failure into quality issue.
+                    result = _fork_join_failure_result(semantic_section, position, exc)
+                results.append(result)
+                completed += 1
+                progress = 25 + int((completed / total_sections) * 65)
+                _update_matrix_task_progress(
+                    db,
+                    task,
+                    progress=progress,
+                    stage="section_fork_join",
+                    message=(
+                        f"正在并发抽取合规条款：{completed}/{len(sections)} 段完成，"
+                        f"最近完成：{semantic_section.title}"
+                    ),
+                    extra={
+                        "section_index": semantic_section.section_index,
+                        "section_title": semantic_section.title,
+                        "section_position": position,
+                        "section_count": len(sections),
+                        "fork_join_completed": completed,
+                        "fork_join_total": len(sections),
+                        "fork_join_pending": len(pending),
+                        "fork_join_max_workers": max_workers,
+                        "execution_mode": "fork_join",
+                        "last_section_status": result.summary.get("fork_status"),
+                    },
+                )
+
+    providers: list[str] = []
+    issues: list[dict[str, Any]] = []
+    all_candidates: list[ComplianceCandidate] = []
+    section_summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for result in sorted(results, key=lambda item: item.section_position):
+        if result.provider:
+            providers.append(result.provider)
+        issues.extend(result.issues)
+        accepted_count = 0
+        for candidate in result.candidates:
+            if candidate.normalized_requirement in seen:
+                continue
+            seen.add(candidate.normalized_requirement)
+            all_candidates.append(candidate)
+            accepted_count += 1
+        section_summary = dict(result.summary)
+        section_summary["accepted_count"] = accepted_count
+        section_summaries.append(section_summary)
+
+    high_issues = [issue for issue in issues if issue.get("severity") == "high"]
+    summary = {
+        "document_id": str(document.id),
+        "document_version_id": str(version.id),
+        "section_count": len(sections),
+        "candidate_count": len(all_candidates),
+        "issue_count": len(issues),
+        "high_issue_count": len(high_issues),
+        "sections": section_summaries,
+        "execution_mode": "fork_join",
+        "fork_join_max_workers": max_workers,
+    }
+    if high_issues:
+        high_issue_codes = {
+            str(issue.get("code") or "").strip()
+            for issue in high_issues
+            if str(issue.get("code") or "").strip()
+        }
+        gate_code = next(iter(high_issue_codes)) if len(high_issue_codes) == 1 else "QUALITY_GATE_BLOCKED"
+        raise ComplianceQualityGateError(
+            "覆盖性复核发现严重漏抽或来源质量问题",
+            code=gate_code,
+            issues=issues,
+            summary=summary,
+        )
+    if not all_candidates:
+        raise ComplianceQualityGateError(
+            "章节抽取未生成合规矩阵候选项",
+            code="NO_COMPLIANCE_CANDIDATES",
+            issues=[
+                _quality_issue(
+                    code="NO_COMPLIANCE_CANDIDATES",
+                    message="章节规划和模型抽取均完成，但没有生成任何可入库候选项。",
+                    severity="high",
+                )
+            ],
+            summary=summary,
+        )
+    return _merge_provider_names(providers) or "ai_sectioned_fork_join", all_candidates, issues, summary
+
+
+def extract_sectioned_compliance_candidates(
+    db: Session,
+    task: AsyncTask,
+    document: Document,
+    version: DocumentVersion,
+    chunks: list[DocumentChunk],
+    *,
+    force_sections: bool = False,
+) -> tuple[str, list[ComplianceCandidate], list[dict[str, Any]], dict[str, Any]]:
+    if not settings.matrix_fork_join_enabled or (task.input_json or {}).get("serial_processing") is True:
+        return _extract_sectioned_compliance_candidates_serial(
+            db,
+            task,
+            document,
+            version,
+            chunks,
+            force_sections=force_sections,
+        )
+
+    sections = ensure_document_section_plan(
+        db,
+        task,
+        document,
+        version,
+        chunks,
+        force=force_sections,
+    )
+    if not _should_use_matrix_fork_join(task, sections):
+        return _extract_sectioned_compliance_candidates_serial(
+            db,
+            task,
+            document,
+            version,
+            chunks,
+            force_sections=force_sections,
+            planned_sections=sections,
+        )
+    return _extract_sectioned_compliance_candidates_fork_join(db, task, document, version, chunks, sections)
 
 
 def extract_compliance_candidates(
@@ -3277,6 +4681,8 @@ def execute_compliance_matrix_generation_task(
             "provider": provider,
             "document_id": str(document.id),
             "document_version_id": str(version.id),
+            "execution_mode": quality_summary.get("execution_mode", "serial"),
+            "fork_join_max_workers": quality_summary.get("fork_join_max_workers"),
             "candidate_count": len(candidates),
             "created_count": created_count,
             "updated_count": updated_count,

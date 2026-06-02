@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     model_config_encryption_key: str = Field(default="", alias="MODEL_CONFIG_ENCRYPTION_KEY")
     model_config_encryption_key_version: str = Field(default="v1", alias="MODEL_CONFIG_ENCRYPTION_KEY_VERSION")
     run_tasks_inline: bool = Field(default=True, alias="RUN_TASKS_INLINE")
+    matrix_fork_join_enabled: bool = Field(default=True, alias="MATRIX_FORK_JOIN_ENABLED")
+    matrix_fork_join_max_workers: int = Field(default=4, alias="MATRIX_FORK_JOIN_MAX_WORKERS")
+    matrix_fork_join_min_sections: int = Field(default=4, alias="MATRIX_FORK_JOIN_MIN_SECTIONS")
 
     frontend_dist_dir: str = Field(default="", alias="FRONTEND_DIST_DIR")
 

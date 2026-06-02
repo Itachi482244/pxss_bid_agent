@@ -340,6 +340,41 @@
   margin-bottom: 14px;
 }
 
+.background-task-overview {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #b7cdfa;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.background-task-overview-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.background-task-overview-header > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.background-task-overview-header .ant-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+}
+
+.background-task-hint {
+  font-size: 12px;
+}
+
+.background-task-actions {
+  margin-top: 2px;
+}
+
 .background-task-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -360,6 +395,84 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.task-center-panel {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.task-center-status {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #b7cdfa;
+  border-radius: 8px;
+  background: #f8fbff;
+}
+
+.task-center-status-main,
+.task-center-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.task-center-status-main > div,
+.task-center-card-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.task-center-status-main p {
+  margin: 0;
+  color: #4f5b6f;
+  line-height: 1.6;
+}
+
+.task-center-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.task-center-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.task-center-card,
+.task-center-next {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #d9e1ee;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.task-center-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.task-center-pending-list {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #edf0f5;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.task-center-pending-list span {
+  color: #303849;
+  line-height: 1.5;
 }
 
 .workflow-guide {
@@ -1020,6 +1133,143 @@
 .section-plan-header p {
   margin: 4px 0 0;
   color: #697386;
+}
+
+.quality-gate-alert {
+  display: grid;
+  gap: 10px;
+}
+
+.quality-gate-panel {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.quality-recommendation-card {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid #b7cdfa;
+  border-radius: 8px;
+  background: #f6f9ff;
+}
+
+.quality-recommendation-main {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.quality-recommendation-main p,
+.quality-detail-intro p {
+  margin: 4px 0 0;
+  color: #4f5b6f;
+  line-height: 1.6;
+}
+
+.quality-recommendation-icon {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #fff7e6;
+  color: #b45309;
+  font-size: 18px;
+}
+
+.quality-recommendation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.quality-safety-notes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.quality-safety-notes span {
+  padding: 4px 8px;
+  border: 1px solid #d9e1ee;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #4f5b6f;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.quality-details {
+  padding: 12px;
+  border: 1px solid #d9e1ee;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.quality-details summary {
+  cursor: pointer;
+  color: #303849;
+  font-weight: 600;
+}
+
+.quality-details[open] summary {
+  margin-bottom: 10px;
+}
+
+.quality-detail-intro {
+  margin-bottom: 10px;
+}
+
+.quality-issue-list {
+  display: grid;
+  gap: 8px;
+}
+
+.quality-issue-list-standalone {
+  margin-top: 10px;
+}
+
+.quality-issue-item {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #f1c8c8;
+  border-radius: 8px;
+  background: #fffafa;
+}
+
+.quality-issue-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.quality-gate-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.quality-source-snippet {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid #e1e7f0;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.quality-source-snippet p {
+  margin: 0;
+  color: #303849;
+  line-height: 1.7;
 }
 
 .export-list {
