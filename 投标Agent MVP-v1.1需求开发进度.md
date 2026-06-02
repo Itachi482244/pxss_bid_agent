@@ -1,12 +1,14 @@
 # 投标 Agent MVP-v1.1 需求开发进度
 
-> 更新时间：2026-05-25
-> 当前阶段：MVP1.1 P0 + P1 已完成开发，项目级回归通过
+> 更新时间：2026-06-02
+> 当前阶段：MVP1.1 P0 + P1 + P1 追加 fork/join 性能需求已完成开发，明珠公寓真实 PDF 全链路验收通过
 > 版本定位：在 MVP1.0 可试用闭环之上，引入受控 AI 能力，增强合规矩阵的语义拆分、分类、来源核对与人工审阅效率。
 
 ## 1. 总体状态
 
-MVP1.1 当前已完成 P0 与 P1 主体开发，并已通过 `make mvp1-check` 回归。最近代码提交：`636c7bd test: cover mvp1.1 matrix review p1 flows`。
+MVP1.1 当前已完成 P0、既有 P1 与 P1 追加的矩阵 fork/join 性能需求。最近实现提交：`4ccbd41 feat: add matrix fork join task center`。
+
+本轮已使用 `deepseek-v4-pro` 对“明珠公寓老旧小区综合改造提升项目”招标 PDF 跑完整合规矩阵生成，最终任务 `6ee54ccf-28e9-4fa9-971e-09f994fd4a81` 成功，质量报告 `4472a33f-b34d-4423-b6db-9b97e0d407c1` 为 `passed`，`issues_json` 为空。
 
 本阶段完成的核心能力：
 
@@ -19,7 +21,10 @@ MVP1.1 当前已完成 P0 与 P1 主体开发，并已通过 `make mvp1-check` �
 7. 人工划选原文补漏。
 8. 相同/相似片段补票和文本 Diff 高亮。
 9. 高风险/强制/资格项确认前原文核对闸口。
-10. 黄金样本、模型路径和 P1 审阅纠错回归测试补强。
+10. 合规矩阵生成按语义章节有界并发抽取，fork/join 汇总候选项、质量问题和章节摘要。
+11. 后台任务中心和解析/矩阵生成进度展示，让用户能看到当前阶段、并发数、完成章节数、剩余章节和下一步动作。
+12. 章节规划、章节抽取、覆盖复核的超时/JSON/schema 失败容错与质量报告落库。
+13. 黄金样本、模型路径、P1 审阅纠错和 fork/join 回归测试补强。
 
 当前明确不进入 MVP1.1 的能力：
 
@@ -56,6 +61,10 @@ MVP1.1 当前已完成 P0 与 P1 主体开发，并已通过 `make mvp1-check` �
 | 级联确认 | 同组确认状态同步并返回影响数量 | 已完成 | 风险等级、强制属性、条目类型不自动级联 |
 | 高风险确认防误触 | 高风险、强制项、资格项确认前必须核对原文 | 已完成 | 前后端均校验 `source_verified` |
 | P1 回归测试 | 锁定人工补漏、相似补票、Diff、关联组和级联确认 | 已完成 | 已补充 `test_project_api.py` P1 专项测试 |
+| 远程模型 fork/join | 矩阵生成按语义章节有界并发抽取并在父任务 join 汇总 | 已完成 | 默认最大并发 4，可配置开关、最大并发和最小章节数；子章节独立 DB session，父任务统一去重、质量门禁和入库 |
+| 后台任务中心 | 长耗时解析/矩阵生成以任务页展示进度和下一步动作 | 已完成 | 前端调用矩阵生成时传 `async_processing: true`，即使开发环境 `RUN_TASKS_INLINE=true` 也会后台执行并立即返回任务 ID |
+| 质量门禁处理页 | 质量报告阻断时从矩阵审阅中独立出来处理 | 已完成 | 展示阻断/提示项、定位章节、重抽段落、重新规划、重新生成矩阵等操作入口 |
+| 大文件真实验收 | 用明珠公寓招标 PDF 跑完整矩阵并校验质量报告 | 已完成 | 最终报告 `passed` 且 `issues_json=[]`，关键条目抽查覆盖合同价格形式、质量保证金、工期履约保证金、报价金额、授权委托书、项目经理证书编号 |
 
 ## 4. 本轮代码落点
 
@@ -69,32 +78,35 @@ MVP1.1 当前已完成 P0 与 P1 主体开发，并已通过 `make mvp1-check` �
 6. `backend/app/services/compliance_generation.py`：合规矩阵 AI 抽取、结构化校验、降级保护。
 7. `backend/app/schemas/project.py`：扩展矩阵审阅、人工补漏、相似补票、关联组和确认请求/返回结构。
 8. `backend/app/api/v1/routes/projects.py`：矩阵审阅聚合、人工新增、相似候选、补票应用、关联组确认/解除/拆分和级联确认。
-9. `backend/tests/test_model_config_api.py`：模型配置、加密、连接测试和 DB 优先级回归。
-10. `backend/tests/test_prompt_registry.py`：prompt registry 单元测试。
-11. `backend/tests/test_compliance_generation_worker.py`：fake LLM 抽取、污染过滤、缺来源降级测试。
-12. `backend/tests/test_project_api.py`：P1 人工补漏、相似补票、Diff、关联组和级联确认回归测试。
-13. `backend/migrations/versions/f6a1c8d9e2b3_add_ai_model_configs.py`：模型配置表迁移。
-14. `backend/migrations/versions/a9d4e7f2c8b1_add_compliance_review_p1_fields.py`：P1 稳定字段迁移。
+9. `backend/app/api/v1/routes/tasks.py`：新增任务列表查询，支持项目、标段、任务类型、active 状态和分页限制过滤。
+10. `backend/app/core/config.py`：新增 `MATRIX_FORK_JOIN_ENABLED`、`MATRIX_FORK_JOIN_MAX_WORKERS`、`MATRIX_FORK_JOIN_MIN_SECTIONS`。
+11. `backend/app/services/llm_gateway.py`：远程模型调用增加 wall timeout，避免 HTTP 客户端底层长期挂起。
+12. `backend/tests/test_model_config_api.py`：模型配置、加密、连接测试和 DB 优先级回归。
+13. `backend/tests/test_prompt_registry.py`：prompt registry 单元测试。
+14. `backend/tests/test_compliance_generation_worker.py`：fake LLM 抽取、污染过滤、缺来源降级、fork/join 并发、章节规划复用和文本守卫补齐测试。
+15. `backend/tests/test_project_api.py`：P1 人工补漏、相似补票、Diff、关联组和级联确认回归测试。
+16. `backend/migrations/versions/f6a1c8d9e2b3_add_ai_model_configs.py`：模型配置表迁移。
+17. `backend/migrations/versions/a9d4e7f2c8b1_add_compliance_review_p1_fields.py`：P1 稳定字段迁移。
 
 前端新增/调整：
 
 1. `frontend/src/api/bid.ts`：扩展 `ComplianceItem` 类型。
-2. `frontend/src/pages/App.tsx`：新增“矩阵审阅”视图、工作流入口、审阅筛选、定位、人工补漏、相似补票和关联组操作。
-3. `frontend/src/pages/app.css`：新增矩阵审阅视图和 Diff 高亮样式。
+2. `frontend/src/pages/App.tsx`：新增“矩阵审阅”视图、工作流入口、审阅筛选、定位、人工补漏、相似补票、关联组操作、任务中心、质量门禁处理页和导入任务状态恢复。
+3. `frontend/src/pages/app.css`：新增矩阵审阅视图、Diff 高亮、后台任务面板和任务中心样式。
 4. `frontend/vite.config.ts`：拆分 `index`、`react-vendor`、`antd-vendor`、`utils-vendor`，处理 Vite chunk 体积提示。
 
 ## 5. 当前验证结果
 
-后端全量测试：
+后端合规生成专项测试：
 
 ```bash
-cd backend && .venv/bin/pytest -q
+cd backend && .venv/bin/pytest tests/test_compliance_generation_worker.py -q
 ```
 
 结果：
 
 ```text
-43 passed, 5 warnings in 14.41s
+79 passed, 5 warnings in 4.26s
 ```
 
 前端构建：
@@ -103,7 +115,29 @@ cd backend && .venv/bin/pytest -q
 cd frontend && npm run build
 ```
 
-结果：构建通过；入口应用 chunk 已拆分为 `index`、`react-vendor`、`antd-vendor`、`utils-vendor`，不再触发 Vite chunk 体积提示。
+结果：构建通过；入口应用 chunk 已拆分为 `index`、`react-vendor`、`antd-vendor`、`utils-vendor`。
+
+明珠公寓真实 PDF 全链路验收：
+
+```text
+项目：明珠公寓老旧小区综合改造提升项目
+文档版本：034a5b5a-f2cb-44e1-9565-f1f59f1cdeb7
+模型：deepseek-v4-pro
+任务：6ee54ccf-28e9-4fa9-971e-09f994fd4a81
+执行模式：fork_join，最大并发 4，语义章节 27
+结果：succeeded，candidate_count=472，created_count=307，updated_count=165
+质量报告：4472a33f-b34d-4423-b6db-9b97e0d407c1，status=passed，issues_json=[]
+```
+
+关键条目抽查已覆盖：
+
+1. 合同价格形式：固定单价合同 / 单价合同。
+2. 质量保证金：剩余 1.5% 留作质量保证金，缴纳方式同投标担保。
+3. 质量保证金：采用缴纳形式同投标担保，保证金额为 1.5% 的工程款。
+4. 工期履约保证金：逾期未提交施工组织设计，每逾期一日扣罚 1000 元。
+5. 响应函报价金额：人民币大写和 RMB 小写，大小写不一致以大写为准。
+6. 授权委托书：代理人信息、代理时限、代理人身份证复印件。
+7. 项目经理信息：建造师注册证书号、建造师执业印章号、安全生产考核合格证书号。
 
 P1 专项测试：
 
@@ -135,6 +169,9 @@ P1 的重点不是继续扩大模型能力，而是把“人工审阅纠错闭�
 8. 关联组可拆分为独立组。
 9. 高风险、强制项、资格项确认前必须核对原文。
 10. 关键动作均写入审计。
+11. 大文件矩阵生成能作为异步任务展示阶段、进度、并发数、完成章节和剩余章节。
+12. 质量门禁阻断时有独立处理页和明确操作入口，不再要求用户混在矩阵审阅里猜下一步。
+13. 章节规划、章节抽取或覆盖复核出现模型空响应、JSON/schema 失败、超时或网关错误时，能进入重试、复用已有规划或质量报告路径，不再裸露为无上下文错误。
 
 ## 7. P2 / MVP1.2 顺延清单
 
@@ -169,6 +206,6 @@ P0 可以按以下标准验收：
 
 MVP1.1 P0 已完成“模型安全接入 + 合规矩阵 AI 增强 + 原文审阅第一版 + 回归验证”的目标。
 
-MVP1.1 P1 已完成“重复项关联、人工划选补漏、相似补票、差异高亮、级联确认和高风险确认防误触”的主体能力，并已补齐后端回归测试。
+MVP1.1 P1 已完成“重复项关联、人工划选补漏、相似补票、差异高亮、级联确认、高风险确认防误触、fork/join 并发矩阵生成、任务中心和质量门禁处理页”的主体能力，并已补齐后端回归测试。
 
-下一步建议不继续扩功能，先做前端浏览器冒烟和交互打磨，确认矩阵审阅页的划选、新增、补票、关联组操作在真实页面中足够顺手。
+明珠公寓真实 PDF 已完成完整矩阵生成和质量门禁验收，最终质量报告通过且无剩余质量问题。下一步建议进入 MVP1.2 商务标生成上下文包和草稿审阅能力，不再继续往 MVP1.1 塞新功能。
