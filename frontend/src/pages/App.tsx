@@ -38,6 +38,7 @@ import {
   Input,
   Layout,
   Modal,
+  Pagination,
   Popover,
   Progress,
   Select,
@@ -249,6 +250,47 @@ type WorkflowStepKey =
   | "approval";
 type WorkflowStepStatus = "not_started" | "todo" | "risk" | "done";
 type MatrixReviewFilter = "all" | "unconfirmed" | "high" | "mandatory" | "missing_evidence";
+
+const workflowStepKeys = new Set<WorkflowStepKey>([
+  "documents",
+  "tasks",
+  "quality",
+  "matrix",
+  "review",
+  "technical",
+  "evidence",
+  "qualification",
+  "chapter",
+  "approval"
+]);
+
+const preflightWorkflowTargets: Record<string, WorkflowStepKey> = {
+  matrix_version: "matrix",
+  high_risk: "review",
+  mandatory_evidence: "evidence",
+  draft_facts: "chapter",
+  qualification: "qualification",
+  technical: "technical",
+  deadline: "documents",
+  approvals: "approval",
+  draft_exists: "chapter"
+};
+
+function isWorkflowStepKey(value: string | null | undefined): value is WorkflowStepKey {
+  return Boolean(value && workflowStepKeys.has(value as WorkflowStepKey));
+}
+
+function workflowStepForPreflightCheck(item: PreflightCheck["checks"][number]) {
+  const mappedTarget = preflightWorkflowTargets[item.code];
+  if (mappedTarget) return mappedTarget;
+  return isWorkflowStepKey(item.target) ? item.target : null;
+}
+
+function preflightActionText(item: PreflightCheck["checks"][number]) {
+  if (item.code === "high_risk") return "打开审阅台";
+  return item.action_label ?? "去处理";
+}
+
 type ReviewChunk = Pick<
   DocumentChunk,
   "id" | "chunk_index" | "page_no" | "heading_path" | "content_text" | "document_version_id"
@@ -275,6 +317,18 @@ type WorkflowStep = {
   status: WorkflowStepStatus;
   statusText: string;
   actionText: string;
+  reason: string;
+  disabled: boolean;
+  disabledReason: string | null;
+};
+
+type SimpleWorkflowStep = {
+  key: string;
+  title: string;
+  targetKey: WorkflowStepKey;
+  activeKeys: WorkflowStepKey[];
+  status: WorkflowStepStatus;
+  statusText: string;
   reason: string;
   disabled: boolean;
   disabledReason: string | null;
@@ -315,6 +369,13 @@ type ImportProcessingState = {
 };
 
 const IMPORT_PROCESSING_STORAGE_KEY = "pxss_bid_agent_import_processing";
+const COMPLIANCE_ITEM_FETCH_LIMIT = 500;
+const LARGE_TABLE_PAGINATION = {
+  defaultPageSize: 25,
+  pageSizeOptions: ["25", "50", "100"],
+  showSizeChanger: true,
+  showTotal: (total: number) => `共 ${total} 条`
+};
 
 function loadImportProcessingState() {
   if (typeof window === "undefined") return null;
@@ -637,6 +698,10 @@ function isAsyncTaskTerminal(task: AsyncTask | null, taskId: string | null) {
   return Boolean(task && ["succeeded", "failed", "canceled"].includes(task.status));
 }
 
+function isAsyncTaskTerminalStatus(status: string | null | undefined) {
+  return status === "succeeded" || status === "failed" || status === "canceled";
+}
+
 function isUsableParseStatus(value: string | null | undefined) {
   return value === "succeeded" || value === "frozen";
 }
@@ -885,8 +950,8 @@ function scrollElementIntoContainer(target: HTMLElement, container: HTMLElement)
 }
 
 export function App() {
-  const [assistantCollapsed, setAssistantCollapsed] = useState(false);
-  const [projectNavCollapsed, setProjectNavCollapsed] = useState(false);
+  const [assistantCollapsed, setAssistantCollapsed] = useState(true);
+  const [projectNavCollapsed, setProjectNavCollapsed] = useState(true);
   const [viewMode, setViewMode] = useState<"home" | "workspace" | "enterprise" | "settings">("home");
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const [selectedSectionId, setSelectedSectionId] = useState<string>();
@@ -900,6 +965,8 @@ export function App() {
   const [mandatoryFilter, setMandatoryFilter] = useState<string | undefined>();
   const [prioritySortEnabled, setPrioritySortEnabled] = useState(true);
   const [matrixReviewFilter, setMatrixReviewFilter] = useState<MatrixReviewFilter>("all");
+  const [reviewQueuePage, setReviewQueuePage] = useState(1);
+  const [reviewQueuePageSize, setReviewQueuePageSize] = useState(25);
   const [reviewChunks, setReviewChunks] = useState<ReviewChunk[]>([]);
   const [loadingReviewChunks, setLoadingReviewChunks] = useState(false);
   const [qualityChunks, setQualityChunks] = useState<ReviewChunk[]>([]);
@@ -926,6 +993,7 @@ export function App() {
   const reviewSourcePaneRef = useRef<HTMLDivElement | null>(null);
   const reviewItemPaneRef = useRef<HTMLDivElement | null>(null);
   const locateReviewTimerRef = useRef<number | null>(null);
+  const terminalTaskRefreshKeysRef = useRef<Set<string>>(new Set());
   const [materialSearchQuery, setMaterialSearchQuery] = useState("");
   const [materialSearchResults, setMaterialSearchResults] = useState<EnterpriseMaterialSearchResult[]>([]);
   const [loadingMaterialSearch, setLoadingMaterialSearch] = useState(false);
@@ -977,6 +1045,7 @@ export function App() {
   const [exportFiles, setExportFiles] = useState<ExportFile[]>([]);
   const [complianceItems, setComplianceItems] = useState<ComplianceItem[]>([]);
   const [preflightCheck, setPreflightCheck] = useState<PreflightCheck | null>(null);
+  const [preflightExpanded, setPreflightExpanded] = useState(false);
   const [qualificationEvaluations, setQualificationEvaluations] = useState<QualificationEvaluation[]>([]);
   const [qualificationDecision, setQualificationDecision] = useState<QualificationDecision | null>(null);
   const [businessDraftChapters, setBusinessDraftChapters] = useState<BusinessDraftChapter[]>([]);
@@ -1215,7 +1284,7 @@ export function App() {
 
     let active = true;
     setLoadingMatrix(true);
-    listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 })
+    listComplianceItems(selectedProjectId, selectedSectionId, { limit: COMPLIANCE_ITEM_FETCH_LIMIT })
       .then((data) => {
         if (!active) return;
         setComplianceItems(data);
@@ -1516,17 +1585,8 @@ export function App() {
       return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
     });
   }, [filteredMatrixRows, prioritySortEnabled]);
-  const matrixReviewRows = useMemo(() => {
+  const allMatrixReviewRows = useMemo(() => {
     return [...matrixRows]
-      .filter((row) => {
-        if (matrixReviewFilter === "unconfirmed") return !isMatrixItemResolved(row);
-        if (matrixReviewFilter === "high") return row.riskCode === "high";
-        if (matrixReviewFilter === "mandatory") return row.mandatory;
-        if (matrixReviewFilter === "missing_evidence") {
-          return !row.enterpriseEvidenceNotRequired && (row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material");
-        }
-        return true;
-      })
       .sort((left, right) => {
         const leftChunk = left.raw.source_chunk_index ?? 999999;
         const rightChunk = right.raw.source_chunk_index ?? 999999;
@@ -1535,7 +1595,26 @@ export function App() {
         const riskOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
         return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
       });
-  }, [matrixReviewFilter, matrixRows]);
+  }, [matrixRows]);
+  const matrixReviewRows = useMemo(() => {
+    return allMatrixReviewRows.filter((row) => {
+      if (matrixReviewFilter === "unconfirmed") return !isMatrixItemResolved(row);
+      if (matrixReviewFilter === "high") return row.riskCode === "high";
+      if (matrixReviewFilter === "mandatory") return row.mandatory;
+      if (matrixReviewFilter === "missing_evidence") {
+        return !row.enterpriseEvidenceNotRequired && (row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material");
+      }
+      return true;
+    });
+  }, [allMatrixReviewRows, matrixReviewFilter]);
+  const pagedMatrixReviewRows = useMemo(() => {
+    const start = (reviewQueuePage - 1) * reviewQueuePageSize;
+    return matrixReviewRows.slice(start, start + reviewQueuePageSize);
+  }, [matrixReviewRows, reviewQueuePage, reviewQueuePageSize]);
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(matrixReviewRows.length / reviewQueuePageSize));
+    if (reviewQueuePage > maxPage) setReviewQueuePage(maxPage);
+  }, [matrixReviewRows.length, reviewQueuePage, reviewQueuePageSize]);
   const reviewFallbackChunks = useMemo<ReviewChunk[]>(() => {
     const pairs = matrixRows
       .filter((row) => row.raw.source_chunk_id && row.raw.source_content_text)
@@ -1645,11 +1724,26 @@ export function App() {
       highConfirmed
     };
   }, [matrixRows]);
-  const visiblePreflightChecks = useMemo(() => {
+  useEffect(() => {
+    setPreflightExpanded(false);
+  }, [selectedProjectId, selectedSectionId, preflightCheck?.status]);
+
+  const preflightChecksForDisplay = useMemo(() => {
     if (!preflightCheck) return [];
     const problemChecks = preflightCheck.checks.filter((item) => item.status !== "pass");
-    return problemChecks.length ? problemChecks : preflightCheck.checks.slice(0, 3);
+    return problemChecks.length ? problemChecks : preflightCheck.checks;
   }, [preflightCheck]);
+
+  const visiblePreflightChecks = useMemo(
+    () => (preflightExpanded ? preflightChecksForDisplay : preflightChecksForDisplay.slice(0, 4)),
+    [preflightChecksForDisplay, preflightExpanded]
+  );
+  const hiddenPreflightCheckCount = Math.max(0, preflightChecksForDisplay.length - visiblePreflightChecks.length);
+  const primaryBlockingPreflightCheck =
+    preflightCheck?.checks.find((item) => item.status === "block" && workflowStepForPreflightCheck(item)) ?? null;
+  const primaryBlockingPreflightTarget = primaryBlockingPreflightCheck
+    ? workflowStepForPreflightCheck(primaryBlockingPreflightCheck)
+    : null;
 
   const ownerOptions = useMemo(() => {
     const pairs = matrixRows
@@ -1672,28 +1766,37 @@ export function App() {
     () => unresolvedMatrixRows.filter((row) => row.riskCode === "high"),
     [unresolvedMatrixRows]
   );
-  const matrixCompletionPercent = matrixRows.length
-    ? Math.round(((matrixRows.length - unresolvedMatrixRows.length) / matrixRows.length) * 100)
-    : 0;
   const isMatrixComplete = matrixRows.length > 0 && unresolvedMatrixRows.length === 0;
-  const parseTaskActive = isAsyncTaskActive(importProcessing?.parseTask ?? null, importProcessing?.parseTaskId ?? null);
-  const matrixTaskActive = isAsyncTaskActive(importProcessing?.matrixTask ?? null, importProcessing?.matrixTaskId ?? null);
+  const qualificationDecisionConfirmed = qualificationDecision?.status === "confirmed";
+  const qualificationDecisionNeedsConfirmation = Boolean(qualificationDecision && !qualificationDecisionConfirmed);
+  const qualificationDecisionIsNoGo = qualificationDecision?.recommendation === "no_go";
+  const rawParseTaskActive = isAsyncTaskActive(importProcessing?.parseTask ?? null, importProcessing?.parseTaskId ?? null);
+  const rawMatrixTaskActive = isAsyncTaskActive(importProcessing?.matrixTask ?? null, importProcessing?.matrixTaskId ?? null);
   const importProcessingVisible = Boolean(
     importProcessing &&
       importProcessing.projectId === selectedProjectId &&
       (!importProcessing.sectionId || importProcessing.sectionId === selectedSectionId) &&
       (importProcessing.parseTaskId || importProcessing.matrixTaskId)
   );
+  const currentImportProcessing = importProcessingVisible ? importProcessing : null;
+  const parseTaskActive = Boolean(importProcessingVisible && rawParseTaskActive);
+  const matrixTaskActive = Boolean(importProcessingVisible && rawMatrixTaskActive);
   const importProcessingHasActiveTask = Boolean(importProcessingVisible && (parseTaskActive || matrixTaskActive));
   const importProcessingDone = Boolean(
-    importProcessing &&
+    importProcessingVisible &&
+      importProcessing &&
       isAsyncTaskTerminal(importProcessing.parseTask, importProcessing.parseTaskId) &&
       isAsyncTaskTerminal(importProcessing.matrixTask, importProcessing.matrixTaskId)
   );
   const importProcessingFailed = Boolean(
-    importProcessing &&
+    importProcessingVisible &&
+      importProcessing &&
       [importProcessing.parseTask, importProcessing.matrixTask].some((task) => task?.status === "failed")
   );
+  const importProcessingParseFailed = Boolean(importProcessingVisible && importProcessing?.parseTask?.status === "failed");
+  const importProcessingMatrixFailed = Boolean(importProcessingVisible && importProcessing?.matrixTask?.status === "failed");
+  const importProcessingOpenTask = Boolean(importProcessingVisible && importProcessing && !importProcessingDone && !importProcessingFailed);
+  const importProcessingInProgress = importProcessingOpenTask;
   const extractionBlocked = extractionQualityReport?.status === "blocked";
   const extractionQualityIssues = extractionQualityReport?.issues_json ?? [];
   const extractionQualityIssueCount = extractionQualityIssues.length || (extractionBlocked ? 1 : 0);
@@ -1703,12 +1806,18 @@ export function App() {
     importProcessingFailed &&
       (extractionBlocked || isQualityGateTaskError(importProcessing?.matrixTask?.error_code))
   );
-  const importProcessingPercent = importProcessingProgress(importProcessing);
+  const importProcessingPercent = importProcessingProgress(currentImportProcessing);
   const importProcessingStageTitle = importProcessingQualityBlocked
     ? "质量门禁需要处理"
+    : importProcessingParseFailed
+    ? "文件解析失败"
+    : importProcessingMatrixFailed
+    ? "矩阵生成失败"
     : importProcessingFailed
     ? "后台处理失败"
-    : importProcessingDone
+    : !currentImportProcessing
+      ? "当前没有后台任务"
+      : importProcessingDone
       ? "后台处理已完成"
       : parseTaskActive
         ? "正在解析招标文件"
@@ -1717,9 +1826,15 @@ export function App() {
           : "后台任务排队中";
   const importProcessingStageMessage = importProcessingQualityBlocked
     ? "本轮结果已暂停写入，请先进入质量门禁页处理阻断项。"
+    : importProcessingParseFailed
+    ? "文件解析失败，请回到文件解析页查看失败文件，可重新解析或重新上传。"
+    : importProcessingMatrixFailed
+    ? "合规矩阵生成失败，请查看任务错误后重新生成矩阵；若为质量门禁问题，请先处理质检阻断。"
     : importProcessingFailed
     ? "查看失败原因后重新解析或重新生成矩阵。"
-    : importProcessingDone
+    : !currentImportProcessing
+      ? "当前项目没有正在运行的解析或矩阵生成任务。"
+      : importProcessingDone
       ? "解析版本和合规矩阵已刷新，可以继续审阅和确认。"
       : parseTaskActive
         ? taskProgressMessage(importProcessing?.parseTask ?? null, "正在读取文件、识别页码并切分条款。", "解析版本已生成。")
@@ -1730,7 +1845,7 @@ export function App() {
               "矩阵已生成并刷新。"
             )
           : "任务已提交，正在等待后台 worker 接手。";
-  const matrixTaskOutput = importProcessing?.matrixTask?.output_json ?? null;
+  const matrixTaskOutput = importProcessingVisible ? importProcessing?.matrixTask?.output_json ?? null : null;
   const matrixForkJoinTotal = summaryNumber(matrixTaskOutput, "fork_join_total") || summaryNumber(matrixTaskOutput, "section_count");
   const matrixForkJoinCompleted = summaryNumber(matrixTaskOutput, "fork_join_completed");
   const matrixForkJoinPending = summaryNumber(matrixTaskOutput, "fork_join_pending");
@@ -1758,7 +1873,7 @@ export function App() {
     const canOpenMatrix = parsedDocuments.length > 0;
     const canOpenMatrixDerived = matrixRows.length > 0;
     const canOpenReview = matrixRows.length > 0;
-    const canOpenChapter = (hasDecision || hasDraft) && !extractionBlocked;
+    const canOpenChapter = (qualificationDecisionConfirmed || hasDraft) && !extractionBlocked;
     const canOpenApproval = (hasDraft || approvalTasks.length > 0 || exportFiles.length > 0) && !extractionBlocked;
 
     return [
@@ -1785,7 +1900,7 @@ export function App() {
         description: "查看文件解析和矩阵生成的后台进度。",
         status: importProcessingFailed
           ? "risk"
-          : importProcessingHasActiveTask
+          : importProcessingInProgress
             ? "todo"
             : importProcessingDone || parsedDocuments.length || matrixRows.length
               ? "done"
@@ -1794,7 +1909,7 @@ export function App() {
                 : "not_started",
         statusText: importProcessingFailed
           ? "需要处理"
-          : importProcessingHasActiveTask
+          : importProcessingInProgress
             ? `${importProcessingPercent}%`
             : importProcessingDone
               ? "已完成"
@@ -1802,7 +1917,7 @@ export function App() {
                 ? "可查看"
                 : "未开始",
         actionText: "进入任务中心",
-        reason: importProcessingHasActiveTask
+        reason: importProcessingInProgress
           ? importProcessingStageMessage
           : importProcessingFailed
             ? "后台任务失败，请查看原因后重试或处理质量门禁。"
@@ -1815,6 +1930,7 @@ export function App() {
         title: "质量门禁",
         description: "处理章节规划、来源回链和漏抽覆盖等生成阻断。",
         status: matrixTaskActive
+          && !matrixRows.length
           ? "todo"
           : extractionBlocked
           ? "risk"
@@ -1824,6 +1940,7 @@ export function App() {
               ? "todo"
               : "not_started",
         statusText: matrixTaskActive
+          && !matrixRows.length
           ? "生成中"
           : extractionBlocked
             ? `${extractionQualityIssueCount} 个阻断`
@@ -1869,10 +1986,18 @@ export function App() {
               ? `已完成 · ${highRiskCount} 高风险已确认`
               : "已完成"
           : "未生成",
-        actionText: matrixTaskActive ? "查看处理状态" : matrixRows.length ? "查看合规矩阵" : "生成合规矩阵",
-	        reason: matrixTaskActive
+        actionText: matrixTaskActive && !matrixRows.length
+          ? "查看处理状态"
+          : preflightCheck?.matrix_outdated
+          ? "重新生成矩阵"
+          : matrixRows.length
+            ? "查看合规矩阵"
+            : "生成合规矩阵",
+	        reason: matrixTaskActive && !matrixRows.length
             ? "合规矩阵正在后台生成，完成后会自动刷新矩阵和提交前核验。"
-            : matrixRows.length
+            : preflightCheck?.matrix_outdated
+              ? "当前矩阵落后于最新解析版本，建议重新生成后再审阅。"
+              : matrixRows.length
 	          ? unresolvedMatrixCount
 	            ? `当前有 ${matrixRows.length} 条矩阵项，${unresolvedMatrixCount} 条仍需确认或补材料。${extractionBlocked ? " 质量门禁问题请到专门页面处理。" : ""}`
 	            : "合规矩阵已全部人工确认，可以进入证据绑定和资格预评估。"
@@ -1956,18 +2081,30 @@ export function App() {
         title: "资格预评估",
         description: "基于矩阵和企业画像生成 Go/No-Go 建议。",
         status: hasDecision
-          ? qualificationDecision?.recommendation === "no_go"
+          ? qualificationDecisionNeedsConfirmation
+            ? "todo"
+            : qualificationDecision?.recommendation === "no_go"
             ? "risk"
             : "done"
           : matrixRows.length
             ? "todo"
             : "not_started",
         statusText: hasDecision
-          ? decisionLabels[qualificationDecision?.recommendation ?? ""] ?? "已生成"
+          ? qualificationDecisionNeedsConfirmation
+            ? "待确认"
+            : decisionLabels[qualificationDecision?.recommendation ?? ""] ?? "已生成"
           : "未评估",
-        actionText: hasDecision ? "查看参标建议" : "运行资格预评估",
+        actionText: hasDecision
+          ? qualificationDecisionNeedsConfirmation
+            ? "确认参标建议"
+            : "查看参标建议"
+          : qualificationEvaluations.length
+            ? "生成参标建议"
+            : "运行资格预评估",
 	        reason: hasDecision
-	          ? qualificationDecision?.summary ?? "参标建议已生成。"
+	          ? qualificationDecisionNeedsConfirmation
+              ? "参标建议已生成，需人工确认后再作为商务草稿上下文。"
+              : qualificationDecision?.summary ?? "参标建议已生成。"
 	          : matrixRows.length
 	            ? "矩阵已有候选项，可以运行资格预评估并生成参标建议。"
 	            : "需要先生成合规矩阵。",
@@ -1978,16 +2115,26 @@ export function App() {
         key: "chapter",
         title: "商务草稿",
         description: "生成可编辑、可核验、可导出的商务标章节。",
-        status: hasDraft ? "done" : hasDecision ? "todo" : "not_started",
+        status: hasDraft ? "done" : qualificationDecisionConfirmed && qualificationDecisionIsNoGo ? "risk" : hasDecision ? "todo" : "not_started",
         statusText: hasDraft ? `${businessDraftChapters.length} 章` : "未生成",
-        actionText: hasDraft ? "编辑商务草稿" : "生成商务标草稿",
+        actionText: hasDraft ? "编辑商务草稿" : qualificationDecisionConfirmed && qualificationDecisionIsNoGo ? "风险接受后生成草稿" : "生成商务标草稿",
 	        reason: hasDraft
 	          ? "商务标章节草稿已生成，可继续事实校验和导出。"
-	          : hasDecision
-	            ? "参标建议已有结果，可以生成商务标草稿。"
-	            : "需要先完成资格预评估。",
+            : qualificationDecisionConfirmed && qualificationDecisionIsNoGo
+              ? "参标建议为 No-Go；如仍要继续，需要先填写风险接受说明。"
+	          : qualificationDecisionConfirmed
+	            ? "参标建议已确认，可以生成商务标草稿。"
+	            : qualificationDecisionNeedsConfirmation
+                ? "参标建议还未人工确认，请先回到资格预评估确认结论。"
+                : "需要先完成资格预评估。",
 	        disabled: !canOpenChapter,
-	        disabledReason: canOpenChapter ? null : extractionBlocked ? extractionBlockReason : "请先完成资格预评估，生成参标建议。"
+	        disabledReason: canOpenChapter
+            ? null
+            : extractionBlocked
+              ? extractionBlockReason
+              : qualificationDecisionNeedsConfirmation
+                ? "请先确认参标建议。"
+                : "请先完成资格预评估，生成参标建议。"
 	      },
       {
         key: "approval",
@@ -2017,14 +2164,20 @@ export function App() {
       importProcessingDone,
       importProcessingFailed,
       importProcessingHasActiveTask,
+      importProcessingInProgress,
       importProcessingPercent,
       importProcessingStageMessage,
 	    exportFiles.length,
       matrixTaskActive,
 	    matrixRows,
       parseTaskActive,
+      preflightCheck?.matrix_outdated,
 	    technicalRows,
 	    qualificationDecision,
+      qualificationDecisionConfirmed,
+      qualificationDecisionIsNoGo,
+      qualificationDecisionNeedsConfirmation,
+      qualificationEvaluations.length,
 	    selectedProjectId,
 	    selectedSectionId,
 	    unresolvedHighRiskRows.length,
@@ -2032,13 +2185,115 @@ export function App() {
 	  ]);
 
   const recommendedStep = useMemo(() => {
+    const parsedDocumentCount = documents.filter((document) => isUsableParseStatus(document.current_version?.parse_status)).length;
+    const unresolvedTechnicalCount = technicalRows.filter((row) => !isMatrixItemResolved(row)).length;
+    let preferredKey: WorkflowStepKey | null = null;
+
+    if (importProcessingInProgress) {
+      preferredKey = "tasks";
+    } else if (importProcessingQualityBlocked || extractionBlocked) {
+      preferredKey = "quality";
+    } else if (!parsedDocumentCount) {
+      preferredKey = "documents";
+    } else if (!matrixRows.length || preflightCheck?.matrix_outdated) {
+      preferredKey = "matrix";
+    } else if (unresolvedHighRiskRows.length || unresolvedMatrixRows.length) {
+      preferredKey = "review";
+    } else if (evidenceRows.length) {
+      preferredKey = "evidence";
+    } else if (unresolvedTechnicalCount) {
+      preferredKey = "technical";
+    } else if (!qualificationDecision || qualificationDecisionNeedsConfirmation) {
+      preferredKey = "qualification";
+    } else if (primaryBlockingPreflightTarget && primaryBlockingPreflightTarget !== "approval") {
+      preferredKey = primaryBlockingPreflightTarget;
+    } else if (!businessDraftChapters.length) {
+      preferredKey = "chapter";
+    } else if (primaryBlockingPreflightTarget) {
+      preferredKey = primaryBlockingPreflightTarget;
+    } else {
+      preferredKey = "approval";
+    }
+
     return (
-      workflowSteps.find((step) => !step.disabled && (step.status === "todo" || step.status === "risk")) ??
+      workflowSteps.find((step) => step.key === preferredKey && !step.disabled) ??
+      workflowSteps.find((step) => !step.disabled && (step.status === "risk" || step.status === "todo")) ??
       workflowSteps.find((step) => !step.disabled && step.status === "not_started") ??
       workflowSteps.find((step) => !step.disabled) ??
       workflowSteps[workflowSteps.length - 1]
     );
-  }, [workflowSteps]);
+  }, [
+    businessDraftChapters.length,
+    documents,
+    evidenceRows.length,
+    extractionBlocked,
+    importProcessingInProgress,
+    importProcessingQualityBlocked,
+    matrixRows.length,
+    preflightCheck?.matrix_outdated,
+    primaryBlockingPreflightTarget,
+    qualificationDecision,
+    qualificationDecisionNeedsConfirmation,
+    technicalRows,
+    unresolvedHighRiskRows.length,
+    unresolvedMatrixRows.length,
+    workflowSteps
+  ]);
+
+  const recommendedPreflightCheck = recommendedStep
+    ? preflightCheck?.checks.find(
+        (item) => item.status === "block" && workflowStepForPreflightCheck(item) === recommendedStep.key
+      ) ??
+      preflightCheck?.checks.find(
+        (item) => item.status === "warn" && workflowStepForPreflightCheck(item) === recommendedStep.key
+      ) ??
+      null
+    : null;
+
+  const simpleWorkflowSteps = useMemo<SimpleWorkflowStep[]>(() => {
+    const byKey = new Map(workflowSteps.map((step) => [step.key, step]));
+    const group = (key: string, title: string, targetKey: WorkflowStepKey, activeKeys: WorkflowStepKey[]) => {
+      const groupSteps = activeKeys.map((stepKey) => byKey.get(stepKey)).filter(Boolean) as WorkflowStep[];
+      const targetStep = byKey.get(targetKey) ?? groupSteps[0];
+      const waitsForCurrentTask = importProcessingOpenTask && key !== "prepare" && key !== "tasks";
+      const status: WorkflowStepStatus = groupSteps.some((step) => step.status === "risk")
+        ? "risk"
+        : groupSteps.some((step) => step.status === "todo")
+          ? "todo"
+          : groupSteps.length && groupSteps.every((step) => step.status === "done")
+            ? "done"
+            : groupSteps.some((step) => step.status === "not_started")
+              ? "not_started"
+              : targetStep?.status ?? "not_started";
+
+      return {
+        key,
+        title,
+        targetKey,
+        activeKeys,
+        status: waitsForCurrentTask ? "not_started" : status,
+        statusText: waitsForCurrentTask ? "待更新" : targetStep?.statusText ?? "未开始",
+        reason: waitsForCurrentTask ? "后台任务完成后会刷新本步骤结果。" : targetStep?.reason ?? "",
+        disabled: waitsForCurrentTask ? true : targetStep?.disabled ?? true,
+        disabledReason: waitsForCurrentTask ? "请先等待第二步后台任务完成。" : targetStep?.disabledReason ?? "请先完成前置步骤。"
+      };
+    };
+
+    return [
+      group("prepare", "上传文件", "documents", ["documents"]),
+      group("tasks", "等待系统", "tasks", ["tasks"]),
+      group("quality", "质检处理", "quality", ["quality"]),
+      group("review", "审阅条款", matrixRows.length ? "review" : "matrix", ["matrix", "review"]),
+      group("evidence", "绑定资料", "evidence", ["evidence"]),
+      group(
+        "decision",
+        "资格/技术",
+        technicalRows.some((row) => !isMatrixItemResolved(row)) ? "technical" : "qualification",
+        ["technical", "qualification"]
+      ),
+      group("draft", "草稿导出", businessDraftChapters.length ? "approval" : "chapter", ["chapter", "approval"])
+    ];
+  }, [businessDraftChapters.length, importProcessingOpenTask, matrixRows.length, technicalRows, workflowSteps]);
 
   useEffect(() => {
     if (!selectedSectionId || !recommendedStep) return;
@@ -2121,7 +2376,7 @@ export function App() {
     if (!selectedProjectId || !selectedSectionId) return;
     setLoadingMatrix(true);
     try {
-      const data = await listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 });
+      const data = await listComplianceItems(selectedProjectId, selectedSectionId, { limit: COMPLIANCE_ITEM_FETCH_LIMIT });
       setComplianceItems(data);
       setSelectedRowKeys([]);
     } finally {
@@ -2302,9 +2557,20 @@ export function App() {
         };
       });
 
-      const parseTerminal = isAsyncTaskTerminal(parseTask, importProcessing.parseTaskId);
-      const matrixTerminal = isAsyncTaskTerminal(matrixTask, importProcessing.matrixTaskId);
-      if (parseTerminal || matrixTerminal) {
+      const terminalRefreshKeys = [
+        importProcessing.parseTaskId && parseTask && isAsyncTaskTerminalStatus(parseTask.status)
+          ? `${parseTask.id}:${parseTask.status}`
+          : null,
+        importProcessing.matrixTaskId && matrixTask && isAsyncTaskTerminalStatus(matrixTask.status)
+          ? `${matrixTask.id}:${matrixTask.status}`
+          : null
+      ].filter((key): key is string => Boolean(key));
+      const newTerminalRefreshKeys = terminalRefreshKeys.filter(
+        (key) => !terminalTaskRefreshKeysRef.current.has(key)
+      );
+
+      if (newTerminalRefreshKeys.length) {
+        newTerminalRefreshKeys.forEach((key) => terminalTaskRefreshKeysRef.current.add(key));
         await Promise.all([
           reloadWorkspaceSummary(),
           reloadDocumentsAndExports(),
@@ -2314,6 +2580,8 @@ export function App() {
         ]);
       }
 
+      const parseTerminal = isAsyncTaskTerminal(parseTask, importProcessing.parseTaskId);
+      const matrixTerminal = isAsyncTaskTerminal(matrixTask, importProcessing.matrixTaskId);
       if (parseTerminal && matrixTerminal && !clearTimer) {
         clearTimer = window.setTimeout(() => {
           setImportProcessing((current) => {
@@ -2612,6 +2880,15 @@ export function App() {
   const focusReviewRow = useCallback((row: MatrixRow) => {
     setActiveReviewItemId(row.key);
     setLocatingReviewItemId(row.key);
+    const filteredIndex = matrixReviewRows.findIndex((item) => item.key === row.key);
+    const allIndex = allMatrixReviewRows.findIndex((item) => item.key === row.key);
+    const queueIndex = filteredIndex >= 0 ? filteredIndex : allIndex;
+    if (queueIndex >= 0) {
+      if (filteredIndex < 0) {
+        setMatrixReviewFilter("all");
+      }
+      setReviewQueuePage(Math.floor(queueIndex / reviewQueuePageSize) + 1);
+    }
     if (locateReviewTimerRef.current !== null) {
       window.clearTimeout(locateReviewTimerRef.current);
     }
@@ -2636,18 +2913,26 @@ export function App() {
       } else {
         itemTarget?.scrollIntoView({ block: "center", behavior: "smooth" });
       }
-    }, 60);
-  }, [effectiveReviewHighlights]);
+    }, 160);
+  }, [allMatrixReviewRows, effectiveReviewHighlights, matrixReviewRows, reviewQueuePageSize]);
 
   const focusReviewChunk = useCallback(
     (chunkId: string) => {
-      const row = matrixRows.find((item) => item.raw.source_chunk_id === chunkId);
+      const row = allMatrixReviewRows.find((item) => item.raw.source_chunk_id === chunkId);
       if (row) {
         focusReviewRow(row);
       }
     },
-    [focusReviewRow, matrixRows]
+    [allMatrixReviewRows, focusReviewRow]
   );
+
+  useEffect(() => {
+    if (activeTab !== "review" || !activeReviewItemId) return;
+    const itemTarget = document.querySelector(`[data-review-item-id="${activeReviewItemId}"]`);
+    if (itemTarget instanceof HTMLElement && reviewItemPaneRef.current) {
+      scrollElementIntoContainer(itemTarget, reviewItemPaneRef.current);
+    }
+  }, [activeReviewItemId, activeTab, pagedMatrixReviewRows]);
 
   const openSourceCreateDraft = useCallback((chunk: ReviewChunk, selectedText?: string) => {
     const text = (selectedText || chunk.content_text).trim();
@@ -2683,14 +2968,13 @@ export function App() {
   );
 
   const activateReviewHighlight = useCallback((highlight: MatrixReviewHighlight) => {
+    const row = matrixRows.find((item) => item.key === highlight.item_id);
+    if (row) {
+      focusReviewRow(row);
+      return;
+    }
     setActiveReviewItemId(highlight.item_id);
-    window.setTimeout(() => {
-      const itemTarget = document.querySelector(`[data-review-item-id="${highlight.item_id}"]`);
-      if (itemTarget instanceof HTMLElement && reviewItemPaneRef.current) {
-        scrollElementIntoContainer(itemTarget, reviewItemPaneRef.current);
-      }
-    }, 60);
-  }, []);
+  }, [focusReviewRow, matrixRows]);
 
   const renderHighlightedText = useCallback(
     (text: string, highlights: MatrixReviewHighlight[], baseKey: string, baseOffset = 0) => {
@@ -3109,7 +3393,7 @@ export function App() {
           }
           if (task.status === "succeeded") {
             const [items] = await Promise.all([
-              listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 }),
+              listComplianceItems(selectedProjectId, selectedSectionId, { limit: COMPLIANCE_ITEM_FETCH_LIMIT }),
               reloadDocumentsAndExports(),
               reloadExtractionQuality(),
               reloadAuditLogs(),
@@ -3175,6 +3459,43 @@ export function App() {
     }
   };
 
+  const confirmNoGoRiskAcceptance = (onContinue: () => void) => {
+    if (!qualificationDecision) return;
+    let reason = "";
+    Modal.confirm({
+      title: "参标建议为 No-Go，仍继续？",
+      content: (
+        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          <Alert
+            type="error"
+            showIcon
+            message="当前建议不参标"
+            description={qualificationDecision.summary || "资格预评估存在阻断或缺失项。"}
+          />
+          <Text type="secondary">继续生成商务草稿前，需要记录风险接受说明；该说明会写入本地操作日志。</Text>
+          <TextArea
+            placeholder="请填写继续原因，例如：仅生成内部评审草稿，待补齐材料后再决策是否正式参标。"
+            autoSize={{ minRows: 3, maxRows: 5 }}
+            onChange={(event) => {
+              reason = event.target.value;
+            }}
+          />
+        </Space>
+      ),
+      okText: "风险接受并继续",
+      cancelText: "返回处理资格项",
+      onOk: () => {
+        if (!reason.trim()) {
+          Modal.warning({ title: "需要填写风险接受说明" });
+          return Promise.reject();
+        }
+        appendLog(`No-Go 风险接受：${truncateText(reason.trim(), 36)}`);
+        onContinue();
+        return undefined;
+      }
+    });
+  };
+
   const runWorkflowPrimaryAction = (stepKey: WorkflowStepKey) => {
     const targetStep = workflowSteps.find((step) => step.key === stepKey);
     if (targetStep?.disabled) {
@@ -3196,8 +3517,10 @@ export function App() {
     if (stepKey === "matrix") {
       if (extractionBlocked && !matrixRows.length) {
         activateWorkflowStep("quality");
-      } else if (matrixTaskActive) {
+      } else if (matrixTaskActive && !matrixRows.length) {
         activateWorkflowStep("matrix");
+      } else if (preflightCheck?.matrix_outdated) {
+        handleGenerateMatrix();
       } else if (matrixRows.length) {
         activateWorkflowStep("matrix");
       } else {
@@ -3219,7 +3542,13 @@ export function App() {
     }
     if (stepKey === "qualification") {
       if (qualificationDecision) {
-        activateWorkflowStep("qualification");
+        if (qualificationDecisionNeedsConfirmation) {
+          handleConfirmQualificationDecision();
+        } else {
+          activateWorkflowStep("qualification");
+        }
+      } else if (qualificationEvaluations.length) {
+        void handleGenerateQualificationDecision();
       } else {
         void handleRunQualificationEvaluation().then(() => handleGenerateQualificationDecision());
       }
@@ -3228,6 +3557,8 @@ export function App() {
     if (stepKey === "chapter") {
       if (businessDraftChapters.length) {
         activateWorkflowStep("chapter");
+      } else if (qualificationDecisionConfirmed && qualificationDecisionIsNoGo) {
+        confirmNoGoRiskAcceptance(confirmDraftGeneration);
       } else {
         confirmDraftGeneration();
       }
@@ -3240,6 +3571,19 @@ export function App() {
         confirmSubmit();
       }
     }
+  };
+
+  const handlePreflightCheckAction = (item: PreflightCheck["checks"][number]) => {
+    const target = workflowStepForPreflightCheck(item);
+    if (!target) {
+      appendLog("该待办暂未绑定处理页面");
+      return;
+    }
+    if (item.code === "matrix_version" || item.code === "draft_exists") {
+      runWorkflowPrimaryAction(target);
+      return;
+    }
+    activateWorkflowStep(target);
   };
 
   const handleConfirmQualificationDecision = () => {
@@ -4081,7 +4425,7 @@ export function App() {
       }
       appendLog(`重抽章节：${semanticSection.title}`);
       const [items] = await Promise.all([
-        listComplianceItems(selectedProjectId, selectedSectionId, { limit: 200 }),
+        listComplianceItems(selectedProjectId, selectedSectionId, { limit: COMPLIANCE_ITEM_FETCH_LIMIT }),
         reloadExtractionQuality(),
         activeTab === "review" ? reloadMatrixReview() : Promise.resolve(),
         getPreflightCheck(selectedProjectId, selectedSectionId).then(setPreflightCheck).catch(() => undefined)
@@ -5101,6 +5445,9 @@ export function App() {
                   <Tag icon={<ClockCircleOutlined />} color="processing">
                     截止 {formatDateTime(currentSection?.bid_deadline_at ?? currentProject?.bid_deadline_at ?? null)}
                   </Tag>
+                  <Button onClick={openKeyInfoModal} disabled={!currentProject || !currentSection}>
+                    项目信息
+                  </Button>
                   <Button type="primary" onClick={confirmSubmit}>
                     提交确认
                   </Button>
@@ -5116,6 +5463,10 @@ export function App() {
                     description={
                       importProcessingQualityBlocked
                         ? "系统已暂停本轮写入，上一版矩阵仍保留。请进入质量门禁页按建议处理阻断项。"
+                        : importProcessingParseFailed
+                        ? "文件解析失败，请在文件解析页重新解析；如果原文件异常，可重新上传后再生成矩阵。"
+                        : importProcessingMatrixFailed
+                        ? "矩阵生成失败，请查看矩阵任务错误后重新生成；如果被质量门禁拦截，先处理质检阻断。"
                         : importProcessingFailed
                         ? "解析或矩阵生成失败，请查看下方任务状态后重新解析或重新生成矩阵。"
                         : importProcessingDone
@@ -5136,13 +5487,14 @@ export function App() {
                     <Progress
                       percent={importProcessingPercent}
                       status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : "active"}
+                      showInfo={false}
                     />
                     {!importProcessingDone && !importProcessingFailed && (
                       <Text type="secondary" className="background-task-hint">
                         当前不需要人工操作；如果质量门禁拦截，系统会在完成后引导到专门处理页。
                       </Text>
                     )}
-                    {(importProcessingHasActiveTask || importProcessingQualityBlocked || importProcessingFailed) && (
+                    {(importProcessingInProgress || importProcessingQualityBlocked || importProcessingFailed) && (
                       <Space className="background-task-actions" wrap>
                         <Button onClick={() => openWorkspace("tasks")}>
                           进入任务中心
@@ -5164,11 +5516,6 @@ export function App() {
                             {asyncTaskStatusLabels[importProcessing.parseTask?.status ?? "pending"] ?? "处理中"}
                           </Tag>
                         </div>
-                        <Progress
-                          percent={asyncTaskProgress(importProcessing.parseTask, importProcessing.parseTaskId)}
-                          size="small"
-                          status={importProcessing.parseTask?.status === "failed" ? "exception" : undefined}
-                        />
                         <Text type="secondary">
                           {taskProgressMessage(
                             importProcessing.parseTask,
@@ -5187,11 +5534,6 @@ export function App() {
                           </Tag>
                         </div>
                         <Text type="secondary">{matrixTaskStageTitle(importProcessing.matrixTask)}</Text>
-                        <Progress
-                          percent={asyncTaskProgress(importProcessing.matrixTask, importProcessing.matrixTaskId)}
-                          size="small"
-                          status={importProcessing.matrixTask?.status === "failed" ? "exception" : undefined}
-                        />
                         <Text type="secondary">
                           {taskProgressMessage(
                             importProcessing.matrixTask,
@@ -5205,154 +5547,192 @@ export function App() {
                 </section>
               )}
 
-              <section className="workflow-guide">
-	                <div className="workflow-steps">
-	                  {workflowSteps.map((step, index) => (
-	                    <Tooltip key={step.key} title={step.disabled ? step.disabledReason : step.reason}>
-	                      <button
-	                        className={[
-	                          "workflow-step",
-	                          step.key === activeTab ? "active" : "",
-	                          step.key === recommendedStep?.key ? "recommended" : "",
-	                          step.disabled ? "disabled" : ""
-	                        ]
-	                          .filter(Boolean)
-	                          .join(" ")}
-	                        disabled={step.disabled}
-	                        onClick={() => activateWorkflowStep(step.key)}
-	                      >
-	                        <span className="workflow-index">{index + 1}</span>
-	                        <strong>{step.title}</strong>
-	                        {step.disabled ? (
-	                          <Tag>待前置</Tag>
-	                        ) : step.key === recommendedStep?.key ? (
-	                          <Tag color={workflowStatusColor(step.status)}>下一步</Tag>
-	                        ) : null}
-	                      </button>
-	                    </Tooltip>
-	                  ))}
-	                </div>
-	                {recommendedStep && (
-	                  <div className="next-action-card">
-	                    <div className="next-action-copy">
-	                      <Text strong>下一步：{recommendedStep.title}</Text>
-	                      <Text type="secondary">{recommendedStep.reason}</Text>
-	                    </div>
-	                    <Button type="primary" onClick={() => runWorkflowPrimaryAction(recommendedStep.key)}>
-	                      {recommendedStep.actionText}
-                    </Button>
+              <section className={preflightCheck ? "command-center" : "command-center command-center-single"}>
+                <div className="workflow-guide">
+                  {recommendedStep && (
+                    <div className="next-action-card">
+                      <div className="next-action-copy">
+                        <Text type="secondary" className="next-action-eyebrow">
+                          现在先做
+                        </Text>
+                        <Text strong>当前任务：{recommendedStep.title}</Text>
+                        <Text type="secondary">
+                          {recommendedPreflightCheck
+                            ? recommendedPreflightCheck.message
+                            : recommendedStep.reason}
+                        </Text>
+                        <div className="next-action-tags">
+                          {extractionQualityReport?.status === "passed" && <Tag color="green">质量门禁已通过</Tag>}
+                          {preflightCheck?.status && preflightCheck.status !== "pass" && (
+                            <Tag color={preflightColor(preflightCheck.status)}>提交前核验{preflightLabel(preflightCheck.status)}</Tag>
+                          )}
+                          {visiblePreflightChecks
+                            .filter((item) => item.status !== "pass")
+                            .slice(0, 3)
+                            .map((item) => (
+                              <Tag key={item.code} color={preflightColor(item.status)}>
+                                {item.title} {item.count}
+                              </Tag>
+                            ))}
+                        </div>
+                      </div>
+                      <Button type="primary" onClick={() => runWorkflowPrimaryAction(recommendedStep.key)}>
+                        {recommendedStep.actionText}
+                      </Button>
+                    </div>
+                  )}
+                  <div className="workflow-steps" aria-label="项目简化流程">
+                    {simpleWorkflowSteps.map((step, index) => (
+                      <Tooltip
+                        key={step.key}
+                        title={
+                          <div className="workflow-step-tooltip">
+                            <div className="workflow-step-tooltip-head">
+                              <strong>{step.title}</strong>
+                              <Tag color={workflowStatusColor(step.status)}>{step.statusText}</Tag>
+                            </div>
+                            <p>{step.disabled ? step.disabledReason : step.reason}</p>
+                          </div>
+                        }
+                      >
+                        <span
+                          className="workflow-step-hitbox"
+                          title={`${step.title} · ${step.statusText}\n${step.disabled ? step.disabledReason ?? "" : step.reason}`}
+                        >
+                          <button
+                            className={[
+                              "workflow-step",
+                              `status-${step.status === "not_started" ? "not-started" : step.status}`,
+                              step.activeKeys.includes(recommendedStep?.key as WorkflowStepKey) &&
+                              step.status !== "done" &&
+                              step.status !== "not_started"
+                                ? "current-blocking"
+                                : "",
+                              step.activeKeys.includes(activeTab as WorkflowStepKey) ? "active" : "",
+                              step.activeKeys.includes(recommendedStep?.key as WorkflowStepKey) ? "recommended" : "",
+                              step.disabled ? "disabled" : ""
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
+                            aria-label={`${index + 1}. ${step.title}，${step.statusText}`}
+                            disabled={step.disabled}
+                            onClick={() => activateWorkflowStep(step.targetKey)}
+                          >
+                            <span className="workflow-index">{index + 1}</span>
+                            <strong>{step.title}</strong>
+                          </button>
+                        </span>
+                      </Tooltip>
+                    ))}
+                  </div>
+
+                  {currentProject && currentSection && missingKeyInfo.length > 0 && (
+                    <section className="key-info-panel">
+                      <div className="key-info-header">
+                        <Space wrap>
+                          <Text strong>项目关键信息</Text>
+                          {missingKeyInfo.length ? (
+                            <Tag color="orange">缺失 {missingKeyInfo.join("、")}</Tag>
+                          ) : (
+                            <Tag color="green">关键字段已填写</Tag>
+                          )}
+                        </Space>
+                        <Button size="small" onClick={openKeyInfoModal}>
+                          编辑/确认
+                        </Button>
+                      </div>
+                      <div className="key-info-grid">
+                        <div>
+                          <Text type="secondary">招标人</Text>
+                          <strong>{currentProject.purchaser || "未填写"}</strong>
+                        </div>
+                        <div>
+                          <Text type="secondary">预算/限价</Text>
+                          <strong>{currentSection.budget_amount || currentProject.budget_amount || "未填写"}</strong>
+                        </div>
+                        <div>
+                          <Text type="secondary">投标截止</Text>
+                          <strong>{formatDateTime(currentSection.bid_deadline_at ?? currentProject.bid_deadline_at)}</strong>
+                        </div>
+                        <div>
+                          <Text type="secondary">地区/行业</Text>
+                          <strong>{[currentProject.region_code, currentProject.industry_code].filter(Boolean).join(" / ") || "未填写"}</strong>
+                        </div>
+                      </div>
+                    </section>
+                  )}
+
+                  <section className="status-grid">
+                    <div className="metric-item">
+                      <Text type="secondary">合规项</Text>
+                      <strong>{currentSection?.compliance_item_count ?? matrixRows.length}</strong>
+                      <Text type="secondary">{unresolvedMatrixRows.length ? `${unresolvedMatrixRows.length} 条待确认` : "已全部确认"}</Text>
+                    </div>
+                    <div className="metric-item">
+                      <Text type="secondary">缺项</Text>
+                      <strong>{matrixRows.filter((row) => row.statusCode === "needs_material").length}</strong>
+                      <Text type="secondary">需要补资料或说明</Text>
+                    </div>
+                    <div className="metric-item">
+                      <Text type="secondary">已确认</Text>
+                      <strong>{matrixRows.filter((row) => row.statusCode === "confirmed").length}</strong>
+                      <Text type="secondary">人工核对完成</Text>
+                    </div>
+                    <div className="metric-item">
+                      <Text type="secondary">高风险</Text>
+                      <strong>{currentSection?.high_risk_count ?? 0}</strong>
+                      <Text type="secondary">{unresolvedHighRiskRows.length ? `${unresolvedHighRiskRows.length} 条待处理` : "暂无待处理"}</Text>
+                    </div>
+                    <div className="metric-item approval-metric">
+                      <Text type="secondary">待审批</Text>
+                      <strong>{approvalTasks.filter((task) => task.status === "pending").length}</strong>
+                      <Button size="small" onClick={() => activateWorkflowStep("tasks")}>
+                        进入任务中心
+                      </Button>
+                    </div>
+                  </section>
+                </div>
+
+                {preflightCheck && (
+                  <div className="preflight-panel">
+                    <div className="preflight-header">
+                      <Space wrap>
+                        <Text strong>待办队列</Text>
+                        <Tag color={preflightColor(preflightCheck.status)}>{preflightLabel(preflightCheck.status)}</Tag>
+                        {preflightCheck.matrix_outdated && <Tag color="red">矩阵已过期</Tag>}
+                      </Space>
+                      <Text type="secondary">
+                        {visiblePreflightChecks.some((item) => item.status !== "pass")
+                          ? "按卡片顺序处理；点击卡片会进入对应页面或执行对应操作。"
+                          : preflightCheck.summary}
+                      </Text>
+                    </div>
+                    <div className="preflight-checks">
+                      {visiblePreflightChecks.map((item) => (
+                        <button
+                          key={item.code}
+                          className={`preflight-check ${item.status}`}
+                          onClick={() => handlePreflightCheckAction(item)}
+                        >
+                          <Tag color={preflightColor(item.status)}>{item.title}</Tag>
+                          <strong>{item.status === "pass" ? "已通过" : item.count}</strong>
+                          <span>{item.message}</span>
+                          <span className="preflight-action-text">{preflightActionText(item)}</span>
+                        </button>
+                      ))}
+                    </div>
+                    {preflightChecksForDisplay.length > 4 && (
+                      <Button
+                        type="text"
+                        size="small"
+                        className="preflight-expand-button"
+                        onClick={() => setPreflightExpanded((value) => !value)}
+                      >
+                        {preflightExpanded ? "收起待办" : `展开全部（还有 ${hiddenPreflightCheckCount} 项）`}
+                      </Button>
+                    )}
                   </div>
                 )}
-              </section>
-
-              {preflightCheck && (
-                <section className="preflight-panel">
-                  <div className="preflight-header">
-                    <Space wrap>
-                      <Text strong>提交前核验</Text>
-                      <Tag color={preflightColor(preflightCheck.status)}>{preflightLabel(preflightCheck.status)}</Tag>
-                      {preflightCheck.matrix_outdated && <Tag color="red">矩阵已过期</Tag>}
-	                    </Space>
-	                    <Text type="secondary">
-	                      {visiblePreflightChecks.some((item) => item.status !== "pass")
-	                        ? "优先展示阻塞和待复核项；已通过项已收起。"
-	                        : preflightCheck.summary}
-	                    </Text>
-	                  </div>
-	                  <div className="preflight-checks">
-	                    {visiblePreflightChecks.map((item) => (
-	                      <button
-	                        key={item.code}
-	                        className={`preflight-check ${item.status}`}
-	                        onClick={() => item.target && activateWorkflowStep(item.target as WorkflowStepKey)}
-	                      >
-	                        <Tag color={preflightColor(item.status)}>{item.title}</Tag>
-	                        <strong>{item.status === "pass" ? "已通过" : item.count}</strong>
-	                        <span>{item.message}</span>
-	                      </button>
-	                    ))}
-                  </div>
-                </section>
-              )}
-
-              {currentProject && currentSection && (
-                <section className="key-info-panel">
-                  <div className="key-info-header">
-                    <Space wrap>
-                      <Text strong>项目关键信息</Text>
-                      {missingKeyInfo.length ? (
-                        <Tag color="orange">缺失 {missingKeyInfo.join("、")}</Tag>
-                      ) : (
-                        <Tag color="green">关键字段已填写</Tag>
-                      )}
-                    </Space>
-                    <Button size="small" onClick={openKeyInfoModal}>
-                      编辑/确认
-                    </Button>
-                  </div>
-                  <div className="key-info-grid">
-                    <div>
-                      <Text type="secondary">招标人</Text>
-                      <strong>{currentProject.purchaser || "未填写"}</strong>
-                    </div>
-                    <div>
-                      <Text type="secondary">预算/限价</Text>
-                      <strong>{currentSection.budget_amount || currentProject.budget_amount || "未填写"}</strong>
-                    </div>
-                    <div>
-                      <Text type="secondary">投标截止</Text>
-                      <strong>{formatDateTime(currentSection.bid_deadline_at ?? currentProject.bid_deadline_at)}</strong>
-                    </div>
-                    <div>
-                      <Text type="secondary">地区/行业</Text>
-                      <strong>{[currentProject.region_code, currentProject.industry_code].filter(Boolean).join(" / ") || "未填写"}</strong>
-                    </div>
-                  </div>
-                </section>
-              )}
-
-              <section className="status-grid">
-                <div className="metric-item">
-                  <Text type="secondary">合规项</Text>
-                  <strong>{currentSection?.compliance_item_count ?? matrixRows.length}</strong>
-                  <Progress percent={matrixCompletionPercent} size="small" showInfo={false} />
-                </div>
-                <div className="metric-item">
-                  <Text type="secondary">缺项</Text>
-                  <strong>{matrixRows.filter((row) => row.statusCode === "needs_material").length}</strong>
-                  <Progress
-                    percent={Math.min(100, matrixRows.filter((row) => row.statusCode === "needs_material").length * 20)}
-                    size="small"
-                    status="exception"
-                    showInfo={false}
-                  />
-                </div>
-                <div className="metric-item">
-                  <Text type="secondary">已确认</Text>
-                  <strong>{matrixRows.filter((row) => row.statusCode === "confirmed").length}</strong>
-                  <Progress
-                    percent={matrixRows.length ? Math.round((matrixRows.filter((row) => row.statusCode === "confirmed").length / matrixRows.length) * 100) : 0}
-                    size="small"
-                    showInfo={false}
-                  />
-                </div>
-                <div className="metric-item">
-                  <Text type="secondary">高风险</Text>
-                  <strong>{currentSection?.high_risk_count ?? 0}</strong>
-                  <Progress
-                    percent={Math.min(100, (currentSection?.high_risk_count ?? 0) * 20)}
-                    size="small"
-                    strokeColor="#cf1322"
-                    showInfo={false}
-                  />
-                </div>
-                <div className="metric-item approval-metric">
-                  <Text type="secondary">待审批</Text>
-                  <strong>{approvalTasks.filter((task) => task.status === "pending").length}</strong>
-                  <Button size="small" onClick={() => activateWorkflowStep("tasks")}>
-                    进入任务中心
-                  </Button>
-                </div>
               </section>
 
               <Tabs
@@ -5373,9 +5753,6 @@ export function App() {
                             <Text strong>后台任务中心</Text>
                             <p>集中查看文件解析、并发抽取、质量门禁和下一步动作。</p>
                           </div>
-                          <Tag color={importProcessingFailed ? "red" : importProcessingHasActiveTask ? "blue" : "green"}>
-                            {importProcessingHasActiveTask ? `${importProcessingPercent}%` : importProcessingFailed ? "需要处理" : "当前空闲"}
-                          </Tag>
                         </div>
 
                         <div className="task-center-status">
@@ -5384,22 +5761,37 @@ export function App() {
                               <Text strong>{importProcessingStageTitle}</Text>
                               <p>{importProcessingStageMessage}</p>
                             </div>
-                            <Tag color={importProcessingFailed ? "red" : importProcessingDone ? "green" : "blue"}>
-                              {importProcessingPercent}%
+                            <Tag color={importProcessingFailed ? "red" : importProcessingDone ? "green" : currentImportProcessing ? "blue" : "default"}>
+                              {currentImportProcessing ? `${importProcessingPercent}%` : "空闲"}
                             </Tag>
                           </div>
-                          <Progress
-                            percent={importProcessingPercent}
-                            status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : importProcessingHasActiveTask ? "active" : "normal"}
-                          />
+                          {currentImportProcessing && (
+                            <Progress
+                              percent={importProcessingPercent}
+                              status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : importProcessingOpenTask ? "active" : "normal"}
+                              showInfo={false}
+                            />
+                          )}
                           <div className="task-center-actions">
                             {importProcessingQualityBlocked ? (
                               <Button type="primary" icon={<WarningOutlined />} onClick={() => activateWorkflowStep("quality")}>
                                 处理质量门禁
                               </Button>
-                            ) : importProcessingFailed ? (
+                            ) : importProcessingParseFailed ? (
+                              <Button
+                                type="primary"
+                                icon={<FileTextOutlined />}
+                                onClick={() => (reviewDocument ? handleReparseDocument(reviewDocument) : activateWorkflowStep("documents"))}
+                              >
+                                重新解析文件
+                              </Button>
+                            ) : importProcessingMatrixFailed ? (
                               <Button type="primary" icon={<RobotOutlined />} onClick={() => handleGenerateMatrix(reviewDocument ?? undefined)}>
                                 重新生成矩阵
+                              </Button>
+                            ) : importProcessingFailed ? (
+                              <Button type="primary" icon={<RobotOutlined />} onClick={() => handleGenerateMatrix(reviewDocument ?? undefined)}>
+                                重试后台处理
                               </Button>
                             ) : matrixTaskActive ? (
                               <Button icon={<ClockCircleOutlined />} disabled>
@@ -5422,55 +5814,45 @@ export function App() {
                           </div>
                         </div>
 
-                        {importProcessing?.parseTaskId || importProcessing?.matrixTaskId ? (
+                        {currentImportProcessing && (currentImportProcessing.parseTaskId || currentImportProcessing.matrixTaskId) ? (
                           <div className="task-center-grid">
-                            {importProcessing.parseTaskId && (
+                            {currentImportProcessing.parseTaskId && (
                               <div className="task-center-card">
                                 <div className="task-center-card-head">
                                   <div>
                                     <Text strong>文件解析</Text>
-                                    <Text type="secondary">任务 {taskShortId(importProcessing.parseTaskId)}</Text>
+                                    <Text type="secondary">任务 {taskShortId(currentImportProcessing.parseTaskId)}</Text>
                                   </div>
-                                  <Tag color={asyncTaskStatusColors[importProcessing.parseTask?.status ?? "pending"]}>
-                                    {asyncTaskStatusText(importProcessing.parseTask, importProcessing.parseTaskId)}
+                                  <Tag color={asyncTaskStatusColors[currentImportProcessing.parseTask?.status ?? "pending"]}>
+                                    {asyncTaskStatusText(currentImportProcessing.parseTask, currentImportProcessing.parseTaskId)}
                                   </Tag>
                                 </div>
-                                <Progress
-                                  percent={asyncTaskProgress(importProcessing.parseTask, importProcessing.parseTaskId)}
-                                  size="small"
-                                  status={importProcessing.parseTask?.status === "failed" ? "exception" : importProcessing.parseTask?.status === "succeeded" ? "success" : "active"}
-                                />
                                 <Text type="secondary">
                                   {taskProgressMessage(
-                                    importProcessing.parseTask,
+                                    currentImportProcessing.parseTask,
                                     "正在读取文件、识别页码并切分条款。",
                                     "解析版本已生成。"
                                   )}
                                 </Text>
-                                <Text type="secondary">{taskTimeRange(importProcessing.parseTask)}</Text>
+                                <Text type="secondary">{taskTimeRange(currentImportProcessing.parseTask)}</Text>
                               </div>
                             )}
 
-                            {importProcessing.matrixTaskId && (
+                            {currentImportProcessing.matrixTaskId && (
                               <div className="task-center-card">
                                 <div className="task-center-card-head">
                                   <div>
                                     <Text strong>合规矩阵</Text>
-                                    <Text type="secondary">任务 {taskShortId(importProcessing.matrixTaskId)}</Text>
+                                    <Text type="secondary">任务 {taskShortId(currentImportProcessing.matrixTaskId)}</Text>
                                   </div>
-                                  <Tag color={asyncTaskStatusColors[importProcessing.matrixTask?.status ?? "pending"]}>
-                                    {asyncTaskStatusText(importProcessing.matrixTask, importProcessing.matrixTaskId)}
+                                  <Tag color={asyncTaskStatusColors[currentImportProcessing.matrixTask?.status ?? "pending"]}>
+                                    {asyncTaskStatusText(currentImportProcessing.matrixTask, currentImportProcessing.matrixTaskId)}
                                   </Tag>
                                 </div>
-                                <Text type="secondary">{matrixTaskStageTitle(importProcessing.matrixTask)}</Text>
-                                <Progress
-                                  percent={asyncTaskProgress(importProcessing.matrixTask, importProcessing.matrixTaskId)}
-                                  size="small"
-                                  status={importProcessing.matrixTask?.status === "failed" ? "exception" : importProcessing.matrixTask?.status === "succeeded" ? "success" : "active"}
-                                />
+                                <Text type="secondary">{matrixTaskStageTitle(currentImportProcessing.matrixTask)}</Text>
                                 <Text type="secondary">
                                   {taskProgressMessage(
-                                    importProcessing.matrixTask,
+                                    currentImportProcessing.matrixTask,
                                     "正在抽取资格项、强制响应项和风险点。",
                                     "矩阵已生成并刷新。"
                                   )}
@@ -5496,7 +5878,7 @@ export function App() {
                                     ))}
                                   </div>
                                 )}
-                                <Text type="secondary">{taskTimeRange(importProcessing.matrixTask)}</Text>
+                                <Text type="secondary">{taskTimeRange(currentImportProcessing.matrixTask)}</Text>
                               </div>
                             )}
                           </div>
@@ -5507,10 +5889,14 @@ export function App() {
                         <div className="task-center-next">
                           <Text strong>用户下一步</Text>
                           <Text type="secondary">
-                            {importProcessingHasActiveTask
+                            {importProcessingOpenTask
                               ? "不用在矩阵里找问题，等后台完成即可；如果被质量门禁拦截，系统会在这里给出处理按钮。"
                               : importProcessingQualityBlocked
                                 ? "点击“处理质量门禁”，按建议重新生成或只重抽问题段。"
+                                : importProcessingParseFailed
+                                  ? "点击“重新解析文件”；如果同一文件继续失败，回到文件解析页重新上传或人工修正原文。"
+                                  : importProcessingMatrixFailed
+                                    ? "点击“重新生成矩阵”；如果再次失败，优先查看质量门禁或矩阵任务错误信息。"
                                 : matrixRows.length
                                   ? "进入合规矩阵，优先确认高风险和强制响应条款。"
                                   : "先完成文件解析，再生成合规矩阵。"}
@@ -5924,7 +6310,7 @@ export function App() {
                         </div>
                         <Table<MatrixRow>
                           size="middle"
-                          pagination={false}
+                          pagination={LARGE_TABLE_PAGINATION}
                           rowKey="key"
                           dataSource={evidenceRows}
                           locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无缺证据项" /> }}
@@ -6051,6 +6437,14 @@ export function App() {
                                 </Button>
                               </div>
                               <p>{qualificationDecision.summary}</p>
+                              {qualificationDecision.status === "confirmed" && qualificationDecision.recommendation === "no_go" && (
+                                <Alert
+                                  type="error"
+                                  showIcon
+                                  message="当前结论为 No-Go"
+                                  description="如仍需生成商务草稿，请先在草稿入口填写风险接受说明；建议优先回到矩阵和证据项处理阻断。"
+                                />
+                              )}
                             </>
                           ) : (
                             <Alert
@@ -6125,7 +6519,7 @@ export function App() {
                           <Table<QualificationEvaluation>
                             size="middle"
                             rowKey="id"
-                            pagination={false}
+                            pagination={LARGE_TABLE_PAGINATION}
                             loading={evaluatingQualification}
                             scroll={{ x: 1580 }}
                             dataSource={qualificationEvaluations}
@@ -6328,7 +6722,7 @@ export function App() {
                         )}
                         <Table<MatrixRow>
                           size="middle"
-                          pagination={false}
+                          pagination={LARGE_TABLE_PAGINATION}
                           loading={loadingMatrix}
                           rowSelection={{
                             selectedRowKeys,
@@ -6535,7 +6929,10 @@ export function App() {
                             </Tag>
                             <Select<MatrixReviewFilter>
                               value={matrixReviewFilter}
-                              onChange={setMatrixReviewFilter}
+                              onChange={(value) => {
+                                setMatrixReviewFilter(value);
+                                setReviewQueuePage(1);
+                              }}
                               className="toolbar-select"
                               options={[
                                 { value: "all", label: "全部条目" },
@@ -6781,8 +7178,24 @@ export function App() {
                                   )}
                                 </Space>
                               </div>
+                              {matrixReviewRows.length > reviewQueuePageSize && (
+                                <Pagination
+                                  className="review-queue-pagination"
+                                  size="small"
+                                  current={reviewQueuePage}
+                                  pageSize={reviewQueuePageSize}
+                                  total={matrixReviewRows.length}
+                                  showSizeChanger
+                                  pageSizeOptions={["25", "50", "100"]}
+                                  showTotal={(total) => `共 ${total} 条`}
+                                  onChange={(page, pageSize) => {
+                                    setReviewQueuePage(page);
+                                    setReviewQueuePageSize(pageSize);
+                                  }}
+                                />
+                              )}
                               {matrixReviewRows.length ? (
-                                matrixReviewRows.map((row) => {
+                                pagedMatrixReviewRows.map((row) => {
                                   const isActive = row.key === activeReviewItemId;
                                   const duplicateGroups = duplicateGroupByItemId.get(row.key) ?? [];
                                   const reviewDetail = (
@@ -6931,7 +7344,7 @@ export function App() {
                         </div>
                         <Table<MatrixRow>
                           size="middle"
-                          pagination={false}
+                          pagination={LARGE_TABLE_PAGINATION}
                           rowKey="key"
                           dataSource={technicalRows}
                           locale={{
@@ -7037,9 +7450,15 @@ export function App() {
                                 type="primary"
                                 icon={<RobotOutlined />}
                                 loading={loadingBusinessDraft}
-                                onClick={confirmDraftGeneration}
+                                onClick={() =>
+                                  qualificationDecisionConfirmed && qualificationDecisionIsNoGo && !businessDraftChapters.length
+                                    ? confirmNoGoRiskAcceptance(confirmDraftGeneration)
+                                    : confirmDraftGeneration()
+                                }
                               >
-                                生成商务标草稿
+                                {qualificationDecisionConfirmed && qualificationDecisionIsNoGo && !businessDraftChapters.length
+                                  ? "风险接受后生成草稿"
+                                  : "生成商务标草稿"}
                               </Button>
                               <Button
                                 icon={<SafetyCertificateOutlined />}
@@ -8004,7 +8423,7 @@ export function App() {
             <Table<ComplianceEvidenceBinding>
               size="small"
               rowKey="id"
-              pagination={false}
+              pagination={LARGE_TABLE_PAGINATION}
               dataSource={evidenceBindings}
               locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未绑定企业资料" /> }}
               columns={[
@@ -8061,7 +8480,7 @@ export function App() {
             <Table<EnterpriseMaterialSearchResult>
               size="small"
               rowKey="id"
-              pagination={false}
+              pagination={LARGE_TABLE_PAGINATION}
               loading={loadingMaterialSearch}
               dataSource={materialSearchResults}
               locale={{
