@@ -15,7 +15,15 @@ from app.models.document import (
     DocumentSemanticSection,
     DocumentVersion,
 )
-from app.models.draft import BusinessDraftChapter, BusinessDraftEvidenceRef, DraftFactCheck
+from app.models.draft import (
+    BusinessDraftChapter,
+    BusinessDraftEvidenceRef,
+    DraftBlock,
+    DraftContextPack,
+    DraftCoverageReview,
+    DraftFactCheck,
+    DraftSectionContextPack,
+)
 from app.models.enterprise import EnterpriseMaterial, EnterpriseProfile
 from app.models.export import ExportFile
 from app.models.identity import Tenant, User
@@ -35,7 +43,11 @@ __all__ = [
     "BusinessDraftEvidenceRef",
     "ComplianceEvidenceBinding",
     "ComplianceItem",
+    "DraftBlock",
+    "DraftContextPack",
+    "DraftCoverageReview",
     "DraftFactCheck",
+    "DraftSectionContextPack",
     "Document",
     "DocumentChunk",
     "DocumentExtractionQualityReport",

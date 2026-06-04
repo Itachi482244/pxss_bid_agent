@@ -626,6 +626,115 @@ class BusinessDraftGenerateRequest(BaseModel):
     force: bool = True
 
 
+class BusinessDraftContextPackRequest(BaseModel):
+    profile_id: str = Field(default="engineering_construction_business_v1", max_length=128)
+    section_types: list[str] | None = Field(default=None, max_length=50)
+
+    @field_validator("section_types")
+    @classmethod
+    def normalize_section_types(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized = [item.strip() for item in value if item.strip()]
+        return normalized or None
+
+
+class BusinessDraftContextPackPreviewRead(BaseModel):
+    profile_id: str
+    profile_version: str
+    schema_version: str
+    readiness_status: str
+    context_json: dict[str, Any]
+    readiness_json: dict[str, Any]
+    outline_plan_json: dict[str, Any]
+
+
+class DraftSectionContextPackRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    context_pack_id: uuid.UUID
+    section_type: str
+    title: str
+    sort_order: int
+    generation_mode: str
+    status: str
+    context_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class DraftBlockRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    chapter_id: uuid.UUID | None
+    section_context_pack_id: uuid.UUID | None
+    block_type: str
+    content_text: str
+    sort_order: int
+    links_json: dict[str, Any]
+    fact_claims_json: list[dict[str, Any]] | None
+    missing_fact_placeholders_json: list[dict[str, Any]] | None
+    risk_flags_json: list[dict[str, Any]] | None
+    review_status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class DraftBlockUpdateRequest(BaseModel):
+    review_status: str = Field(pattern="^(pending|covered|needs_evidence|needs_fact|approved|rejected)$")
+    content_text: str | None = Field(default=None, min_length=1)
+    reason: str = Field(default="更新结构化草稿 block 审阅状态", min_length=2, max_length=1000)
+
+
+class DraftCoverageReviewRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    context_pack_id: uuid.UUID | None
+    status: str
+    summary_json: dict[str, Any]
+    issues_json: list[dict[str, Any]]
+    created_at: datetime
+
+
+class BusinessDraftContextPackRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    profile_id: str
+    profile_version: str
+    schema_version: str
+    status: str
+    readiness_status: str
+    context_json: dict[str, Any]
+    readiness_json: dict[str, Any]
+    outline_plan_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    section_context_packs: list[DraftSectionContextPackRead] = Field(default_factory=list)
+
+
+class BusinessDraftContextPackGenerateRequest(BaseModel):
+    allow_blocked_internal_draft: bool = False
+
+
+class BusinessDraftContextPackGenerateResult(BaseModel):
+    context_pack: BusinessDraftContextPackRead
+    chapters: list[BusinessDraftChapterRead]
+    blocks: list[DraftBlockRead]
+    coverage_review: DraftCoverageReviewRead
+
+
 class BusinessDraftExportRequest(BaseModel):
     risk_acceptance_reason: str | None = Field(default=None, max_length=1000)
 

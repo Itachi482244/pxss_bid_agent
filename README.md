@@ -20,8 +20,16 @@
 - MVP1.0：通用投标闭环已完成，包括项目导入、文件解析、合规矩阵、企业资料、证据绑定、资格预评估、商务/资格草稿、事实校验、审批导出、审计留痕和提交前核验。
 - MVP1.1 P0：已完成模型配置中心、PromptOps registry、合规矩阵 AI 抽取增强、结构化校验、规则降级和矩阵审阅第一版。
 - MVP1.1 P1：已完成审阅聚合接口、人工划选补漏、相似补票、Diff 高亮数据、重复项关联、级联确认和高风险确认防误触。
-- 暂未进入：pgvector RAG、Embedding/Rerank、技术标核心章节生成、净化产品选型、图纸、多 Agent 编排、报价、OCR 和自动提交。
+- MVP1.2：ContextPack First，专注商务/资格草稿生成上下文包、分章节提示词、结构化生成稿、生成后校验和审阅导出。
+- MVP1.3：承接 pgvector RAG、Embedding/Rerank、企业资料语义检索和候选证据推荐，作为 ContextPack 的上游增强。
+- 长期规划：技术标核心章节、净化产品选型、图纸/示意图、OCR、多 Agent 编排、报价辅助和外部提交/签章集成；这些不排入具体 MVP 版本，待样本、数据和专业责任边界明确后再拆专项。
 - 最近回归：`make mvp1-check` 通过，后端 `43 passed`，前端构建通过且 Vite chunk 体积提示已处理。
+
+版本需求和进度文档：
+
+- [投标Agent MVP-v1.2需求规划与开发进度.md](docs/投标Agent%20MVP-v1.2需求规划与开发进度.md)
+- [投标Agent MVP-v1.3需求规划与开发进度.md](docs/投标Agent%20MVP-v1.3需求规划与开发进度.md)
+- [投标Agent ContextPack分阶段生成方案.md](docs/投标Agent%20ContextPack分阶段生成方案.md)
 
 ## 技术栈
 
@@ -38,7 +46,7 @@
 pxss_bid_agent/
   backend/          FastAPI 后端、Agent 编排、工具、规则、检索、审计
   frontend/         React B/S 工作台
-  docs/             工程文档
+  docs/             产品、架构、版本规划和功能方案文档
   data/             示例数据、规则、模板和本地存储占位
   infra/            Docker 初始化脚本
   scripts/          本地开发脚本

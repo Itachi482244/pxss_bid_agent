@@ -945,7 +945,7 @@ tenant/{tenant_id}/project/{project_id}/exports/{export_file_id}/{filename}
 | 地方规则包 | `rule_packages`、`rule_versions`、`rule_bindings`、`rule_execution_logs` | 项目/标段绑定冻结规则版本 |
 | 标书章节 | `draft_sections`、`draft_versions`、`draft_evidence_links`、`fact_check_results` | 章节内容绑定矩阵项和证据 |
 | 审批流 | `approval_tasks`、`approval_actions`、`approval_state_snapshots` | 矩阵确认、参标、报价、提交关口 |
-| 报价 | `price_books`、`price_items`、`price_versions`、`supplier_quotes` | 二期报价辅助和审批 |
+| 报价 | `price_books`、`price_items`、`price_versions`、`supplier_quotes` | 长期规划中的报价辅助和审批 |
 | LLM 调用 | `model_providers`、`model_call_logs`、`prompt_templates` | v1.0 记录模型、版本、token 和输入摘要 |
 
 ## 10. MVP-v0.5 建议落库顺序

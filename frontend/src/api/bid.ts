@@ -758,6 +758,89 @@ export type BusinessDraftChapter = {
   fact_checks: DraftFactCheck[];
 };
 
+export type BusinessDraftContextPackPreview = {
+  profile_id: string;
+  profile_version: string;
+  schema_version: string;
+  readiness_status: string;
+  context_json: Record<string, unknown>;
+  readiness_json: Record<string, unknown>;
+  outline_plan_json: Record<string, unknown>;
+};
+
+export type DraftSectionContextPack = {
+  id: string;
+  project_id: string;
+  section_id: string;
+  context_pack_id: string;
+  section_type: string;
+  title: string;
+  sort_order: number;
+  generation_mode: string;
+  status: string;
+  context_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DraftBlock = {
+  id: string;
+  project_id: string;
+  section_id: string;
+  chapter_id: string | null;
+  section_context_pack_id: string | null;
+  block_type: string;
+  content_text: string;
+  sort_order: number;
+  links_json: Record<string, unknown>;
+  fact_claims_json: Record<string, unknown>[] | null;
+  missing_fact_placeholders_json: Record<string, unknown>[] | null;
+  risk_flags_json: Record<string, unknown>[] | null;
+  review_status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DraftCoverageReview = {
+  id: string;
+  project_id: string;
+  section_id: string;
+  context_pack_id: string | null;
+  status: string;
+  summary_json: Record<string, unknown>;
+  issues_json: Record<string, unknown>[];
+  created_at: string;
+};
+
+export type BusinessDraftContextPack = {
+  id: string;
+  project_id: string;
+  section_id: string;
+  profile_id: string;
+  profile_version: string;
+  schema_version: string;
+  status: string;
+  readiness_status: string;
+  context_json: Record<string, unknown>;
+  readiness_json: Record<string, unknown>;
+  outline_plan_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  section_context_packs: DraftSectionContextPack[];
+};
+
+export type BusinessDraftContextPackPayload = {
+  profile_id?: string;
+  section_types?: string[] | null;
+};
+
+export type BusinessDraftContextPackGenerateResult = {
+  context_pack: BusinessDraftContextPack;
+  chapters: BusinessDraftChapter[];
+  blocks: DraftBlock[];
+  coverage_review: DraftCoverageReview;
+};
+
 export type QualificationDecision = {
   id: string;
   project_id: string;
@@ -1227,6 +1310,87 @@ export async function confirmQualificationDecision(
 export async function listBusinessDraftChapters(projectId: string, sectionId: string) {
   const response = await apiClient.get<BusinessDraftChapter[]>(
     `/projects/${projectId}/sections/${sectionId}/business-draft/chapters`
+  );
+  return response.data;
+}
+
+export async function previewBusinessDraftContextPack(
+  projectId: string,
+  sectionId: string,
+  payload: BusinessDraftContextPackPayload = {}
+) {
+  const response = await apiClient.post<BusinessDraftContextPackPreview>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack/preview`,
+    payload
+  );
+  return response.data;
+}
+
+export async function listBusinessDraftContextPacks(projectId: string, sectionId: string) {
+  const response = await apiClient.get<BusinessDraftContextPack[]>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack`
+  );
+  return response.data;
+}
+
+export async function createBusinessDraftContextPack(
+  projectId: string,
+  sectionId: string,
+  payload: BusinessDraftContextPackPayload = {}
+) {
+  const response = await apiClient.post<BusinessDraftContextPack>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack`,
+    payload
+  );
+  return response.data;
+}
+
+export async function generateBusinessDraftFromContextPack(
+  projectId: string,
+  sectionId: string,
+  contextPackId: string,
+  payload: {
+    allow_blocked_internal_draft?: boolean;
+  } = {}
+) {
+  const response = await apiClient.post<BusinessDraftContextPackGenerateResult>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack/${contextPackId}/generate`,
+    payload
+  );
+  return response.data;
+}
+
+export async function runBusinessDraftContextPackCoverageReview(
+  projectId: string,
+  sectionId: string,
+  contextPackId: string
+) {
+  const response = await apiClient.post<DraftCoverageReview>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack/${contextPackId}/coverage-review`
+  );
+  return response.data;
+}
+
+export async function listBusinessDraftBlocks(projectId: string, sectionId: string) {
+  const response = await apiClient.get<DraftBlock[]>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/blocks`
+  );
+  return response.data;
+}
+
+export async function updateBusinessDraftBlock(
+  projectId: string,
+  sectionId: string,
+  blockId: string,
+  payload: {
+    review_status: string;
+    content_text?: string | null;
+    reason: string;
+  }
+) {
+  const response = await apiClient.patch<DraftBlock>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/blocks/${blockId}`,
+    payload
   );
   return response.data;
 }

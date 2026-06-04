@@ -11,11 +11,13 @@ from app.db.session import SessionLocal
 from app.models import (
     AuditLog,
     BidSection,
+    ComplianceEvidenceBinding,
     ComplianceItem,
     Document,
     DocumentChunk,
     DocumentVersion,
     EnterpriseMaterial,
+    EnterpriseProfile,
     Project,
     ProjectMember,
     Tenant,
@@ -30,6 +32,8 @@ DEMO_PROJECT_NAME = "智慧园区弱电工程投标"
 DEMO_SECTION_CODE = "section-001"
 CLEANROOM_PROJECT_NAME = "洁净车间净化设备采购与安装项目"
 CLEANROOM_SECTION_CODE = "cleanroom-001"
+MINGZHU_PROJECT_KEYWORD = "明珠公寓"
+MINGZHU_COMPANY_NAME = "杭州明筑更新工程有限公司"
 
 
 def get_or_create_tenant(db: Session) -> Tenant:
@@ -790,9 +794,16 @@ def get_or_create_demo_material(
     name: str,
     evidence_text: str,
     structured_fields: dict[str, object],
+    issuing_authority: str | None = None,
+    certificate_no: str | None = None,
+    holder_name: str | None = None,
+    project_name: str | None = None,
+    amount: str | None = None,
+    valid_from: date | None = None,
     verification_status: str = "confirmed",
     data_level: str = "internal",
     valid_until: date | None = None,
+    file_name: str | None = None,
 ) -> EnterpriseMaterial:
     material = db.scalar(
         select(EnterpriseMaterial).where(
@@ -802,11 +813,18 @@ def get_or_create_demo_material(
         )
     )
     if material is not None:
+        material.issuing_authority = issuing_authority
+        material.certificate_no = certificate_no
+        material.holder_name = holder_name
+        material.project_name = project_name
+        material.amount = amount
+        material.valid_from = valid_from
         material.data_level = data_level
         material.verification_status = verification_status
         material.valid_until = valid_until
         material.structured_fields = structured_fields
         material.evidence_text = evidence_text
+        material.file_name = file_name
         material.updated_by = user.id
         material.updated_at = datetime.now(UTC)
         db.flush()
@@ -817,11 +835,18 @@ def get_or_create_demo_material(
         tenant_id=tenant.id,
         material_type=material_type,
         name=name,
+        issuing_authority=issuing_authority,
+        certificate_no=certificate_no,
+        holder_name=holder_name,
+        project_name=project_name,
+        amount=amount,
+        valid_from=valid_from,
         data_level=data_level,
         verification_status=verification_status,
         valid_until=valid_until,
         structured_fields=structured_fields,
         evidence_text=evidence_text,
+        file_name=file_name,
         created_by=user.id,
         updated_by=user.id,
     )
@@ -884,6 +909,523 @@ def seed_cleanroom_materials(db: Session, tenant: Tenant, user: User) -> None:
         structured_fields={"industry": "cleanroom", "risk_demo": "draft_material"},
         verification_status="draft",
     )
+
+
+def upsert_mingzhu_enterprise_profile(db: Session, tenant: Tenant, user: User) -> EnterpriseProfile:
+    profile = db.scalar(select(EnterpriseProfile).where(EnterpriseProfile.tenant_id == tenant.id))
+    if profile is None:
+        profile = EnterpriseProfile(
+            tenant_id=tenant.id,
+            company_name=MINGZHU_COMPANY_NAME,
+            unified_social_credit_code="91330110MA2MZJG001",
+            legal_representative="陈明",
+            registered_address="浙江省杭州市上城区九堡街道九沙大道88号1幢801室",
+            business_scope=(
+                "房屋建筑工程、市政公用工程、建筑装修装饰工程、老旧小区综合改造工程施工；"
+                "建筑立面及屋面整治、室外附属工程、弱电及消防配套工程施工；工程项目管理。"
+            ),
+            region_preferences=["浙江省", "杭州市", "上城区"],
+            industry_preferences=["建筑工程", "老旧小区改造", "城市更新"],
+            forbidden_rules=[],
+            created_by=user.id,
+            updated_by=user.id,
+        )
+        db.add(profile)
+        db.flush()
+        return profile
+
+    profile.company_name = MINGZHU_COMPANY_NAME
+    profile.unified_social_credit_code = "91330110MA2MZJG001"
+    profile.legal_representative = "陈明"
+    profile.registered_address = "浙江省杭州市上城区九堡街道九沙大道88号1幢801室"
+    profile.business_scope = (
+        "房屋建筑工程、市政公用工程、建筑装修装饰工程、老旧小区综合改造工程施工；"
+        "建筑立面及屋面整治、室外附属工程、弱电及消防配套工程施工；工程项目管理。"
+    )
+    profile.region_preferences = ["浙江省", "杭州市", "上城区"]
+    profile.industry_preferences = ["建筑工程", "老旧小区改造", "城市更新"]
+    profile.forbidden_rules = []
+    profile.updated_by = user.id
+    profile.updated_at = datetime.now(UTC)
+    db.flush()
+    return profile
+
+
+def seed_mingzhu_enterprise_materials(
+    db: Session,
+    tenant: Tenant,
+    user: User,
+) -> dict[str, EnterpriseMaterial]:
+    common_fields = {
+        "company_name": MINGZHU_COMPANY_NAME,
+        "project_fit": "明珠公寓老旧小区综合改造提升项目",
+        "data_source": "seed_dev_data.mock",
+        "is_mock": True,
+    }
+    return {
+        "license": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="license",
+            name="明珠公寓模拟-营业执照",
+            issuing_authority="杭州市市场监督管理局",
+            certificate_no="91330110MA2MZJG001",
+            holder_name=MINGZHU_COMPANY_NAME,
+            valid_from=date(2021, 5, 18),
+            valid_until=date(2036, 5, 17),
+            evidence_text=(
+                "营业执照载明企业主体为杭州明筑更新工程有限公司，统一社会信用代码"
+                "91330110MA2MZJG001，经营范围包含房屋建筑工程、建筑装修装饰工程、"
+                "老旧小区综合改造工程施工，可覆盖明珠公寓项目主体资格、注册资金和营业范围响应。"
+            ),
+            structured_fields=common_fields
+            | {
+                "registered_capital": "6000万元人民币",
+                "business_scope_keywords": ["建筑工程", "老旧小区改造", "建筑装修装饰", "城市更新"],
+            },
+            file_name="mock_mingzhu_business_license.pdf",
+        ),
+        "construction_qualification": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="qualification",
+            name="明珠公寓模拟-建筑工程施工总承包二级资质",
+            issuing_authority="浙江省住房和城乡建设厅",
+            certificate_no="D233MZ2026001",
+            holder_name=MINGZHU_COMPANY_NAME,
+            valid_from=date(2024, 1, 1),
+            valid_until=date(2029, 12, 31),
+            evidence_text=(
+                "建筑业企业资质证书载明资质类别为建筑工程施工总承包二级，有效期至2029-12-31，"
+                "等级高于明珠公寓项目要求的建筑工程施工总承包三级资质。"
+            ),
+            structured_fields=common_fields
+            | {
+                "qualification_category": "建筑工程施工总承包",
+                "grade": "二级",
+                "meets_min_grade": "三级",
+            },
+            file_name="mock_mingzhu_construction_qualification.pdf",
+        ),
+        "safety_license": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="qualification",
+            name="明珠公寓模拟-安全生产许可证",
+            issuing_authority="浙江省住房和城乡建设厅",
+            certificate_no="(浙)JZ安许证字[2026]019876",
+            holder_name=MINGZHU_COMPANY_NAME,
+            valid_from=date(2026, 1, 1),
+            valid_until=date(2029, 12, 31),
+            evidence_text=(
+                "安全生产许可证处于有效期，许可范围覆盖建筑施工，可作为施工安全资格响应材料。"
+            ),
+            structured_fields=common_fields | {"certificate_type": "安全生产许可证"},
+            file_name="mock_mingzhu_safety_license.pdf",
+        ),
+        "project_manager": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="personnel",
+            name="明珠公寓模拟-项目经理王建安注册建造师及安全B证",
+            issuing_authority="浙江省住房和城乡建设厅",
+            certificate_no="浙2332021202308888 / 浙建安B(2023)3108888",
+            holder_name="王建安",
+            valid_from=date(2023, 4, 12),
+            valid_until=date(2028, 12, 31),
+            evidence_text=(
+                "王建安为本单位在册人员，具备建筑工程专业二级注册建造师资格、安全生产考核合格B证，"
+                "注册单位为杭州明筑更新工程有限公司；当前无在建项目锁定记录。"
+            ),
+            structured_fields=common_fields
+            | {
+                "person_name": "王建安",
+                "role": "拟派项目负责人",
+                "registered_major": "建筑工程",
+                "constructor_grade": "二级",
+                "safety_b_certificate": "浙建安B(2023)3108888",
+                "no_active_project_commitment": True,
+                "id_no": "330102198806168888",
+            },
+            file_name="mock_mingzhu_project_manager_certificates.pdf",
+        ),
+        "senior_title": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="personnel",
+            name="明珠公寓模拟-项目经理高级工程师职称证书",
+            issuing_authority="浙江省人力资源和社会保障厅",
+            certificate_no="G3301MZ20220088",
+            holder_name="王建安",
+            valid_from=date(2022, 9, 20),
+            evidence_text="王建安具备建筑工程管理高级工程师职称，可覆盖评分办法中的项目经理高级职称加分项。",
+            structured_fields=common_fields
+            | {"person_name": "王建安", "title": "高级工程师", "major": "建筑工程管理"},
+            file_name="mock_mingzhu_project_manager_senior_title.pdf",
+        ),
+        "performance": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="performance",
+            name="明珠公寓模拟-近三年老旧小区综合改造业绩",
+            issuing_authority="杭州市城市更新建设单位（模拟）",
+            certificate_no="HT-MZ-JG-2024-011",
+            holder_name=MINGZHU_COMPANY_NAME,
+            project_name="杭州市翠苑三区老旧小区综合改造提升工程",
+            amount="868.42万元",
+            valid_from=date(2024, 3, 15),
+            evidence_text=(
+                "合同签订时间为2024-03-15，合同金额868.42万元，工程内容包含建筑立面整治、"
+                "屋面防水修缮、楼道公共部位修缮和室外附属改造；竣工验收结论为合格，"
+                "满足2019年1月1日以来金额250万元及以上类似改造施工业绩评分要求。"
+            ),
+            structured_fields=common_fields
+            | {
+                "performance_type": "老旧小区综合改造",
+                "contract_signed_at": "2024-03-15",
+                "acceptance_status": "合格",
+                "amount_cny": 8684200,
+            },
+            file_name="mock_mingzhu_similar_performance.pdf",
+        ),
+        "iso_system": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="qualification",
+            name="明珠公寓模拟-质量环境职业健康安全三体系认证",
+            issuing_authority="中建认证中心（模拟）",
+            certificate_no="QEO-MZ-2026-001",
+            holder_name=MINGZHU_COMPANY_NAME,
+            valid_from=date(2026, 1, 10),
+            valid_until=date(2029, 1, 9),
+            evidence_text=(
+                "企业通过ISO 9001质量管理体系、ISO 14001环境管理体系、ISO 45001职业健康安全管理体系认证，"
+                "三项证书均处于有效期。"
+            ),
+            structured_fields=common_fields
+            | {"certifications": ["ISO 9001", "ISO 14001", "ISO 45001"]},
+            file_name="mock_mingzhu_iso_certificates.pdf",
+        ),
+        "credit_commitment": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="commitment",
+            name="明珠公寓模拟-信用与无重大违法记录承诺",
+            evidence_text=(
+                "企业承诺不存在被依法暂停或取消投标资格、被限制参与上城区限额以下公共资源交易活动、"
+                "失信被执行、重大违法、重大质量安全事故或其他禁止参标情形。"
+            ),
+            structured_fields=common_fields
+            | {"commitment_scope": ["信用", "失信", "黑名单", "处罚", "重大违法", "禁止参标"]},
+            file_name="mock_mingzhu_credit_commitment.pdf",
+        ),
+        "financial_tax_social_security": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="other",
+            name="明珠公寓模拟-财务纳税及社保证明",
+            issuing_authority="主管税务机关及社保经办机构（模拟）",
+            holder_name=MINGZHU_COMPANY_NAME,
+            valid_from=date(2026, 5, 1),
+            evidence_text=(
+                "企业2025年度财务状况正常，依法纳税；拟派项目负责人王建安及授权代理人李文的社保"
+                "由杭州明筑更新工程有限公司连续缴纳，覆盖投标文件编制期。"
+            ),
+            structured_fields=common_fields
+            | {
+                "tax_status": "正常",
+                "social_security_staff": ["王建安", "李文"],
+                "financial_report_years": ["2023", "2024", "2025"],
+            },
+            file_name="mock_mingzhu_tax_social_security.pdf",
+        ),
+        "authorization": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="commitment",
+            name="明珠公寓模拟-法定代表人身份证明及授权委托书",
+            holder_name="陈明 / 李文",
+            evidence_text=(
+                "法定代表人为陈明；授权代理人为李文，授权范围包含明珠公寓老旧小区综合改造提升项目"
+                "响应文件签署、递交、澄清、合同签订等事项，并附身份证明材料。"
+            ),
+            structured_fields=common_fields
+            | {
+                "legal_representative": "陈明",
+                "legal_representative_title": "执行董事兼总经理",
+                "authorized_agent": "李文",
+                "authorized_agent_name": "李文",
+                "authorization_project": "明珠公寓",
+            },
+            file_name="mock_mingzhu_authorization_letter.pdf",
+        ),
+        "bid_security": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="commitment",
+            name="明珠公寓模拟-履约担保及低价风险差额担保承诺",
+            evidence_text=(
+                "企业承诺成交后按交易文件要求提交合同总价2%的履约担保；如成交价低于风险控制价，"
+                "将按要求提交成交价与风险控制价差额担保，担保形式接受银行保函、保证保险、担保公司担保或基本账户转账。"
+            ),
+            structured_fields=common_fields
+            | {
+                "performance_bond": "合同总价的2%",
+                "performance_bond_ratio": "2%",
+                "low_price_difference_bond": True,
+                "bid_security_amount": "交易保证金：无",
+                "bid_security_form": "无",
+            },
+            file_name="mock_mingzhu_performance_bond_commitment.pdf",
+        ),
+        "response_commitment": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="commitment",
+            name="明珠公寓模拟-商务响应及工期质量承诺",
+            evidence_text=(
+                "企业承诺响应明珠公寓项目全部商务实质性条款：计划工期180日历天，质量标准为符合现行国家"
+                "有关工程施工验收规范和标准的合格要求，承包方式为包工、包料、包工期、包质量、包安全、包文明施工。"
+            ),
+            structured_fields=common_fields
+            | {
+                "construction_period_days": 180,
+                "quality_standard": "合格",
+                "project_scope": "明珠公寓建筑立面、屋面、楼道公共部位及室外附属综合改造提升",
+                "warranty_period": "按交易文件及工程质量保修书执行，缺陷责任期不低于24个月",
+                "response_scope": "商务实质性响应",
+            },
+            file_name="mock_mingzhu_business_response_commitment.pdf",
+        ),
+        "paper_file_commitment": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="commitment",
+            name="明珠公寓模拟-电子及纸质响应文件一致性承诺",
+            evidence_text=(
+                "企业承诺按交易文件要求使用投标工具制作并递交电子响应文件；成交后7个工作日内补交与电子"
+                "响应文件一致的纸质正本1份、副本3份及电子光盘，并包含施工组织设计文件。"
+            ),
+            structured_fields=common_fields
+            | {"paper_original_count": 1, "paper_copy_count": 3, "electronic_file_consistency": True},
+            file_name="mock_mingzhu_file_consistency_commitment.pdf",
+        ),
+        "construction_quality_plan": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="technical_proposal",
+            name="明珠公寓模拟-施工组织及质量安全文明施工方案",
+            evidence_text=(
+                "方案覆盖老旧小区改造施工组织、居民出行协调、建筑立面及屋面整治、成品保护、质量验收、"
+                "安全文明施工和应急响应措施，可支撑质量、安全、文明施工及施工组织设计相关响应。"
+            ),
+            structured_fields=common_fields
+            | {"proposal_scope": ["施工组织设计", "质量验收", "安全文明施工", "居民协调"]},
+            file_name="mock_mingzhu_construction_quality_plan.pdf",
+        ),
+        "non_consortium": get_or_create_demo_material(
+            db,
+            tenant,
+            user,
+            material_type="commitment",
+            name="明珠公寓模拟-非联合体及不分包承诺",
+            evidence_text=(
+                "企业承诺本项目以独立投标人身份参与，不组成联合体；成交后不违法分包、转包，并按合同约定"
+                "组织自有项目管理团队履约。"
+            ),
+            structured_fields=common_fields
+            | {"consortium": False, "is_consortium": False, "illegal_subcontracting": False},
+            file_name="mock_mingzhu_non_consortium_commitment.pdf",
+        ),
+    }
+
+
+def _mingzhu_material_snapshot(material: EnterpriseMaterial) -> dict[str, object]:
+    return {
+        "id": str(material.id),
+        "material_type": material.material_type,
+        "name": material.name,
+        "issuing_authority": material.issuing_authority,
+        "certificate_no": material.certificate_no,
+        "holder_name": material.holder_name,
+        "project_name": material.project_name,
+        "amount": material.amount,
+        "valid_from": material.valid_from.isoformat() if material.valid_from else None,
+        "valid_until": material.valid_until.isoformat() if material.valid_until else None,
+        "data_level": material.data_level,
+        "verification_status": material.verification_status,
+        "structured_fields": material.structured_fields,
+        "evidence_text": material.evidence_text,
+        "file_name": material.file_name,
+        "sha256": material.sha256,
+    }
+
+
+def _mingzhu_material_key_for_item(item: ComplianceItem) -> str:
+    text = f"{item.requirement_text}\n{item.normalized_requirement or ''}\n{item.response_suggestion or ''}"
+    if "联合体" in text or "分包" in text:
+        return "non_consortium"
+    if "安全生产许可证" in text:
+        return "safety_license"
+    if "营业执照" in text:
+        return "license"
+    if "注册资金" in text or "注册资本" in text:
+        return "license"
+    if "三体系" in text or "管理体系认证" in text or "ISO" in text:
+        return "iso_system"
+    if "职称" in text:
+        return "senior_title"
+    if any(signal in text for signal in ("项目负责人", "项目经理", "建造师", "安全B证", "B证", "在建")):
+        return "project_manager"
+    if "业绩" in text or "类似工程" in text or "类似改造" in text:
+        return "performance"
+    if "资质" in text or "施工总承包" in text:
+        return "construction_qualification"
+    if any(signal in text for signal in ("信用", "失信", "黑名单", "处罚", "重大违法", "限制参与", "禁止参标")):
+        return "credit_commitment"
+    if any(signal in text for signal in ("社保", "纳税", "财务")):
+        return "financial_tax_social_security"
+    if any(signal in text for signal in ("法定代表人", "授权委托", "代理人", "身份证明")):
+        return "authorization"
+    if any(signal in text for signal in ("履约担保", "保证金", "保函", "保证保险", "风险控制价", "差额担保")):
+        return "bid_security"
+    if any(signal in text for signal in ("电子响应文件", "纸质响应文件", "响应文件的组成", "光盘", "投标工具")):
+        return "paper_file_commitment"
+    if item.item_type == "technical_response" or any(
+        signal in text for signal in ("施工组织", "质量", "验收", "安全", "文明施工", "成品保护")
+    ):
+        return "construction_quality_plan"
+    if any(signal in text for signal in ("工期", "期限", "承包方式", "响应函", "报价", "合同总价")):
+        return "response_commitment"
+    if item.item_type == "format":
+        return "paper_file_commitment"
+    if item.item_type == "scoring":
+        return "performance"
+    if item.item_type == "qualification":
+        return "construction_qualification"
+    return "response_commitment"
+
+
+def _bind_mingzhu_evidence(
+    db: Session,
+    tenant: Tenant,
+    user: User,
+    project: Project,
+    section: BidSection,
+    item: ComplianceItem,
+    material: EnterpriseMaterial,
+) -> str:
+    existing = db.scalar(
+        select(ComplianceEvidenceBinding).where(
+            ComplianceEvidenceBinding.tenant_id == tenant.id,
+            ComplianceEvidenceBinding.compliance_item_id == item.id,
+            ComplianceEvidenceBinding.enterprise_material_id == material.id,
+            ComplianceEvidenceBinding.status == "active",
+        )
+    )
+    evidence_text = (
+        f"{material.evidence_text or material.name}\n"
+        f"适配条款：{item.requirement_text[:360]}"
+    )
+    bind_reason = "明珠公寓演示数据：按条款关键词自动匹配模拟企业资料"
+    if existing is not None:
+        existing.project_id = project.id
+        existing.section_id = section.id
+        existing.evidence_text = evidence_text
+        existing.material_snapshot = _mingzhu_material_snapshot(material)
+        existing.confidence_score = Decimal("0.9300")
+        existing.bind_reason = bind_reason
+        return "updated"
+
+    active_binding = db.scalar(
+        select(ComplianceEvidenceBinding).where(
+            ComplianceEvidenceBinding.tenant_id == tenant.id,
+            ComplianceEvidenceBinding.compliance_item_id == item.id,
+            ComplianceEvidenceBinding.status == "active",
+        )
+    )
+    if active_binding is not None:
+        return "skipped"
+
+    db.add(
+        ComplianceEvidenceBinding(
+            tenant_id=tenant.id,
+            project_id=project.id,
+            section_id=section.id,
+            compliance_item_id=item.id,
+            enterprise_material_id=material.id,
+            evidence_text=evidence_text,
+            material_snapshot=_mingzhu_material_snapshot(material),
+            confidence_score=Decimal("0.9300"),
+            bind_reason=bind_reason,
+            status="active",
+            created_by=user.id,
+        )
+    )
+    return "created"
+
+
+def seed_mingzhu_mock_enterprise_data(db: Session, tenant: Tenant, user: User) -> dict[str, int]:
+    upsert_mingzhu_enterprise_profile(db, tenant, user)
+    materials = seed_mingzhu_enterprise_materials(db, tenant, user)
+    summary = {
+        "projects": 0,
+        "sections": 0,
+        "materials": len(materials),
+        "bindings_created": 0,
+        "bindings_updated": 0,
+        "bindings_skipped": 0,
+    }
+    projects = db.scalars(
+        select(Project).where(
+            Project.tenant_id == tenant.id,
+            Project.name.contains(MINGZHU_PROJECT_KEYWORD),
+            Project.archived_at.is_(None),
+        )
+    ).all()
+    for project in projects:
+        summary["projects"] += 1
+        sections = db.scalars(
+            select(BidSection).where(
+                BidSection.tenant_id == tenant.id,
+                BidSection.project_id == project.id,
+                BidSection.status != "archived",
+            )
+        ).all()
+        for section in sections:
+            summary["sections"] += 1
+            items = db.scalars(
+                select(ComplianceItem).where(
+                    ComplianceItem.tenant_id == tenant.id,
+                    ComplianceItem.project_id == project.id,
+                    ComplianceItem.section_id == section.id,
+                    ComplianceItem.deleted_at.is_(None),
+                )
+            ).all()
+            for item in items:
+                material = materials[_mingzhu_material_key_for_item(item)]
+                result = _bind_mingzhu_evidence(db, tenant, user, project, section, item, material)
+                if result == "created":
+                    summary["bindings_created"] += 1
+                elif result == "updated":
+                    summary["bindings_updated"] += 1
+                else:
+                    summary["bindings_skipped"] += 1
+    return summary
 
 
 def write_audit_log(
@@ -954,6 +1496,7 @@ def seed() -> None:
         )
         cleanroom_items = seed_cleanroom_demo_project(db, tenant, user)
         seed_cleanroom_materials(db, tenant, user)
+        mingzhu_summary = seed_mingzhu_mock_enterprise_data(db, tenant, user)
         write_audit_log(db, tenant, project, section, user, item)
         write_audit_log(db, tenant, project, section, user, technical_item)
         cleanroom_project = get_or_create_cleanroom_project(db, tenant, user)
@@ -963,7 +1506,10 @@ def seed() -> None:
         db.commit()
         print(
             "Seeded demo data: "
-            f"tenant={tenant.code}, project={project.name}, cleanroom_project={cleanroom_project.name}"
+            f"tenant={tenant.code}, project={project.name}, cleanroom_project={cleanroom_project.name}, "
+            f"mingzhu_projects={mingzhu_summary['projects']}, "
+            f"mingzhu_bindings_created={mingzhu_summary['bindings_created']}, "
+            f"mingzhu_bindings_updated={mingzhu_summary['bindings_updated']}"
         )
 
 

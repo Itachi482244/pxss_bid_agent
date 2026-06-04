@@ -269,6 +269,11 @@ def test_manual_revision_creates_new_version_and_matrix_uses_revised_chunks(monk
     def fake_chat_completion(db, **kwargs):  # noqa: ANN001, ARG001
         prompt_version = kwargs["prompt_version"]
         if prompt_version == "document_section_plan@1.1.0":
+            # Word 解析文本无真实分页，分块按 chunk 顺序映射为合成页码，
+            # 章节范围须覆盖全部分块，否则校验会因页码未全覆盖而失败。
+            user_content = kwargs["messages"][-1]["content"]
+            pages = json.loads(user_content.rsplit("pages:\n", 1)[1])
+            end_page = max(page["page_no"] for page in pages)
             content = {
                 "sections": [
                     {
@@ -276,7 +281,7 @@ def test_manual_revision_creates_new_version_and_matrix_uses_revised_chunks(monk
                         "title": "资格要求",
                         "section_type": "announcement",
                         "start_page": 1,
-                        "end_page": 1,
+                        "end_page": end_page,
                         "confidence_score": 0.9,
                         "evidence": "人工修正后的资格要求段落。",
                     }
@@ -285,9 +290,10 @@ def test_manual_revision_creates_new_version_and_matrix_uses_revised_chunks(monk
         elif prompt_version == "compliance_extract_by_section@1.1.0":
             user_content = kwargs["messages"][-1]["content"]
             chunks = json.loads(user_content.rsplit("chunks:\n", 1)[1])
-            chunk = next(item for item in chunks if "安全生产许可证" in item["text"])
-            content = {
-                "items": [
+            # 大章节会被拆成多段抽取，每段仅含部分分块；仅当本段命中目标分块时才产出条款。
+            chunk = next((item for item in chunks if "安全生产许可证" in item["text"]), None)
+            items = (
+                [
                     {
                         "source_chunk_index": chunk["chunk_index"],
                         "item_type": "qualification",
@@ -298,7 +304,10 @@ def test_manual_revision_creates_new_version_and_matrix_uses_revised_chunks(monk
                         "confidence_score": 0.9,
                     }
                 ]
-            }
+                if chunk is not None
+                else []
+            )
+            content = {"items": items}
         else:
             content = {"status": "passed", "issues": []}
         return SimpleNamespace(

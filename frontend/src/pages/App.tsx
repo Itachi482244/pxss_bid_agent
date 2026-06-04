@@ -70,6 +70,7 @@ import {
   confirmQualificationEvaluation,
   confirmProjectImportDraft,
   createApprovalTask,
+  createBusinessDraftContextPack,
   createComplianceItemFromSource,
   createParseTask,
   createProjectImportDraftFromFile,
@@ -83,6 +84,7 @@ import {
   listDocumentSemanticSections,
   exportBusinessDraftWord,
   exportComplianceMatrixExcel,
+  generateBusinessDraftFromContextPack,
   generateBusinessDraftChapters,
   generateComplianceMatrix,
   getDocumentExtractionQualityReport,
@@ -94,7 +96,9 @@ import {
   getQualificationDecision,
   getTask,
   listApprovalTasks,
+  listBusinessDraftBlocks,
   listBusinessDraftChapters,
+  listBusinessDraftContextPacks,
   listTasks,
   listEnterpriseMaterials,
   listComplianceEvidenceBindings,
@@ -109,9 +113,11 @@ import {
   replanDocumentSemanticSections,
   requestPublicUrlAcquisition,
   runBusinessDraftFactChecks,
+  runBusinessDraftContextPackCoverageReview,
   runQualificationEvaluation,
   searchEnterpriseMaterials,
   publishDocumentManualRevision,
+  previewBusinessDraftContextPack,
   getChatModelConfig,
   uploadEnterpriseMaterialFile,
   unbindComplianceEvidence,
@@ -124,6 +130,7 @@ import {
   uploadDocument,
   waiveComplianceEvidenceRequirement,
   splitDuplicateGroupItem,
+  updateBusinessDraftBlock,
   updateBusinessDraftChapter,
   updateComplianceItem
 } from "../api/bid";
@@ -131,6 +138,8 @@ import type {
   AuditLog,
   ApprovalTask,
   BusinessDraftChapter,
+  BusinessDraftContextPack,
+  BusinessDraftContextPackPreview,
   ChatModelConfig,
   ChatModelConfigPayload,
   ChatModelConfigTestResult,
@@ -140,6 +149,8 @@ import type {
   DocumentChunk,
   DocumentExtractionQualityReport,
   DocumentSemanticSection,
+  DraftBlock,
+  DraftCoverageReview,
   EnterpriseMaterial,
   EnterpriseMaterialSearchResult,
   EnterpriseProfile,
@@ -281,9 +292,10 @@ function isWorkflowStepKey(value: string | null | undefined): value is WorkflowS
 }
 
 function workflowStepForPreflightCheck(item: PreflightCheck["checks"][number]) {
+  if (isWorkflowStepKey(item.target)) return item.target;
   const mappedTarget = preflightWorkflowTargets[item.code];
   if (mappedTarget) return mappedTarget;
-  return isWorkflowStepKey(item.target) ? item.target : null;
+  return null;
 }
 
 function preflightActionText(item: PreflightCheck["checks"][number]) {
@@ -555,6 +567,24 @@ const factCheckLabels: Record<string, string> = {
   verified: "已核验",
   warning: "需关注",
   unverified: "无法核验"
+};
+
+const draftBlockStatusLabels: Record<string, string> = {
+  pending: "待审阅",
+  covered: "已覆盖",
+  needs_evidence: "缺证据",
+  needs_fact: "待补事实",
+  approved: "已通过",
+  rejected: "已退回"
+};
+
+const draftBlockStatusColors: Record<string, string> = {
+  pending: "gold",
+  covered: "blue",
+  needs_evidence: "red",
+  needs_fact: "orange",
+  approved: "green",
+  rejected: "red"
 };
 
 const approvalTaskTypeLabels: Record<string, string> = {
@@ -834,6 +864,19 @@ function sourceMetaText(value: Record<string, unknown> | null) {
   return JSON.stringify(value);
 }
 
+function auditContentText(value: Record<string, unknown> | null) {
+  const content = value?.content_text;
+  return typeof content === "string" ? content : "";
+}
+
+function draftBlockLinkIds(block: DraftBlock, key: "compliance_item_ids" | "evidence_binding_ids" | "source_chunk_ids") {
+  const value = block.links_json[key];
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item : item == null ? "" : String(item)))
+    .filter(Boolean);
+}
+
 function isMatrixItemResolved(row: MatrixRow) {
   return ["confirmed", "rejected", "superseded"].includes(row.statusCode);
 }
@@ -889,6 +932,9 @@ function auditActionText(log: AuditLog) {
     "qualification.decision_generated": "生成参标建议",
     "qualification.decision_confirmed": "确认参标建议",
     "business_draft.generated": "生成商务标草稿",
+    "business_draft.context_pack_created": "生成 ContextPack",
+    "business_draft.context_pack_generated": "按 ContextPack 生成草稿",
+    "business_draft.block_updated": "更新草稿 block",
     "business_draft.chapter_updated": "修改商务标草稿",
     "business_draft.fact_checked": "执行事实校验",
     "business_draft.word_exported": "导出商务标 Word",
@@ -1049,6 +1095,11 @@ export function App() {
   const [qualificationEvaluations, setQualificationEvaluations] = useState<QualificationEvaluation[]>([]);
   const [qualificationDecision, setQualificationDecision] = useState<QualificationDecision | null>(null);
   const [businessDraftChapters, setBusinessDraftChapters] = useState<BusinessDraftChapter[]>([]);
+  const [businessDraftContextPacks, setBusinessDraftContextPacks] = useState<BusinessDraftContextPack[]>([]);
+  const [contextPackPreview, setContextPackPreview] = useState<BusinessDraftContextPackPreview | null>(null);
+  const [draftBlocks, setDraftBlocks] = useState<DraftBlock[]>([]);
+  const [activeDraftBlockId, setActiveDraftBlockId] = useState("");
+  const [coverageReview, setCoverageReview] = useState<DraftCoverageReview | null>(null);
   const [selectedDraftChapterId, setSelectedDraftChapterId] = useState("");
   const [draftEditorValue, setDraftEditorValue] = useState("");
   const [approvalTasks, setApprovalTasks] = useState<ApprovalTask[]>([]);
@@ -1058,6 +1109,7 @@ export function App() {
   const [loadingMatrix, setLoadingMatrix] = useState(false);
   const [savingMatrixAction, setSavingMatrixAction] = useState(false);
   const [loadingBusinessDraft, setLoadingBusinessDraft] = useState(false);
+  const [loadingContextPack, setLoadingContextPack] = useState(false);
   const [savingBusinessDraft, setSavingBusinessDraft] = useState(false);
   const [exportingWord, setExportingWord] = useState(false);
   const [generatingDecision, setGeneratingDecision] = useState(false);
@@ -1323,13 +1375,18 @@ export function App() {
     Promise.all([
       getQualificationDecision(selectedProjectId, selectedSectionId),
       listBusinessDraftChapters(selectedProjectId, selectedSectionId),
-      listApprovalTasks(selectedProjectId, selectedSectionId)
+      listApprovalTasks(selectedProjectId, selectedSectionId),
+      listBusinessDraftContextPacks(selectedProjectId, selectedSectionId),
+      listBusinessDraftBlocks(selectedProjectId, selectedSectionId)
     ])
-      .then(([decision, chapters, tasks]) => {
+      .then(([decision, chapters, tasks, contextPacks, blocks]) => {
         if (!active) return;
         setQualificationDecision(decision);
         setBusinessDraftChapters(chapters);
         setApprovalTasks(tasks);
+        setBusinessDraftContextPacks(contextPacks);
+        setDraftBlocks(blocks);
+        setCoverageReview(null);
         setSelectedDraftChapterId((current) => {
           if (current && chapters.some((chapter) => chapter.id === current)) return current;
           return chapters[0]?.id ?? "";
@@ -1340,6 +1397,9 @@ export function App() {
         setQualificationDecision(null);
         setBusinessDraftChapters([]);
         setApprovalTasks([]);
+        setBusinessDraftContextPacks([]);
+        setDraftBlocks([]);
+        setCoverageReview(null);
         setSelectedDraftChapterId("");
       });
     return () => {
@@ -1508,6 +1568,69 @@ export function App() {
     () => businessDraftChapters.find((chapter) => chapter.id === selectedDraftChapterId) ?? null,
     [businessDraftChapters, selectedDraftChapterId]
   );
+  const activeContextPack = businessDraftContextPacks[0] ?? null;
+  const contextPackSource = contextPackPreview ?? activeContextPack;
+  const contextPackChecks = useMemo(() => {
+    const readiness = contextPackSource?.readiness_json as { checks?: Record<string, unknown>[] } | undefined;
+    return readiness?.checks ?? [];
+  }, [contextPackSource]);
+  const contextPackOutlineSections = useMemo(() => {
+    const outline = contextPackSource?.outline_plan_json as { sections?: Record<string, unknown>[] } | undefined;
+    return outline?.sections ?? [];
+  }, [contextPackSource]);
+  const contextPackBlockSummary = useMemo(() => {
+    return {
+      total: draftBlocks.length,
+      needsEvidence: draftBlocks.filter((block) => block.review_status === "needs_evidence").length,
+      needsFact: draftBlocks.filter((block) => block.review_status === "needs_fact").length
+    };
+  }, [draftBlocks]);
+  const unapprovedDraftBlockCount = useMemo(
+    () => draftBlocks.filter((block) => block.review_status !== "approved").length,
+    [draftBlocks]
+  );
+  const selectedChapterBlocks = useMemo(
+    () =>
+      draftBlocks
+        .filter((block) => block.chapter_id === selectedDraftChapterId)
+        .sort((a, b) => a.sort_order - b.sort_order),
+    [draftBlocks, selectedDraftChapterId]
+  );
+  const selectedDraftDiff = useMemo(() => {
+    if (!selectedDraftChapterId) return null;
+    const blockIds = new Set(selectedChapterBlocks.map((block) => block.id));
+    const log = auditLogs.find(
+      (item) =>
+        (item.action === "business_draft.chapter_updated" && item.object_id === selectedDraftChapterId) ||
+        (item.action === "business_draft.block_updated" && item.object_id && blockIds.has(item.object_id))
+    );
+    if (!log) return null;
+    const beforeText = auditContentText(log.before_json);
+    const afterText = auditContentText(log.after_json);
+    if (!beforeText && !afterText) return null;
+    return {
+      action: log.action,
+      reason: log.reason,
+      beforeText,
+      afterText,
+      createdAt: log.created_at,
+      delta: afterText.length - beforeText.length,
+    };
+  }, [auditLogs, selectedChapterBlocks, selectedDraftChapterId]);
+  const draftBlocksByComplianceItemId = useMemo(() => {
+    const byItem = new Map<string, DraftBlock[]>();
+    for (const block of draftBlocks) {
+      for (const itemId of draftBlockLinkIds(block, "compliance_item_ids")) {
+        const blocks = byItem.get(itemId) ?? [];
+        blocks.push(block);
+        byItem.set(itemId, blocks);
+      }
+    }
+    return byItem;
+  }, [draftBlocks]);
+  const matrixRowsById = useMemo(() => {
+    return new Map(matrixRows.map((row) => [row.key, row]));
+  }, [matrixRows]);
   const missingKeyInfo = useMemo(() => {
     const missing: string[] = [];
     if (!currentProject?.purchaser) missing.push("招标人");
@@ -1770,6 +1893,37 @@ export function App() {
   const qualificationDecisionConfirmed = qualificationDecision?.status === "confirmed";
   const qualificationDecisionNeedsConfirmation = Boolean(qualificationDecision && !qualificationDecisionConfirmed);
   const qualificationDecisionIsNoGo = qualificationDecision?.recommendation === "no_go";
+  const contextPackQualificationGate = !qualificationDecision
+    ? {
+        status: "block",
+        message: "先运行资格预评估并生成参标建议。",
+        action: "去资格预评估"
+      }
+    : qualificationDecisionNeedsConfirmation
+      ? {
+          status: "block",
+          message: "参标建议尚未人工确认。",
+          action: "确认参标建议"
+        }
+      : qualificationDecisionIsNoGo
+        ? {
+            status: "block",
+            message: "已确认 No-Go，只能生成带风险接受记录的内部草稿。",
+            action: "查看资格结论"
+          }
+        : qualificationDecision?.recommendation === "conditional_go"
+          ? {
+              status: "warn",
+              message: "有条件 Go，草稿中会保留待补/待复核事项。",
+              action: "查看资格结论"
+            }
+          : {
+              status: "pass",
+              message: "资格结论已确认，可确认 ContextPack。",
+              action: "查看资格结论"
+            };
+  const canConfirmContextPack = Boolean(selectedProjectId && selectedSectionId && qualificationDecisionConfirmed);
+  const canGenerateContextPackDraft = Boolean(activeContextPack && qualificationDecisionConfirmed);
   const rawParseTaskActive = isAsyncTaskActive(importProcessing?.parseTask ?? null, importProcessing?.parseTaskId ?? null);
   const rawMatrixTaskActive = isAsyncTaskActive(importProcessing?.matrixTask ?? null, importProcessing?.matrixTaskId ?? null);
   const importProcessingVisible = Boolean(
@@ -1856,41 +2010,45 @@ export function App() {
         .slice(0, 4)
     : [];
 
-  const workflowSteps = useMemo<WorkflowStep[]>(() => {
-    const parsedDocuments = documents.filter((document) => isUsableParseStatus(document.current_version?.parse_status));
-    const missingEvidenceCount = evidenceRows.length;
-    const unresolvedMatrixCount = unresolvedMatrixRows.length;
-    const unresolvedTechnicalCount = technicalRows.filter((row) => !isMatrixItemResolved(row)).length;
+	  const workflowSteps = useMemo<WorkflowStep[]>(() => {
+	    const parsedDocuments = documents.filter((document) => isUsableParseStatus(document.current_version?.parse_status));
+	    const missingEvidenceCount = evidenceRows.length;
+	    const unresolvedMatrixCount = unresolvedMatrixRows.length;
+	    const unresolvedTechnicalCount = technicalRows.filter((row) => !isMatrixItemResolved(row)).length;
     const highRiskCount = matrixRows.filter((row) => row.riskCode === "high").length;
     const unresolvedHighRiskCount = unresolvedHighRiskRows.length;
     const pendingApprovals = approvalTasks.filter((task) => task.status === "pending").length;
-    const hasDecision = Boolean(qualificationDecision);
-    const hasDraft = businessDraftChapters.length > 0;
-    const hasSelectedScope = Boolean(selectedProjectId && selectedSectionId);
-    const canOpenDocuments = hasSelectedScope;
-    const canOpenTasks = hasSelectedScope;
-    const canOpenQuality = parsedDocuments.length > 0 || Boolean(extractionQualityReport);
-    const canOpenMatrix = parsedDocuments.length > 0;
-    const canOpenMatrixDerived = matrixRows.length > 0;
-    const canOpenReview = matrixRows.length > 0;
-    const canOpenChapter = (qualificationDecisionConfirmed || hasDraft) && !extractionBlocked;
-    const canOpenApproval = (hasDraft || approvalTasks.length > 0 || exportFiles.length > 0) && !extractionBlocked;
+	    const hasDecision = Boolean(qualificationDecision);
+	    const hasDraft = businessDraftChapters.length > 0;
+	    const hasSelectedScope = Boolean(selectedProjectId && selectedSectionId);
+	    const hasUsableSource = parsedDocuments.length > 0 || matrixRows.length > 0;
+	    const hasMatrixResult = matrixRows.length > 0;
+	    const canOpenDocuments = hasSelectedScope;
+	    const canOpenTasks = hasSelectedScope;
+	    const canOpenQuality = hasUsableSource || Boolean(extractionQualityReport);
+	    const canOpenMatrix = hasUsableSource;
+	    const canOpenMatrixDerived = matrixRows.length > 0;
+	    const canOpenReview = matrixRows.length > 0;
+	    const canOpenChapter = (qualificationDecisionConfirmed || hasDraft) && !extractionBlocked;
+	    const canOpenApproval = (hasDraft || approvalTasks.length > 0 || exportFiles.length > 0) && !extractionBlocked;
 
     return [
       {
-        key: "documents",
-        title: "文件解析",
-        description: "上传或获取招标文件，并确认解析版本可用。",
-        status: parsedDocuments.length ? "done" : documents.length || parseTaskActive ? "todo" : "not_started",
-        statusText: parseTaskActive ? "解析中" : parsedDocuments.length ? "已完成" : documents.length ? "待解析" : "未开始",
-	        actionText: documents.length ? "查看文件解析" : "上传/获取文件",
-	        reason: parseTaskActive
-            ? "文件解析正在后台处理，完成后会自动刷新解析版本。"
-            : parsedDocuments.length
-	          ? `已有 ${parsedDocuments.length} 份文件解析成功。`
-	          : documents.length
-	            ? "已有文件，但还没有可用的解析版本。"
-	            : "先上传 Word/PDF 或从公开链接获取招标文件。",
+	        key: "documents",
+	        title: "文件解析",
+	        description: "上传或获取招标文件，并确认解析版本可用。",
+	        status: hasUsableSource ? "done" : documents.length || parseTaskActive ? "todo" : "not_started",
+	        statusText: parseTaskActive ? "解析中" : hasUsableSource ? "已完成" : documents.length ? "待解析" : "未开始",
+		        actionText: documents.length ? "查看文件解析" : "上传/获取文件",
+		        reason: parseTaskActive
+	            ? "文件解析正在后台处理，完成后会自动刷新解析版本。"
+	            : hasUsableSource
+		          ? parsedDocuments.length
+		            ? `已有 ${parsedDocuments.length} 份文件解析成功。`
+		            : "当前标段已有合规矩阵结果，可视为文件解析链路已完成。"
+		          : documents.length
+		            ? "已有文件，但还没有可用的解析版本。"
+		            : "先上传 Word/PDF 或从公开链接获取招标文件。",
 	        disabled: !canOpenDocuments,
 	        disabledReason: canOpenDocuments ? null : "请先选择项目和标段。"
 	      },
@@ -1901,21 +2059,21 @@ export function App() {
         status: importProcessingFailed
           ? "risk"
           : importProcessingInProgress
-            ? "todo"
-            : importProcessingDone || parsedDocuments.length || matrixRows.length
-              ? "done"
+	            ? "todo"
+	            : importProcessingDone || parsedDocuments.length || matrixRows.length
+	              ? "done"
               : documents.length
                 ? "todo"
                 : "not_started",
-        statusText: importProcessingFailed
-          ? "需要处理"
-          : importProcessingInProgress
-            ? `${importProcessingPercent}%`
-            : importProcessingDone
-              ? "已完成"
-              : documents.length || parsedDocuments.length || matrixRows.length
-                ? "可查看"
-                : "未开始",
+	        statusText: importProcessingFailed
+	          ? "需要处理"
+	          : importProcessingInProgress
+	            ? `${importProcessingPercent}%`
+	            : importProcessingDone || matrixRows.length
+	              ? "已完成"
+	              : documents.length || parsedDocuments.length || matrixRows.length
+	                ? "可查看"
+	                : "未开始",
         actionText: "进入任务中心",
         reason: importProcessingInProgress
           ? importProcessingStageMessage
@@ -1925,38 +2083,44 @@ export function App() {
         disabled: !canOpenTasks,
         disabledReason: canOpenTasks ? null : "请先选择项目和标段。"
       },
-      {
-        key: "quality",
-        title: "质量门禁",
-        description: "处理章节规划、来源回链和漏抽覆盖等生成阻断。",
-        status: matrixTaskActive
-          && !matrixRows.length
-          ? "todo"
-          : extractionBlocked
-          ? "risk"
-          : extractionQualityReport?.status === "passed"
-            ? "done"
-            : parsedDocuments.length
+	      {
+	        key: "quality",
+	        title: "质量门禁",
+	        description: "处理章节规划、来源回链和漏抽覆盖等生成阻断。",
+	        status: matrixTaskActive
+	          && !matrixRows.length
+	          ? "todo"
+	          : extractionBlocked
+	          ? "risk"
+	          : hasMatrixResult
+	            ? "done"
+	          : extractionQualityReport?.status === "passed"
+	            ? "done"
+	            : parsedDocuments.length
               ? "todo"
               : "not_started",
         statusText: matrixTaskActive
           && !matrixRows.length
           ? "生成中"
-          : extractionBlocked
-            ? `${extractionQualityIssueCount} 个阻断`
-            : extractionQualityReport?.status === "passed"
-              ? "已通过"
-              : parsedDocuments.length
+	          : extractionBlocked
+	            ? `${extractionQualityIssueCount} 个阻断`
+	            : hasMatrixResult
+	              ? "已通过"
+	            : extractionQualityReport?.status === "passed"
+	              ? "已通过"
+	              : parsedDocuments.length
                 ? "待生成"
                 : "未开始",
         actionText: extractionBlocked ? "处理质量门禁" : "查看质量门禁",
         reason: extractionBlocked
           ? `发现 ${extractionQualityIssueCount} 个关键条款漏抽。建议点击“按建议处理”重新生成矩阵；上一版矩阵会保留。`
-          : extractionQualityReport?.status === "passed"
-            ? "最近一次抽取质量门禁已通过。"
-            : parsedDocuments.length
-              ? "生成矩阵时会自动执行质量门禁；如被阻断，可在这里逐项处理。"
-              : "需要先完成文件解析。",
+	          : extractionQualityReport?.status === "passed"
+	            ? "最近一次抽取质量门禁已通过。"
+	            : hasMatrixResult
+	              ? "已生成合规矩阵且没有质量门禁阻断。"
+	            : parsedDocuments.length
+	              ? "生成矩阵时会自动执行质量门禁；如被阻断，可在这里逐项处理。"
+	              : "需要先完成文件解析。",
         disabled: !canOpenQuality,
         disabledReason: canOpenQuality ? null : "请先完成文件解析，形成可用解析版本。"
       },
@@ -2252,11 +2416,11 @@ export function App() {
 
   const simpleWorkflowSteps = useMemo<SimpleWorkflowStep[]>(() => {
     const byKey = new Map(workflowSteps.map((step) => [step.key, step]));
-    const group = (key: string, title: string, targetKey: WorkflowStepKey, activeKeys: WorkflowStepKey[]) => {
-      const groupSteps = activeKeys.map((stepKey) => byKey.get(stepKey)).filter(Boolean) as WorkflowStep[];
-      const targetStep = byKey.get(targetKey) ?? groupSteps[0];
-      const waitsForCurrentTask = importProcessingOpenTask && key !== "prepare" && key !== "tasks";
-      const status: WorkflowStepStatus = groupSteps.some((step) => step.status === "risk")
+	    const group = (key: string, title: string, targetKey: WorkflowStepKey, activeKeys: WorkflowStepKey[]) => {
+	      const groupSteps = activeKeys.map((stepKey) => byKey.get(stepKey)).filter(Boolean) as WorkflowStep[];
+	      const targetStep = byKey.get(targetKey) ?? groupSteps[0];
+	      const waitsForCurrentTask = importProcessingOpenTask && key !== "prepare" && key !== "tasks";
+	      const status: WorkflowStepStatus = groupSteps.some((step) => step.status === "risk")
         ? "risk"
         : groupSteps.some((step) => step.status === "todo")
           ? "todo"
@@ -2264,20 +2428,26 @@ export function App() {
             ? "done"
             : groupSteps.some((step) => step.status === "not_started")
               ? "not_started"
-              : targetStep?.status ?? "not_started";
+	          : targetStep?.status ?? "not_started";
+	      const resolvedStatus = waitsForCurrentTask ? "not_started" : status;
+	      const isDone = resolvedStatus === "done";
 
-      return {
-        key,
-        title,
-        targetKey,
-        activeKeys,
-        status: waitsForCurrentTask ? "not_started" : status,
-        statusText: waitsForCurrentTask ? "待更新" : targetStep?.statusText ?? "未开始",
-        reason: waitsForCurrentTask ? "后台任务完成后会刷新本步骤结果。" : targetStep?.reason ?? "",
-        disabled: waitsForCurrentTask ? true : targetStep?.disabled ?? true,
-        disabledReason: waitsForCurrentTask ? "请先等待第二步后台任务完成。" : targetStep?.disabledReason ?? "请先完成前置步骤。"
-      };
-    };
+	      return {
+	        key,
+	        title,
+	        targetKey,
+	        activeKeys,
+	        status: resolvedStatus,
+	        statusText: waitsForCurrentTask ? "待更新" : targetStep?.statusText ?? "未开始",
+	        reason: waitsForCurrentTask ? "后台任务完成后会刷新本步骤结果。" : targetStep?.reason ?? "",
+	        disabled: isDone ? false : waitsForCurrentTask ? true : targetStep?.disabled ?? true,
+	        disabledReason: isDone
+	          ? null
+	          : waitsForCurrentTask
+	            ? "请先等待第二步后台任务完成。"
+	            : targetStep?.disabledReason ?? "请先完成前置步骤。"
+	      };
+	    };
 
     return [
       group("prepare", "上传文件", "documents", ["documents"]),
@@ -2443,6 +2613,16 @@ export function App() {
     });
   }, [selectedProjectId, selectedSectionId]);
 
+  const reloadBusinessDraftContext = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    const [contextPacks, blocks] = await Promise.all([
+      listBusinessDraftContextPacks(selectedProjectId, selectedSectionId),
+      listBusinessDraftBlocks(selectedProjectId, selectedSectionId)
+    ]);
+    setBusinessDraftContextPacks(contextPacks);
+    setDraftBlocks(blocks);
+  }, [selectedProjectId, selectedSectionId]);
+
   const reloadApprovalTasks = useCallback(async () => {
     if (!selectedProjectId || !selectedSectionId) return;
     const tasks = await listApprovalTasks(selectedProjectId, selectedSectionId);
@@ -2465,6 +2645,7 @@ export function App() {
       reloadQualificationEvaluations(),
       reloadQualificationDecision(),
       reloadBusinessDraftChapters(),
+      reloadBusinessDraftContext(),
       reloadApprovalTasks(),
       reloadPreflightCheck()
     ]);
@@ -2472,6 +2653,7 @@ export function App() {
     reloadApprovalTasks,
     reloadAuditLogs,
     reloadBusinessDraftChapters,
+    reloadBusinessDraftContext,
     reloadDocumentsAndExports,
     reloadMatrix,
     reloadMatrixReview,
@@ -2877,6 +3059,39 @@ export function App() {
     [appendLog, setWorkspaceNode]
   );
 
+  const focusDraftBlock = useCallback(
+    (block: DraftBlock) => {
+      setViewMode("workspace");
+      setActiveTab("chapter");
+      setWorkspaceNode("chapter");
+      if (block.chapter_id) {
+        setSelectedDraftChapterId(block.chapter_id);
+      }
+      setActiveDraftBlockId(block.id);
+      appendLog("定位合规条目对应的草稿 block");
+      window.setTimeout(() => {
+        document.querySelector(`[data-draft-block-id="${block.id}"]`)?.scrollIntoView({
+          block: "center",
+          behavior: "smooth"
+        });
+      }, 160);
+      window.setTimeout(() => setActiveDraftBlockId(""), 3000);
+    },
+    [appendLog, setWorkspaceNode]
+  );
+
+  const locateDraftBlockForRow = useCallback(
+    (rowKey: string) => {
+      const block = draftBlocksByComplianceItemId.get(rowKey)?.[0];
+      if (!block) {
+        appendLog("当前条款尚未覆盖到结构化草稿 block");
+        return;
+      }
+      focusDraftBlock(block);
+    },
+    [appendLog, draftBlocksByComplianceItemId, focusDraftBlock]
+  );
+
   const focusReviewRow = useCallback((row: MatrixRow) => {
     setActiveReviewItemId(row.key);
     setLocatingReviewItemId(row.key);
@@ -3249,6 +3464,195 @@ export function App() {
         } finally {
           setLoadingBusinessDraft(false);
         }
+      }
+    });
+  };
+
+  const handlePreviewContextPack = async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    setLoadingContextPack(true);
+    setApiError("");
+    try {
+      const preview = await previewBusinessDraftContextPack(selectedProjectId, selectedSectionId, {
+        profile_id: "engineering_construction_business_v1"
+      });
+      const outline = preview.outline_plan_json as { sections?: unknown[] };
+      setContextPackPreview(preview);
+      appendLog(`预览 ContextPack：${outline.sections?.length ?? 0} 个章节计划`);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "ContextPack 预览失败");
+    } finally {
+      setLoadingContextPack(false);
+    }
+  };
+
+  const handleCreateContextPack = async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    if (!qualificationDecisionConfirmed) {
+      Modal.warning({
+        title: "请先确认参标建议",
+        content: contextPackQualificationGate.message,
+        okText: "去资格预评估",
+        onOk: () => activateWorkflowStep("qualification")
+      });
+      return;
+    }
+    setLoadingContextPack(true);
+    setApiError("");
+    try {
+      const contextPack = await createBusinessDraftContextPack(selectedProjectId, selectedSectionId, {
+        profile_id: "engineering_construction_business_v1"
+      });
+      setBusinessDraftContextPacks([contextPack]);
+      setContextPackPreview(null);
+      setCoverageReview(null);
+      appendLog(`确认 ContextPack：${contextPack.section_context_packs.length} 个章节上下文`);
+      await reloadAuditLogs();
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "ContextPack 生成失败");
+    } finally {
+      setLoadingContextPack(false);
+    }
+  };
+
+  const openContextPackDraftGenerationConfirm = () => {
+    if (!activeContextPack || !selectedProjectId || !selectedSectionId) return;
+    const isBlocked = activeContextPack.readiness_status === "block" || qualificationDecisionIsNoGo;
+    Modal.confirm({
+      title: isBlocked ? "生成内部草稿" : "按 ContextPack 生成草稿",
+      content: isBlocked
+        ? "当前 ContextPack 或资格结论仍存在阻塞项。本次只生成带待补占位的内部草稿，不代表可提交版本。"
+        : "将按已确认的 ContextPack 生成结构化章节和可追溯 block，生成后会执行覆盖检查。",
+      okText: isBlocked ? "生成内部草稿" : "生成草稿",
+      cancelText: "取消",
+      onOk: async () => {
+        setLoadingBusinessDraft(true);
+        setApiError("");
+        try {
+          const result = await generateBusinessDraftFromContextPack(
+            selectedProjectId,
+            selectedSectionId,
+            activeContextPack.id,
+            { allow_blocked_internal_draft: isBlocked }
+          );
+          setBusinessDraftContextPacks([result.context_pack]);
+          setBusinessDraftChapters(result.chapters);
+          setDraftBlocks(result.blocks);
+          setCoverageReview(result.coverage_review);
+          setSelectedDraftChapterId(result.chapters[0]?.id ?? "");
+          setViewMode("workspace");
+          setActiveTab("chapter");
+          setWorkspaceNode("chapter");
+          appendLog(`ContextPack 生成草稿：${result.chapters.length} 章，${result.blocks.length} 个 block`);
+          await Promise.all([reloadApprovalTasks(), reloadAuditLogs(), reloadPreflightCheck()]);
+        } catch (error) {
+          setApiError(error instanceof Error ? error.message : "ContextPack 草稿生成失败");
+          throw error;
+        } finally {
+          setLoadingBusinessDraft(false);
+        }
+      }
+    });
+  };
+
+  const confirmContextPackDraftGeneration = () => {
+    if (!activeContextPack || !selectedProjectId || !selectedSectionId) return;
+    if (!qualificationDecisionConfirmed) {
+      Modal.warning({
+        title: "请先确认参标建议",
+        content: contextPackQualificationGate.message,
+        okText: "去资格预评估",
+        onOk: () => activateWorkflowStep("qualification")
+      });
+      return;
+    }
+    if (qualificationDecisionIsNoGo) {
+      confirmNoGoRiskAcceptance(openContextPackDraftGenerationConfirm);
+      return;
+    }
+    openContextPackDraftGenerationConfirm();
+  };
+
+  const handleRunContextPackCoverageReview = async () => {
+    if (!activeContextPack || !selectedProjectId || !selectedSectionId) return;
+    setLoadingContextPack(true);
+    setApiError("");
+    try {
+      const review = await runBusinessDraftContextPackCoverageReview(
+        selectedProjectId,
+        selectedSectionId,
+        activeContextPack.id
+      );
+      setCoverageReview(review);
+      appendLog(`执行 ContextPack 覆盖检查：${review.status}`);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "覆盖检查失败");
+    } finally {
+      setLoadingContextPack(false);
+    }
+  };
+
+  const handleUpdateDraftBlockStatus = async (
+    block: DraftBlock,
+    reviewStatus: string,
+    reason: string,
+    contentText?: string
+  ) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    setSavingBusinessDraft(true);
+    setApiError("");
+    try {
+      const updated = await updateBusinessDraftBlock(selectedProjectId, selectedSectionId, block.id, {
+        review_status: reviewStatus,
+        content_text: contentText ?? null,
+        reason
+      });
+      setDraftBlocks((blocks) => blocks.map((item) => (item.id === updated.id ? updated : item)));
+      if (updated.chapter_id && contentText) {
+        await reloadBusinessDraftChapters();
+      }
+      appendLog(`更新草稿 block 状态：${reviewStatus}`);
+      await reloadAuditLogs();
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "草稿 block 状态更新失败");
+    } finally {
+      setSavingBusinessDraft(false);
+    }
+  };
+
+  const openEditDraftBlock = (block: DraftBlock) => {
+    let contentText = block.content_text;
+    let reason = "人工修改结构化草稿 block 内容";
+    Modal.confirm({
+      title: "编辑结构化 block",
+      width: 760,
+      content: (
+        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          <Text type="secondary">保存后该 block 会回到待审阅状态，并重新执行章节事实校验。</Text>
+          <TextArea
+            defaultValue={block.content_text}
+            autoSize={{ minRows: 8, maxRows: 14 }}
+            onChange={(event) => {
+              contentText = event.target.value;
+            }}
+          />
+          <TextArea
+            defaultValue={reason}
+            autoSize={{ minRows: 2, maxRows: 4 }}
+            onChange={(event) => {
+              reason = event.target.value;
+            }}
+          />
+        </Space>
+      ),
+      okText: "保存",
+      cancelText: "取消",
+      onOk: async () => {
+        if (!contentText.trim() || !reason.trim()) {
+          Modal.warning({ title: "需要填写 block 内容和修改原因" });
+          throw new Error("draft block content and reason required");
+        }
+        await handleUpdateDraftBlockStatus(block, "pending", reason.trim(), contentText.trim());
       }
     });
   };
@@ -3731,17 +4135,25 @@ export function App() {
 
   const handleExportBusinessWord = async () => {
     if (!selectedProjectId || !selectedSectionId) return;
-    if (preflightCheck && (preflightCheck.unverified_fact_count > 0 || preflightCheck.status === "block")) {
+    const hasUnapprovedDraftBlocks = draftBlocks.length > 0 && unapprovedDraftBlockCount > 0;
+    if (
+      hasUnapprovedDraftBlocks ||
+      (preflightCheck && (preflightCheck.unverified_fact_count > 0 || preflightCheck.status === "block"))
+    ) {
       let riskAcceptanceReason = "";
       Modal.confirm({
-        title: "提交前核验仍有风险",
+        title: hasUnapprovedDraftBlocks ? "结构化草稿尚未全部通过" : "提交前核验仍有风险",
         content: (
           <Space direction="vertical" size={12} style={{ width: "100%" }}>
             <Alert
-              type={preflightCheck.status === "block" ? "error" : "warning"}
+              type={hasUnapprovedDraftBlocks || preflightCheck?.status === "block" ? "error" : "warning"}
               showIcon
               message="导出将被标记为内部草稿"
-              description={`${preflightCheck.summary} 导出的 Word 需人工复核后使用。`}
+              description={
+                hasUnapprovedDraftBlocks
+                  ? `还有 ${unapprovedDraftBlockCount} 个结构化 block 未人工通过。导出的 Word 只能作为内部草稿。`
+                  : `${preflightCheck?.summary ?? "提交前核验仍有风险。"} 导出的 Word 需人工复核后使用。`
+              }
             />
             <TextArea
               placeholder="请填写风险接受说明，例如：导出内部草稿用于会议评审，待补齐证据后再形成正式版本。"
@@ -3755,7 +4167,7 @@ export function App() {
         okText: "继续导出草稿",
         cancelText: "先处理风险",
         onOk: () => {
-          if (preflightCheck.status === "block" && !riskAcceptanceReason.trim()) {
+          if ((hasUnapprovedDraftBlocks || preflightCheck?.status === "block") && !riskAcceptanceReason.trim()) {
             Modal.warning({ title: "需要填写风险接受说明" });
             throw new Error("risk acceptance required");
           }
@@ -6875,13 +7287,30 @@ export function App() {
                             {
                               title: "操作",
                               dataIndex: "actions",
-                              width: 280,
+                              width: 340,
                               fixed: "right",
                               render: (_: unknown, record) => (
                                 <Space size={6}>
                                   <Button size="small" icon={<FileTextOutlined />} onClick={() => setSourceDrawer(record)}>
                                     原文
                                   </Button>
+                                  <Tooltip
+                                    title={
+                                      draftBlocksByComplianceItemId.has(record.key)
+                                        ? "定位覆盖该条款的结构化草稿 block"
+                                        : "该条款尚未覆盖到结构化草稿 block"
+                                    }
+                                  >
+                                    <span>
+                                      <Button
+                                        size="small"
+                                        disabled={!draftBlocksByComplianceItemId.has(record.key)}
+                                        onClick={() => locateDraftBlockForRow(record.key)}
+                                      >
+                                        草稿
+                                      </Button>
+                                    </span>
+                                  </Tooltip>
                                   <Button
                                     size="small"
                                     type="primary"
@@ -7444,6 +7873,98 @@ export function App() {
                           )}
                         </div>
                         <div className="draft-editor">
+                          <div className="context-pack-strip">
+                            <div className="context-pack-main">
+                              <Space wrap>
+                                <Text strong>ContextPack</Text>
+                                <Tag color={preflightColor(contextPackSource?.readiness_status ?? "warn")}>
+                                  {contextPackSource ? preflightLabel(contextPackSource.readiness_status) : "未生成"}
+                                </Tag>
+                                <Tag color="blue">{contextPackOutlineSections.length} 章计划</Tag>
+                                <Tag color={contextPackBlockSummary.needsEvidence ? "red" : "green"}>
+                                  缺证据 block {contextPackBlockSummary.needsEvidence}
+                                </Tag>
+                                <Tag color={contextPackBlockSummary.needsFact ? "gold" : "green"}>
+                                  待补事实 {contextPackBlockSummary.needsFact}
+                                </Tag>
+                                {coverageReview && (
+                                  <Tag color={preflightColor(coverageReview.status)}>
+                                    覆盖检查 {preflightLabel(coverageReview.status)}
+                                  </Tag>
+                                )}
+                                {coverageReview && (
+                                  <Tag color={summaryNumber(coverageReview.summary_json, "quality_score") >= 85 ? "green" : "gold"}>
+                                    质量分 {summaryNumber(coverageReview.summary_json, "quality_score")}
+                                  </Tag>
+                                )}
+                                {contextPackQualificationGate.status !== "pass" && (
+                                  <Tag color={preflightColor(contextPackQualificationGate.status)}>
+                                    {contextPackQualificationGate.message}
+                                  </Tag>
+                                )}
+                              </Space>
+                              {contextPackChecks.length > 0 ? (
+                                <div className="context-pack-checks">
+                                  {contextPackChecks.slice(0, 3).map((check, index) => (
+                                    <Tag
+                                      key={`${String(check.code ?? index)}-${index}`}
+                                      color={preflightColor(String(check.status ?? "warn"))}
+                                    >
+                                      {String(check.summary ?? check.code ?? "待处理")}
+                                    </Tag>
+                                  ))}
+                                </div>
+                              ) : (
+                                <Text type="secondary">生成前会固定项目字段、矩阵项、证据、缺项和章节范围。</Text>
+                              )}
+                            </div>
+                            <Space wrap>
+                              <Button loading={loadingContextPack} onClick={handlePreviewContextPack}>
+                                预览
+                              </Button>
+                              <Tooltip title={canConfirmContextPack ? "" : contextPackQualificationGate.message}>
+                                <span>
+                                  <Button
+                                    loading={loadingContextPack}
+                                    disabled={!canConfirmContextPack}
+                                    onClick={handleCreateContextPack}
+                                  >
+                                    确认 ContextPack
+                                  </Button>
+                                </span>
+                              </Tooltip>
+                              <Tooltip
+                                title={
+                                  canGenerateContextPackDraft
+                                    ? ""
+                                    : activeContextPack
+                                      ? contextPackQualificationGate.message
+                                      : "先确认 ContextPack。"
+                                }
+                              >
+                                <span>
+                                  <Button
+                                    type="primary"
+                                    icon={<RobotOutlined />}
+                                    loading={loadingBusinessDraft}
+                                    disabled={!canGenerateContextPackDraft}
+                                    onClick={confirmContextPackDraftGeneration}
+                                  >
+                                    {activeContextPack?.readiness_status === "block" || qualificationDecisionIsNoGo
+                                      ? "生成内部草稿"
+                                      : "按 ContextPack 生成"}
+                                  </Button>
+                                </span>
+                              </Tooltip>
+                              <Button
+                                loading={loadingContextPack}
+                                disabled={!activeContextPack || !draftBlocks.length}
+                                onClick={handleRunContextPackCoverageReview}
+                              >
+                                覆盖检查
+                              </Button>
+                            </Space>
+                          </div>
                           <div className="draft-toolbar">
                             <Space wrap>
                               <Button
@@ -7527,6 +8048,137 @@ export function App() {
                                 </Button>
                                 <Text type="secondary">保存会重新校验证书编号、金额、日期等事实，并替换无法验证内容。</Text>
                               </div>
+                              {selectedDraftDiff && (
+                                <div className="draft-diff-card">
+                                  <div className="draft-diff-head">
+                                    <Space wrap>
+                                      <Text strong>最近修改对比</Text>
+                                      <Tag color={selectedDraftDiff.action === "business_draft.block_updated" ? "blue" : "purple"}>
+                                        {selectedDraftDiff.action === "business_draft.block_updated" ? "Block" : "章节"}
+                                      </Tag>
+                                      <Tag color={selectedDraftDiff.delta >= 0 ? "green" : "gold"}>
+                                        {selectedDraftDiff.delta >= 0 ? "+" : ""}
+                                        {selectedDraftDiff.delta} 字
+                                      </Tag>
+                                    </Space>
+                                    <Text type="secondary">{formatDateTime(selectedDraftDiff.createdAt)}</Text>
+                                  </div>
+                                  <div className="draft-diff-grid">
+                                    <div>
+                                      <Text type="secondary">修改前</Text>
+                                      <p>{truncateText(selectedDraftDiff.beforeText || "无旧内容", 180)}</p>
+                                    </div>
+                                    <div>
+                                      <Text type="secondary">修改后</Text>
+                                      <p>{truncateText(selectedDraftDiff.afterText || "无新内容", 180)}</p>
+                                    </div>
+                                  </div>
+                                  {selectedDraftDiff.reason && (
+                                    <Text type="secondary">原因：{selectedDraftDiff.reason}</Text>
+                                  )}
+                                </div>
+                              )}
+                              {selectedChapterBlocks.length > 0 && (
+                                <div className="draft-block-list">
+                                  <div className="draft-block-title">
+                                    <Text strong>结构化 block 审阅</Text>
+                                    <Tag>{selectedChapterBlocks.length}</Tag>
+                                  </div>
+                                  {selectedChapterBlocks.map((block) => {
+                                    const complianceItemIds = draftBlockLinkIds(block, "compliance_item_ids");
+                                    const evidenceBindingIds = draftBlockLinkIds(block, "evidence_binding_ids");
+                                    const linkedRows = complianceItemIds
+                                      .map((itemId) => matrixRowsById.get(itemId))
+                                      .filter((row): row is MatrixRow => Boolean(row));
+                                    return (
+                                      <div
+                                        className={`draft-block-item ${activeDraftBlockId === block.id ? "active" : ""}`}
+                                        data-draft-block-id={block.id}
+                                        key={block.id}
+                                      >
+                                        <div>
+                                          <Space wrap>
+                                            <Tag color={draftBlockStatusColors[block.review_status] ?? "default"}>
+                                              {draftBlockStatusLabels[block.review_status] ?? block.review_status}
+                                            </Tag>
+                                            <Tag color="blue">
+                                              条款 {complianceItemIds.length}
+                                            </Tag>
+                                            <Tag color="green">
+                                              证据 {evidenceBindingIds.length}
+                                            </Tag>
+                                          </Space>
+                                          <p>{block.content_text}</p>
+                                          {linkedRows.length > 0 && (
+                                            <div className="draft-block-trace">
+                                              {linkedRows.slice(0, 4).map((row, index) => (
+                                                <Tooltip title={row.requirement} key={`${block.id}-${row.key}`}>
+                                                  <Button
+                                                    size="small"
+                                                    className="draft-block-trace-button"
+                                                    onClick={() => locateMatrixRow(row.key)}
+                                                  >
+                                                    条款 {index + 1}
+                                                  </Button>
+                                                </Tooltip>
+                                              ))}
+                                              <Button
+                                                size="small"
+                                                onClick={() => {
+                                                  setSourceDrawer(linkedRows[0]);
+                                                }}
+                                              >
+                                                原文
+                                              </Button>
+                                              <Button
+                                                size="small"
+                                                onClick={() => {
+                                                  setViewMode("workspace");
+                                                  setActiveTab("review");
+                                                  setWorkspaceNode("review");
+                                                  window.setTimeout(() => focusReviewRow(linkedRows[0]), 100);
+                                                }}
+                                              >
+                                                审阅台
+                                              </Button>
+                                            </div>
+                                          )}
+                                        </div>
+                                        <Space wrap>
+                                          <Button
+                                            size="small"
+                                            loading={savingBusinessDraft}
+                                            onClick={() => openEditDraftBlock(block)}
+                                          >
+                                            编辑
+                                          </Button>
+                                          <Button
+                                            size="small"
+                                            disabled={block.review_status === "approved"}
+                                            loading={savingBusinessDraft}
+                                            onClick={() =>
+                                              handleUpdateDraftBlockStatus(block, "approved", "人工审阅通过该结构化 block")
+                                            }
+                                          >
+                                            通过
+                                          </Button>
+                                          <Button
+                                            size="small"
+                                            danger
+                                            disabled={block.review_status === "needs_evidence"}
+                                            loading={savingBusinessDraft}
+                                            onClick={() =>
+                                              handleUpdateDraftBlockStatus(block, "needs_evidence", "人工标记该 block 仍需补充证据")
+                                            }
+                                          >
+                                            需补证
+                                          </Button>
+                                        </Space>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
                               <div className="fact-check-list">
                                 <Text strong>事实性校验</Text>
                                 {selectedDraftChapter.fact_checks.map((check) => (

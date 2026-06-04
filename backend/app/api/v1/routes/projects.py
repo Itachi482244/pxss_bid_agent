@@ -29,7 +29,11 @@ from app.models import (
     Document,
     DocumentChunk,
     DocumentVersion,
+    DraftBlock,
+    DraftContextPack,
+    DraftCoverageReview,
     DraftFactCheck,
+    DraftSectionContextPack,
     EnterpriseMaterial,
     ExportFile,
     Project,
@@ -48,6 +52,11 @@ from app.schemas.project import (
     ApprovalTaskRead,
     BusinessDraftChapterRead,
     BusinessDraftChapterUpdateRequest,
+    BusinessDraftContextPackGenerateRequest,
+    BusinessDraftContextPackGenerateResult,
+    BusinessDraftContextPackPreviewRead,
+    BusinessDraftContextPackRead,
+    BusinessDraftContextPackRequest,
     BusinessDraftEvidenceRefRead,
     BusinessDraftExportRequest,
     BusinessDraftGenerateRequest,
@@ -62,7 +71,11 @@ from app.schemas.project import (
     ComplianceItemFromSourceRequest,
     ComplianceItemFromSourceResult,
     ComplianceMatrixGenerateRequest,
+    DraftBlockRead,
+    DraftBlockUpdateRequest,
+    DraftCoverageReviewRead,
     DraftFactCheckRead,
+    DraftSectionContextPackRead,
     DuplicateGroupActionRequest,
     DuplicateGroupActionResult,
     ComplianceItemRead,
@@ -103,6 +116,12 @@ from app.services.business_draft import (
     export_business_draft_word,
     generate_business_draft_chapters,
     run_fact_checks,
+)
+from app.services.context_pack import (
+    build_context_pack_preview,
+    create_context_pack,
+    create_coverage_review,
+    generate_draft_from_context_pack,
 )
 from app.services.compliance_generation import execute_compliance_matrix_generation_task
 from app.services.document_utils import MAX_FILE_BYTES
@@ -975,6 +994,68 @@ def business_draft_chapter_read(db: Session, chapter: BusinessDraftChapter) -> B
     return payload
 
 
+def draft_section_context_pack_read(
+    section_context_pack: DraftSectionContextPack,
+) -> DraftSectionContextPackRead:
+    return DraftSectionContextPackRead.model_validate(section_context_pack)
+
+
+def draft_context_pack_read(db: Session, context_pack: DraftContextPack) -> BusinessDraftContextPackRead:
+    section_context_packs = db.scalars(
+        select(DraftSectionContextPack)
+        .where(
+            DraftSectionContextPack.tenant_id == context_pack.tenant_id,
+            DraftSectionContextPack.context_pack_id == context_pack.id,
+            DraftSectionContextPack.status != "superseded",
+        )
+        .order_by(DraftSectionContextPack.sort_order.asc())
+    ).all()
+    payload = BusinessDraftContextPackRead.model_validate(context_pack)
+    payload.section_context_packs = [
+        draft_section_context_pack_read(section_context_pack)
+        for section_context_pack in section_context_packs
+    ]
+    return payload
+
+
+def draft_block_read(block: DraftBlock) -> DraftBlockRead:
+    return DraftBlockRead.model_validate(block)
+
+
+def draft_coverage_review_read(review: DraftCoverageReview) -> DraftCoverageReviewRead:
+    return DraftCoverageReviewRead.model_validate(review)
+
+
+def draft_block_review_summary(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+) -> dict[str, int | list[str]]:
+    blocks = db.scalars(
+        select(DraftBlock).where(
+            DraftBlock.tenant_id == tenant_id,
+            DraftBlock.project_id == project_id,
+            DraftBlock.section_id == section_id,
+        )
+    ).all()
+    status_counts: dict[str, int] = {}
+    for block in blocks:
+        status_counts[block.review_status] = status_counts.get(block.review_status, 0) + 1
+    unresolved_statuses = sorted(status for status in status_counts if status != "approved")
+    return {
+        "total": len(blocks),
+        "approved": status_counts.get("approved", 0),
+        "unresolved": sum(count for status, count in status_counts.items() if status != "approved"),
+        "unresolved_statuses": unresolved_statuses,
+        "needs_evidence": status_counts.get("needs_evidence", 0),
+        "needs_fact": status_counts.get("needs_fact", 0),
+        "rejected": status_counts.get("rejected", 0),
+        "pending": status_counts.get("pending", 0) + status_counts.get("covered", 0),
+    }
+
+
 def build_preflight_check(
     db: Session,
     *,
@@ -1052,6 +1133,16 @@ def build_preflight_check(
     pending_qualification_count = sum(
         1 for item in items if item.item_type == "qualification" and item.status in unresolved_statuses
     )
+    qualification_decision = db.scalar(
+        select(QualificationDecision)
+        .where(
+            QualificationDecision.tenant_id == ctx.tenant_id,
+            QualificationDecision.project_id == project.id,
+            QualificationDecision.section_id == section.id,
+            QualificationDecision.status != "superseded",
+        )
+        .order_by(QualificationDecision.created_at.desc())
+    )
     high_risk_unconfirmed_count = sum(
         1 for item in items if item.risk_level == "high" and item.status != "confirmed"
     )
@@ -1101,6 +1192,12 @@ def build_preflight_check(
     unverified_fact_count = sum(1 for check in fact_checks if check.check_status == "unverified")
     failed_fact_count = sum(1 for check in fact_checks if check.check_status == "warning")
     pending_fact_check_chapter_count = sum(1 for chapter in chapters if chapter.fact_check_status == "pending")
+    block_review = draft_block_review_summary(
+        db,
+        tenant_id=ctx.tenant_id,
+        project_id=project.id,
+        section_id=section.id,
+    )
 
     approval_tasks = db.scalars(
         select(ApprovalTask).where(
@@ -1179,6 +1276,18 @@ def build_preflight_check(
         "查看商务草稿",
         "chapter",
     )
+    if block_review["total"]:
+        add_check(
+            "draft_block_review",
+            "结构化草稿审阅",
+            "block" if block_review["unresolved"] else "pass",
+            int(block_review["unresolved"]),
+            f"还有 {block_review['unresolved']} 个结构化草稿 block 未人工通过。"
+            if block_review["unresolved"]
+            else "结构化草稿 block 已全部人工通过。",
+            "审阅草稿 block",
+            "chapter",
+        )
     add_check(
         "qualification",
         "资格项确认",
@@ -1186,6 +1295,40 @@ def build_preflight_check(
         pending_qualification_count,
         f"还有 {pending_qualification_count} 条资格项待确认。" if pending_qualification_count else "资格项已确认。",
         "查看资格预评估",
+        "qualification",
+    )
+    if qualification_decision is None:
+        qualification_decision_status = "block"
+        qualification_decision_message = "尚未生成参标建议，需先运行资格预评估并人工确认。"
+        qualification_decision_action = "运行资格预评估"
+        qualification_decision_count = 1
+    elif qualification_decision.status != "confirmed":
+        qualification_decision_status = "block"
+        qualification_decision_message = "参标建议尚未人工确认，不能进入正式 ContextPack 和草稿生成。"
+        qualification_decision_action = "确认参标建议"
+        qualification_decision_count = 1
+    elif qualification_decision.recommendation == "no_go":
+        qualification_decision_status = "block"
+        qualification_decision_message = "已确认的参标建议为 No-Go，只能在风险接受后生成内部草稿。"
+        qualification_decision_action = "查看资格结论"
+        qualification_decision_count = 1
+    elif qualification_decision.recommendation == "conditional_go":
+        qualification_decision_status = "warn"
+        qualification_decision_message = "参标建议为有条件 Go，生成草稿和提交前仍需复核缺材料/待确认事项。"
+        qualification_decision_action = "查看资格结论"
+        qualification_decision_count = 1
+    else:
+        qualification_decision_status = "pass"
+        qualification_decision_message = "参标建议已确认。"
+        qualification_decision_action = "查看资格结论"
+        qualification_decision_count = 0
+    add_check(
+        "qualification_decision",
+        "参标建议",
+        qualification_decision_status,
+        qualification_decision_count,
+        qualification_decision_message,
+        qualification_decision_action,
         "qualification",
     )
     add_check(
@@ -1221,14 +1364,21 @@ def build_preflight_check(
     )
 
     if not chapters:
+        draft_message = "尚未生成商务/资格草稿。"
+        draft_action = "生成草稿"
+        draft_target = "chapter"
+        if qualification_decision is None or qualification_decision.status != "confirmed":
+            draft_message = "尚未完成资格预评估确认，先生成并确认参标建议后再生成草稿。"
+            draft_action = "运行资格预评估"
+            draft_target = "qualification"
         add_check(
             "draft_exists",
             "商务草稿",
             "warn",
             1,
-            "尚未生成商务/资格草稿。",
-            "生成草稿",
-            "chapter",
+            draft_message,
+            draft_action,
+            draft_target,
         )
 
     if any(item.status == "block" for item in checks):
@@ -2461,6 +2611,231 @@ def confirm_qualification_decision(
     return QualificationDecisionRead.model_validate(decision)
 
 
+@router.post(
+    "/{project_id}/sections/{section_id}/business-draft/context-pack/preview",
+    response_model=BusinessDraftContextPackPreviewRead,
+)
+def preview_business_draft_context_pack(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: BusinessDraftContextPackRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> BusinessDraftContextPackPreviewRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        preview = build_context_pack_preview(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            profile_id=payload.profile_id,
+            section_types=payload.section_types,
+        )
+    except BusinessDraftError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return BusinessDraftContextPackPreviewRead.model_validate(preview)
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/business-draft/context-pack",
+    response_model=list[BusinessDraftContextPackRead],
+)
+def list_business_draft_context_packs(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> list[BusinessDraftContextPackRead]:
+    get_section_or_404(db, ctx, project_id, section_id)
+    context_packs = db.scalars(
+        select(DraftContextPack)
+        .where(
+            DraftContextPack.tenant_id == ctx.tenant_id,
+            DraftContextPack.project_id == project_id,
+            DraftContextPack.section_id == section_id,
+            DraftContextPack.status != "superseded",
+        )
+        .order_by(DraftContextPack.created_at.desc())
+    ).all()
+    return [draft_context_pack_read(db, context_pack) for context_pack in context_packs]
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/business-draft/context-pack",
+    response_model=BusinessDraftContextPackRead,
+)
+def create_business_draft_context_pack(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: BusinessDraftContextPackRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> BusinessDraftContextPackRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        context_pack = create_context_pack(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=ctx.user_id,
+            profile_id=payload.profile_id,
+            section_types=payload.section_types,
+        )
+    except BusinessDraftError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(context_pack)
+    return draft_context_pack_read(db, context_pack)
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/business-draft/context-pack/{context_pack_id}/generate",
+    response_model=BusinessDraftContextPackGenerateResult,
+)
+def generate_business_draft_from_context_pack(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    context_pack_id: uuid.UUID,
+    payload: BusinessDraftContextPackGenerateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> BusinessDraftContextPackGenerateResult:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        chapters, blocks, coverage_review = generate_draft_from_context_pack(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            context_pack_id=context_pack_id,
+            actor_user_id=ctx.user_id,
+            allow_blocked_internal_draft=payload.allow_blocked_internal_draft,
+        )
+    except BusinessDraftError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    context_pack = db.get(DraftContextPack, context_pack_id)
+    if context_pack is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ContextPack not found")
+    db.commit()
+    db.refresh(context_pack)
+    for chapter in chapters:
+        db.refresh(chapter)
+    for block in blocks:
+        db.refresh(block)
+    db.refresh(coverage_review)
+    return BusinessDraftContextPackGenerateResult(
+        context_pack=draft_context_pack_read(db, context_pack),
+        chapters=[business_draft_chapter_read(db, chapter) for chapter in chapters],
+        blocks=[draft_block_read(block) for block in blocks],
+        coverage_review=draft_coverage_review_read(coverage_review),
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/business-draft/context-pack/{context_pack_id}/coverage-review",
+    response_model=DraftCoverageReviewRead,
+)
+def run_business_draft_context_pack_coverage_review(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    context_pack_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> DraftCoverageReviewRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        review = create_coverage_review(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            context_pack_id=context_pack_id,
+            actor_user_id=ctx.user_id,
+        )
+    except BusinessDraftError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(review)
+    return draft_coverage_review_read(review)
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/business-draft/blocks",
+    response_model=list[DraftBlockRead],
+)
+def list_business_draft_blocks(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> list[DraftBlockRead]:
+    get_section_or_404(db, ctx, project_id, section_id)
+    blocks = db.scalars(
+        select(DraftBlock)
+        .where(
+            DraftBlock.tenant_id == ctx.tenant_id,
+            DraftBlock.project_id == project_id,
+            DraftBlock.section_id == section_id,
+        )
+        .order_by(DraftBlock.created_at.desc(), DraftBlock.sort_order.asc())
+    ).all()
+    return [draft_block_read(block) for block in blocks]
+
+
+@router.patch(
+    "/{project_id}/sections/{section_id}/business-draft/blocks/{block_id}",
+    response_model=DraftBlockRead,
+)
+def update_business_draft_block(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    block_id: uuid.UUID,
+    payload: DraftBlockUpdateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> DraftBlockRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    block = db.scalar(
+        select(DraftBlock).where(
+            DraftBlock.tenant_id == ctx.tenant_id,
+            DraftBlock.project_id == project_id,
+            DraftBlock.section_id == section_id,
+            DraftBlock.id == block_id,
+        )
+    )
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft block not found")
+    before = draft_block_read(block).model_dump(mode="json")
+    block.review_status = payload.review_status
+    if payload.content_text is not None:
+        block.content_text = payload.content_text
+        if block.chapter_id and block.block_type != "heading":
+            chapter = db.get(BusinessDraftChapter, block.chapter_id)
+            project = db.get(Project, project_id)
+            if chapter is not None:
+                chapter.content_text = payload.content_text
+                chapter.updated_by = ctx.user_id
+                if project is not None:
+                    run_fact_checks(db, chapter=chapter, project=project, actor_user_id=ctx.user_id)
+    add_matrix_audit_log(
+        db,
+        ctx,
+        project_id=project_id,
+        section_id=section_id,
+        action="business_draft.block_updated",
+        object_type="draft_block",
+        object_id=block.id,
+        before_json=before,
+        after_json=draft_block_read(block).model_dump(mode="json"),
+        reason=payload.reason.strip(),
+    )
+    db.commit()
+    db.refresh(block)
+    return draft_block_read(block)
+
+
 @router.get(
     "/{project_id}/sections/{section_id}/business-draft/chapters",
     response_model=list[BusinessDraftChapterRead],
@@ -2634,6 +3009,12 @@ def export_business_draft_word_file(
     project = get_project_or_404(db, ctx, project_id)
     section = get_section_or_404(db, ctx, project_id, section_id)
     preflight = build_preflight_check(db, ctx=ctx, project=project, section=section)
+    block_review = draft_block_review_summary(
+        db,
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+    )
     risk_acceptance_reason = (payload.risk_acceptance_reason or "").strip() if payload else ""
     if preflight.status == "block" and not risk_acceptance_reason:
         raise HTTPException(
@@ -2656,6 +3037,7 @@ def export_business_draft_word_file(
                 "preflight_status": preflight.status,
                 "preflight_summary": preflight.summary,
                 "blocking_summary": blocking_summary,
+                "draft_block_review": block_review,
                 "risk_acceptance_reason": risk_acceptance_reason or None,
                 "captured_at": datetime.now(UTC).isoformat(),
                 "internal_draft": preflight.status == "block",

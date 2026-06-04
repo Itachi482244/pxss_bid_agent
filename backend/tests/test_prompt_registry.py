@@ -33,3 +33,13 @@ def test_prompt_registry_contains_sectioned_extraction_prompts() -> None:
     assert "source_quote" in section_extract.render(section_json="{}", chunks_json="[]")[1]["content"]
     assert coverage_review.output_schema["required"] == ["status", "issues"]
     assert "漏抽" in coverage_review.render(section_json="{}", chunks_json="[]", items_json="[]")[1]["content"]
+
+
+def test_prompt_registry_contains_mvp12_business_draft_section_prompt() -> None:
+    prompt = get_prompt("business_draft_section", "1.2.0")
+    messages = prompt.render(section_context_pack_json='{"section":{"title":"投标函"}}')
+
+    assert prompt.prompt_version == "business_draft_section@1.2.0"
+    assert prompt.output_schema["required"] == ["blocks"]
+    assert "DraftBlock" in messages[0]["content"]
+    assert "missing_fact_placeholders" in messages[1]["content"]

@@ -362,6 +362,11 @@ def test_project_import_from_uploaded_document_creates_project_document_and_matr
     def fake_chat_completion(db, **kwargs):  # noqa: ANN001, ARG001
         prompt_version = kwargs["prompt_version"]
         if prompt_version == "document_section_plan@1.1.0":
+            # Word 导入文本无真实分页，分块按 chunk 顺序映射为合成页码，
+            # 章节范围需覆盖全部分块，否则后续按页抽取会漏掉正文条款。
+            user_content = kwargs["messages"][-1]["content"]
+            pages = json.loads(user_content.rsplit("pages:\n", 1)[1])
+            end_page = max(page["page_no"] for page in pages)
             content = {
                 "sections": [
                     {
@@ -369,7 +374,7 @@ def test_project_import_from_uploaded_document_creates_project_document_and_matr
                         "title": "招标公告",
                         "section_type": "announcement",
                         "start_page": 1,
-                        "end_page": 1,
+                        "end_page": end_page,
                         "confidence_score": 0.9,
                         "evidence": "导入文件招标公告。",
                     }
@@ -379,29 +384,41 @@ def test_project_import_from_uploaded_document_creates_project_document_and_matr
             user_content = kwargs["messages"][-1]["content"]
             chunks = json.loads(user_content.rsplit("chunks:\n", 1)[1])
 
-            def chunk_for(needle: str) -> dict:
-                return next(item for item in chunks if needle in item["text"])
+            # 大章节会被拆成多段抽取，每次只看到本段分块；按 needle 命中本段才产出条款，
+            # 命中不到则返回 None 并过滤掉，避免对不含该条款的段落误报或抛异常。
+            def chunk_for(needle: str) -> dict | None:
+                return next((item for item in chunks if needle in item["text"]), None)
+
+            def make_item(needle: str, requirement_text: str, item_type: str) -> dict | None:
+                chunk = chunk_for(needle)
+                if chunk is None:
+                    return None
+                return {
+                    "source_chunk_index": chunk["chunk_index"],
+                    "item_type": item_type,
+                    "requirement_text": requirement_text,
+                    "risk_level": "high",
+                    "is_mandatory": True,
+                    "source_quote": requirement_text,
+                    "confidence_score": 0.9,
+                }
 
             content = {
                 "items": [
-                    {
-                        "source_chunk_index": chunk_for("营业执照")["chunk_index"],
-                        "item_type": "qualification",
-                        "requirement_text": "投标人须提供有效营业执照，并加盖公章。",
-                        "risk_level": "high",
-                        "is_mandatory": True,
-                        "source_quote": "投标人须提供有效营业执照，并加盖公章。",
-                        "confidence_score": 0.9,
-                    },
-                    {
-                        "source_chunk_index": chunk_for("最高投标限价")["chunk_index"],
-                        "item_type": "mandatory_response",
-                        "requirement_text": "最高投标限价：1349.09万元。",
-                        "risk_level": "high",
-                        "is_mandatory": True,
-                        "source_quote": "最高投标限价：1349.09万元",
-                        "confidence_score": 0.9,
-                    },
+                    candidate
+                    for candidate in (
+                        make_item(
+                            "营业执照",
+                            "投标人须提供有效营业执照，并加盖公章。",
+                            "qualification",
+                        ),
+                        make_item(
+                            "最高投标限价",
+                            "最高投标限价：1349.09万元。",
+                            "mandatory_response",
+                        ),
+                    )
+                    if candidate is not None
                 ]
             }
         else:
