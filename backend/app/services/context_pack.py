@@ -9,6 +9,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AsyncTask,
     AuditLog,
     BidSection,
     BusinessDraftChapter,
@@ -26,10 +27,15 @@ from app.models import (
     Project,
     QualificationDecision,
 )
+from app.core.observability import observed_task
 from app.prompts import get_prompt
 from app.services.business_draft import BusinessDraftError, run_fact_checks
+from app.services.evidence_policy import (
+    enterprise_evidence_not_required,
+    enterprise_evidence_not_required_reason,
+    requires_enterprise_evidence,
+)
 from app.services.template_profile import (
-    DEFAULT_TEMPLATE_PROFILE_ID,
     get_template_profile,
     iter_profile_sections,
 )
@@ -54,20 +60,15 @@ def _jsonable(value: Any) -> Any:
 
 
 def _evidence_not_required(item: ComplianceItem) -> bool:
-    explanation = item.explanation_json or {}
-    return bool(explanation.get("enterprise_evidence_not_required"))
+    return enterprise_evidence_not_required(item)
 
 
 def _evidence_not_required_reason(item: ComplianceItem) -> str | None:
-    explanation = item.explanation_json or {}
-    reason = explanation.get("enterprise_evidence_not_required_reason")
-    return str(reason) if reason else None
+    return enterprise_evidence_not_required_reason(item)
 
 
 def _requires_enterprise_evidence(item: ComplianceItem) -> bool:
-    if _evidence_not_required(item):
-        return False
-    return item.item_type in {"qualification", "mandatory_response"} or item.is_mandatory or item.risk_level == "high"
+    return requires_enterprise_evidence(item)
 
 
 def _binding_snapshot(binding: ComplianceEvidenceBinding) -> dict[str, Any]:
@@ -1280,7 +1281,11 @@ def create_coverage_review(
     elif issues:
         status = "warn"
     expected_count = len(expected_item_ids)
-    covered_count = len(covered_item_ids)
+    # Count only the *expected* items that were covered so the rate stays within
+    # [0, 1] and ``covered + missing == expected`` holds. Blocks routinely
+    # reference compliance items outside the expected (evidence-required / high
+    # risk) population, so the raw reference count is not a valid numerator.
+    covered_count = len(expected_item_ids & covered_item_ids)
     coverage_rate = round(covered_count / expected_count, 4) if expected_count else 1.0
     evidence_ref_count = sum(
         len((block.links_json or {}).get("evidence_binding_ids") or [])
@@ -1325,3 +1330,99 @@ def create_coverage_review(
     )
     db.add(review)
     return review
+
+
+def _coerce_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+@observed_task("business_draft_generate")
+def execute_business_draft_generation_task(
+    db: Session,
+    task_id: uuid.UUID | str,
+) -> dict[str, str | int]:
+    """Run an async MVP1.2 ContextPack draft generation task.
+
+    Mirrors :func:`execute_compliance_matrix_generation_task`: drives the
+    ``async_tasks`` row through running -> succeeded/failed, persists a summary
+    in ``output_json``, and never re-raises so an inline caller can return the
+    failed task for the client to poll.
+    """
+    task_uuid = _coerce_uuid(task_id)
+    task = db.get(AsyncTask, task_uuid)
+    if task is None or task.task_type != "business_draft_generate":
+        raise BusinessDraftError("商务草稿生成任务不存在")
+
+    now = datetime.now(UTC)
+    task.status = "running"
+    task.started_at = task.started_at or now
+    task.progress = 20
+    db.commit()
+
+    payload = task.input_json or {}
+    try:
+        context_pack_id = _coerce_uuid(payload["context_pack_id"])
+        chapters, blocks, coverage_review = generate_draft_from_context_pack(
+            db,
+            tenant_id=task.tenant_id,
+            project_id=task.project_id,
+            section_id=task.section_id,
+            context_pack_id=context_pack_id,
+            actor_user_id=task.created_by,
+            allow_blocked_internal_draft=bool(payload.get("allow_blocked_internal_draft")),
+        )
+        task.status = "succeeded"
+        task.progress = 100
+        task.output_json = {
+            "context_pack_id": str(context_pack_id),
+            "chapter_count": len(chapters),
+            "block_count": len(blocks),
+            "coverage_status": coverage_review.status,
+            "coverage_review_id": str(coverage_review.id),
+        }
+        task.finished_at = datetime.now(UTC)
+        db.add(
+            AuditLog(
+                tenant_id=task.tenant_id,
+                project_id=task.project_id,
+                section_id=task.section_id,
+                actor_user_id=task.created_by,
+                actor_type="system",
+                action="business_draft.context_pack_generate_task_succeeded",
+                object_type="async_task",
+                object_id=task.id,
+                after_json=task.output_json,
+                reason="异步 ContextPack 商务/资格草稿生成完成",
+                severity="info" if coverage_review.status == "pass" else "warning",
+            )
+        )
+        db.commit()
+        return {"status": "succeeded", "block_count": len(blocks)}
+    except Exception as exc:  # noqa: BLE001 - record and surface via task row
+        if db.is_active:
+            db.rollback()
+        error_code = "BUSINESS_DRAFT_GENERATION_BLOCKED" if isinstance(exc, BusinessDraftError) else "BUSINESS_DRAFT_GENERATION_FAILED"
+        task = db.get(AsyncTask, task_uuid)
+        if task is not None:
+            task.status = "failed"
+            task.progress = 100
+            task.error_code = error_code
+            task.error_message = str(exc)[:1000]
+            task.finished_at = datetime.now(UTC)
+            db.add(
+                AuditLog(
+                    tenant_id=task.tenant_id,
+                    project_id=task.project_id,
+                    section_id=task.section_id,
+                    actor_user_id=task.created_by,
+                    actor_type="system",
+                    action="business_draft.context_pack_generate_task_failed",
+                    object_type="async_task",
+                    object_id=task.id,
+                    after_json={"error_code": error_code, "error_message": str(exc)[:1000]},
+                    reason="异步 ContextPack 草稿生成失败，不保存为有效草稿",
+                    severity="warning",
+                )
+            )
+            db.commit()
+        return {"status": "failed", "error_code": error_code}

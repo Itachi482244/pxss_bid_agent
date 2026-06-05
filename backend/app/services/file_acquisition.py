@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.observability import observed_task
 from app.models import AsyncTask, AuditLog, Document, DocumentVersion, FileAcquisitionTask, ParseTask
 from app.services.document_utils import (
     MAX_FILE_BYTES,
@@ -260,6 +261,7 @@ def _create_parse_task_if_missing(
     return parse_task
 
 
+@observed_task("file_acquisition")
 def execute_file_acquisition_task(db: Session, task_id: uuid.UUID | str) -> dict[str, str]:
     task_uuid = _coerce_task_id(task_id)
     task = db.get(AsyncTask, task_uuid)

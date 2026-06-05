@@ -52,7 +52,6 @@ from app.services.url_safety import validate_public_file_url
 from app.services.document_parse import execute_document_parse_task
 from app.services.file_acquisition import execute_file_acquisition_task
 from app.services.compliance_generation import (
-    ComplianceGenerationError,
     ensure_document_section_plan,
     execute_section_compliance_extract_task,
     latest_extraction_quality_report,

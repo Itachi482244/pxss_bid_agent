@@ -121,10 +121,18 @@ from app.services.context_pack import (
     build_context_pack_preview,
     create_context_pack,
     create_coverage_review,
+    execute_business_draft_generation_task,
     generate_draft_from_context_pack,
 )
 from app.services.compliance_generation import execute_compliance_matrix_generation_task
 from app.services.document_utils import MAX_FILE_BYTES
+from app.services.evidence_policy import (
+    enterprise_evidence_not_required as policy_enterprise_evidence_not_required,
+)
+from app.services.evidence_policy import (
+    enterprise_evidence_not_required_reason as policy_enterprise_evidence_not_required_reason,
+)
+from app.services.evidence_policy import requires_enterprise_evidence
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import FileAcquisitionError
 from app.services.project_import import (
@@ -691,14 +699,11 @@ def confirmation_requires_source_verified(item: ComplianceItem) -> bool:
 
 
 def enterprise_evidence_not_required(item: ComplianceItem) -> bool:
-    explanation = item.explanation_json or {}
-    return bool(explanation.get("enterprise_evidence_not_required"))
+    return policy_enterprise_evidence_not_required(item)
 
 
 def enterprise_evidence_not_required_reason(item: ComplianceItem) -> str | None:
-    explanation = item.explanation_json or {}
-    reason = explanation.get("enterprise_evidence_not_required_reason")
-    return reason if isinstance(reason, str) and reason.strip() else None
+    return policy_enterprise_evidence_not_required_reason(item)
 
 
 def compliance_priority_for_item(item: ComplianceItem, evidence_count: int) -> tuple[int, str, str]:
@@ -1146,20 +1151,17 @@ def build_preflight_check(
     high_risk_unconfirmed_count = sum(
         1 for item in items if item.risk_level == "high" and item.status != "confirmed"
     )
-    def item_requires_enterprise_evidence(item: ComplianceItem) -> bool:
-        return not enterprise_evidence_not_required(item)
-
     mandatory_missing_evidence_count = sum(
         1
         for item in items
         if item.is_mandatory
-        and item_requires_enterprise_evidence(item)
+        and requires_enterprise_evidence(item)
         and evidence_counts.get(item.id, 0) == 0
     )
     missing_evidence_count = sum(
         1
         for item in items
-        if item_requires_enterprise_evidence(item)
+        if requires_enterprise_evidence(item)
         and (item.is_mandatory or item.status == "needs_material")
         and evidence_counts.get(item.id, 0) == 0
     )
@@ -2731,6 +2733,96 @@ def generate_business_draft_from_context_pack(
         blocks=[draft_block_read(block) for block in blocks],
         coverage_review=draft_coverage_review_read(coverage_review),
     )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/business-draft/context-pack/{context_pack_id}/generate-async",
+    response_model=AsyncTaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_business_draft_from_context_pack_async(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    context_pack_id: uuid.UUID,
+    payload: BusinessDraftContextPackGenerateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> AsyncTaskRead:
+    """Dispatch ContextPack draft generation as an async task.
+
+    Large documents can produce many chapters/blocks plus a coverage review;
+    running that synchronously risks request timeouts. The result is fetched via
+    the generic ``GET /tasks/{task_id}`` poll plus the existing blocks/chapters
+    and coverage-review read endpoints once the task succeeds.
+    """
+    get_section_or_404(db, ctx, project_id, section_id)
+    context_pack = db.get(DraftContextPack, context_pack_id)
+    if (
+        context_pack is None
+        or context_pack.tenant_id != ctx.tenant_id
+        or context_pack.project_id != project_id
+        or context_pack.section_id != section_id
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ContextPack not found")
+
+    idempotency_key = "business-draft-generate:" + hashlib.sha256(
+        f"{context_pack_id}:{uuid.uuid4().hex}".encode("utf-8")
+    ).hexdigest()
+    task = AsyncTask(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        task_type="business_draft_generate",
+        status="pending",
+        idempotency_key=idempotency_key,
+        progress=0,
+        input_json={
+            "context_pack_id": str(context_pack_id),
+            "allow_blocked_internal_draft": payload.allow_blocked_internal_draft,
+        },
+        retry_count=0,
+        max_retries=3,
+        created_by=ctx.user_id,
+    )
+    db.add(task)
+    db.flush()
+    db.add(
+        AuditLog(
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=ctx.user_id,
+            actor_type="user",
+            action="business_draft.context_pack_generate_requested",
+            object_type="async_task",
+            object_id=task.id,
+            after_json=task.input_json,
+            reason="用户请求异步生成 ContextPack 商务/资格草稿",
+            severity="info",
+        )
+    )
+    db.commit()
+    db.refresh(task)
+
+    if settings.run_tasks_inline:
+        execute_business_draft_generation_task(db, task.id)
+        db.refresh(task)
+    else:
+        from app.worker import run_business_draft_generation_task
+
+        try:
+            enqueue_celery_task(
+                db,
+                task,
+                lambda: run_business_draft_generation_task.delay(str(task.id)),
+            )
+        except TaskDispatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"商务草稿生成任务派发失败：{exc}",
+            ) from exc
+        db.refresh(task)
+    return AsyncTaskRead.model_validate(task)
 
 
 @router.post(

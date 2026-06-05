@@ -1577,6 +1577,78 @@ def test_rule_fallback_uses_pdf_table_rows_and_filters_template_placeholders() -
     assert not any("□允许" in text or "\uf0a3允许" in text or text.startswith("PDF 第") for text in texts)
 
 
+def test_junshan_rules_contextualize_and_deduplicate_low_information_fragments() -> None:
+    chunks = [
+        SimpleNamespace(
+            chunk_index=1,
+            heading_path="君山区城区燃气管网改造项目（EPC）/类似工程业绩要求",
+            content_text="不要求",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=2,
+            heading_path="君山区城区燃气管网改造项目（EPC）/获取招标文件",
+            content_text="2025 年 11 月 28 日17时",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=3,
+            heading_path="君山区城区燃气管网改造项目（EPC）/资格要求",
+            content_text="以联合体投标的，拟任工程总承包项目负责人须为联合体牵头人单位人员",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=4,
+            heading_path="君山区城区燃气管网改造项目（EPC）/资格要求",
+            content_text="以联合体投标的，拟任工程总承包项目负责人须为联合体牵头人单位人员。",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=5,
+            heading_path="君山区城区燃气管网改造项目（EPC）/资格要求",
+            content_text="2.6 本次招标接受联合体投标，联合体投标的相关要求见投标人须知前附表",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=6,
+            heading_path="君山区城区燃气管网改造项目（EPC）/资格要求",
+            content_text="本项目接受联合体投标。",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=7,
+            heading_path="君山区城区燃气管网改造项目（EPC）/项目概况",
+            content_text="1.3 工期要求： 270 ？天（日历日，下同）□月□年；",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=8,
+            heading_path="君山区城区燃气管网改造项目（EPC）/项目概况",
+            content_text="工期要求：270天（日历日，下同）。",
+            table_json=None,
+        ),
+        SimpleNamespace(
+            chunk_index=9,
+            heading_path="君山区城区燃气管网改造项目（EPC）/项目概况",
+            content_text="建设规模范围内的设计、施工总承包",
+            table_json=None,
+        ),
+    ]
+
+    candidates = _rule_extract(chunks)  # type: ignore[arg-type]
+    texts = [candidate.requirement_text for candidate in candidates]
+
+    similar_performance = next(item for item in candidates if item.requirement_text.startswith("类似工程业绩要求"))
+    assert similar_performance.requirement_text == "类似工程业绩要求：不要求。"
+    assert similar_performance.risk_level == "low"
+    assert similar_performance.is_mandatory is False
+    assert "2025 年 11 月 28 日17时" not in texts
+    assert "建设规模范围内的设计、施工总承包" not in texts
+    assert sum("联合体牵头人单位人员" in text for text in texts) == 1
+    assert sum("接受联合体投标" in text for text in texts) == 1
+    assert sum(text.startswith("工期要求") or "工期要求：" in text for text in texts) == 1
+
+
 def test_rule_fallback_splits_pdf_numbered_clauses_without_long_prefix() -> None:
     chunk = SimpleNamespace(
         chunk_index=1,

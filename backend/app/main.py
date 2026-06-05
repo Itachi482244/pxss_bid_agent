@@ -8,6 +8,7 @@ from starlette.staticfiles import StaticFiles
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.logging import configure_logging
+from app.core.observability import register_observability
 
 
 class SPAStaticFiles(StaticFiles):
@@ -38,6 +39,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    register_observability(app)
 
     app.include_router(api_router, prefix="/api/v1")
 

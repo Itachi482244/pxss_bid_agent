@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from app.core.observability import observed_task
 from app.models import AsyncTask, AuditLog, Document, DocumentChunk, DocumentVersion, ParseTask
 from app.parsers.pdf import PdfTextEmptyError, parse_pdf_bytes
 from app.parsers.word import parse_docx_bytes
@@ -97,6 +98,7 @@ def _load_parse_context(
     return task, parse_task, document, version
 
 
+@observed_task("document_parse")
 def execute_document_parse_task(db: Session, task_id: uuid.UUID | str) -> dict[str, str | int]:
     task, parse_task, document, version = _load_parse_context(db, task_id)
 

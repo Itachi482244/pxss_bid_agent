@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import re
@@ -16,6 +17,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.observability import observed_task
 from app.db.session import SessionLocal
 from app.models import (
     AsyncTask,
@@ -399,17 +401,41 @@ def _is_pure_heading(text: str) -> bool:
 
 def _contextual_requirement_text(text: str, heading_path: str | None) -> str:
     leaf = _heading_leaf(heading_path)
+    if text == "不要求" and "类似工程业绩要求" in (heading_path or ""):
+        return "类似工程业绩要求：不要求。"
+    if text == "采用资格后审方式" and "资格审查" in (heading_path or ""):
+        return "资格审查方式：采用资格后审方式。"
     if leaf and len(text) <= 20 and text not in leaf and not STRUCTURAL_HEADING_RE.match(leaf):
         return f"{leaf.rstrip(':：')}：{text}"
     return text
 
 
+def _is_standalone_date_text(text: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*(?:\d{1,2}\s*[点:：时]\s*(?:\d{1,2}\s*分?)?)?",
+            text.strip(),
+        )
+    )
+
+
 def _normalized_key(text: str) -> str:
-    cleaned = re.sub(r"\s+", "", text.lower())
+    cleaned = re.sub(r"^[（(]?\d+(?:[.．]\d+)*[）).．、]?\s*", "", text.lower())
+    cleaned = re.sub(r"[\s，,。；;：:（）()、.．]+", "", cleaned)
     return "auto:" + hashlib.sha1(cleaned.encode("utf-8")).hexdigest()
 
 
 def _semantic_key(text: str, item_type: str) -> str:
+    compact = _compact_for_match(text)
+    if "类似工程业绩要求" in compact and "不要求" in compact:
+        return "auto:qualification:similar-performance-not-required"
+    if "接受联合体投标" in compact and "不接受联合体投标" not in compact:
+        return "auto:qualification:joint-venture-accepted"
+    if "拟任工程总承包项目负责人须为联合体牵头人单位人员" in compact:
+        return "auto:qualification:joint-venture-leader-personnel"
+    duration_match = re.search(r"工期要求[：:]?\s*(\d+)\s*[？?□☐\s]*天", text)
+    if duration_match:
+        return f"auto:mandatory:duration-days:{int(duration_match.group(1))}"
     if item_type == "deadline":
         date_match = re.search(
             r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2})?\s*[点:：时]?\s*(\d{1,2})?",
@@ -1877,11 +1903,11 @@ def _best_chunk_matching_quote_window(
 def _contextualized_llm_requirement_text(source_chunk: DocumentChunk, cleaned_text: str) -> str:
     row_quote = _best_table_row_quote(source_chunk, cleaned_text)
     if not row_quote or "：" not in row_quote:
-        return cleaned_text
+        return _contextual_requirement_text(cleaned_text, source_chunk.heading_path)
     label, _value = row_quote.split("：", 1)
     label = _clean_requirement_text(label)
     if not label or label in cleaned_text or len(label) > 40:
-        return cleaned_text
+        return _contextual_requirement_text(cleaned_text, source_chunk.heading_path)
     if not any(
         signal in label
         for signal in (
@@ -1897,11 +1923,20 @@ def _contextualized_llm_requirement_text(source_chunk: DocumentChunk, cleaned_te
             "资质要求",
             "资格要求",
             "联合体",
+            "类似工程业绩",
         )
     ):
-        return cleaned_text
+        return _contextual_requirement_text(cleaned_text, source_chunk.heading_path)
     value = "不允许。" if "联合体" in label and "不允许" in cleaned_text else cleaned_text
     return f"{label}：{value}"
+
+
+def _candidate_is_mandatory(item_type: str, risk_level: str, text: str, preferred: bool | None = None) -> bool:
+    if "类似工程业绩要求" in text and "不要求" in text:
+        return False
+    if preferred is not None:
+        return bool(preferred)
+    return risk_level == "high" or item_type in {"qualification", "deadline"}
 
 
 def _section_chunks(
@@ -1994,6 +2029,8 @@ def _call_section_llm(
         if _is_contact_text(cleaned_text, source_chunk.heading_path):
             continue
         cleaned_text = _contextualized_llm_requirement_text(source_chunk, cleaned_text)
+        if _should_skip_rule_text(cleaned_text, source_chunk.heading_path):
+            continue
         rule_type = _rule_item_type(cleaned_text, source_chunk.heading_path)
         item_type = item.item_type
         risk_level = item.risk_level
@@ -2068,6 +2105,7 @@ def _call_section_llm(
         if row_quote:
             source_quote = row_quote
 
+        is_mandatory = _candidate_is_mandatory(item_type, risk_level, cleaned_text, item.is_mandatory)
         needs_review, classification_reason, split_reason, review_hint = _llm_candidate_notes(
             item.model_copy(update={"item_type": item_type, "risk_level": risk_level}),
             source_chunk,
@@ -2097,7 +2135,7 @@ def _call_section_llm(
             text=cleaned_text,
             heading_path=source_chunk.heading_path,
             risk_level=risk_level,
-            is_mandatory=item.is_mandatory,
+            is_mandatory=is_mandatory,
             extraction_provider=extraction_provider,
         )
         explanation.update(
@@ -2124,7 +2162,7 @@ def _call_section_llm(
                 normalized_requirement=normalized,
                 response_suggestion=item.response_suggestion,
                 risk_level=risk_level,
-                is_mandatory=item.is_mandatory,
+                is_mandatory=is_mandatory,
                 confidence_score=_confidence(item.confidence_score),
                 explanation_json=explanation,
             )
@@ -2344,6 +2382,9 @@ def _call_llm(
             continue
         if _is_contact_text(cleaned_text, source_chunk.heading_path):
             continue
+        cleaned_text = _contextual_requirement_text(cleaned_text, source_chunk.heading_path)
+        if _should_skip_rule_text(cleaned_text, source_chunk.heading_path):
+            continue
         needs_review, classification_reason, split_reason, review_hint = _llm_candidate_notes(
             item,
             source_chunk,
@@ -2352,12 +2393,13 @@ def _call_llm(
         normalized = item.normalized_requirement or _semantic_key(cleaned_text, item.item_type)
         if not normalized.startswith("auto:"):
             normalized = _normalized_key(normalized)
+        is_mandatory = _candidate_is_mandatory(item.item_type, item.risk_level, cleaned_text, item.is_mandatory)
         explanation = _candidate_explanation(
             item_type=item.item_type,
             text=cleaned_text,
             heading_path=source_chunk.heading_path,
             risk_level=item.risk_level,
-            is_mandatory=item.is_mandatory,
+            is_mandatory=is_mandatory,
             extraction_provider=f"{result.provider}:{result.model_name}",
         )
         explanation.update(
@@ -2381,7 +2423,7 @@ def _call_llm(
                 normalized_requirement=normalized,
                 response_suggestion=item.response_suggestion,
                 risk_level=item.risk_level,
-                is_mandatory=item.is_mandatory,
+                is_mandatory=is_mandatory,
                 confidence_score=_confidence(item.confidence_score),
                 explanation_json=explanation,
             )
@@ -2449,6 +2491,8 @@ def _rule_item_type(text: str, heading_path: str | None) -> str:
 def _should_skip_rule_text(text: str, heading_path: str | None) -> bool:
     heading_leaf = _heading_leaf(heading_path)
     compact = re.sub(r"\s+", "", text)
+    if _is_standalone_date_text(text):
+        return True
     if compact == "目录" or (
         compact.startswith("目录") and "第一章" in compact and "第二章" in compact
     ):
@@ -2486,6 +2530,8 @@ def _should_skip_rule_text(text: str, heading_path: str | None) -> bool:
     if "/年/月/日" in compact or "承接过/业绩" in compact:
         return True
     if "发包人需要增加的、符合法律法规的其他要求" in text and len(text) <= 80:
+        return True
+    if compact in {"建设规模范围内的设计、施工总承包", "建设规模范围内的设计施工总承包"}:
         return True
     if re.match(r"^(项目名称|建设地点|建设规模|资金来源(?:及比例)?)[：:]", text):
         return True
@@ -2819,7 +2865,7 @@ def _extra_candidates_for_chunk(
     extras: list[ComplianceCandidate] = []
     if "拟任工程总承包项目负责人须为联合体牵头人单位人员" in text:
         requirement = "以联合体投标的，拟任工程总承包项目负责人须为联合体牵头人单位人员。"
-        normalized = _normalized_key(requirement)
+        normalized = _semantic_key(requirement, "qualification")
         if normalized not in seen:
             seen.add(normalized)
             extras.append(
@@ -2908,7 +2954,7 @@ def _rule_extract(chunks: list[DocumentChunk]) -> list[ComplianceCandidate]:
                     continue
                 seen.add(normalized)
                 risk_level = _risk_level(item_type, text)
-                is_mandatory = risk_level == "high" or item_type in {"qualification", "deadline"}
+                is_mandatory = _candidate_is_mandatory(item_type, risk_level, text)
                 candidates.append(
                     ComplianceCandidate(
                         source_chunk_index=chunk.chunk_index,
@@ -3170,6 +3216,7 @@ def _augment_section_candidates_from_table_guards(
                     or "交易担保" in label
                 ):
                     risk_level = "high"
+                is_mandatory = _candidate_is_mandatory(item_type, risk_level, requirement)
                 augmented.append(
                     ComplianceCandidate(
                         source_chunk_index=chunk.chunk_index,
@@ -3178,7 +3225,7 @@ def _augment_section_candidates_from_table_guards(
                         normalized_requirement=normalized,
                         response_suggestion=_response_suggestion(item_type, requirement),
                         risk_level=risk_level,
-                        is_mandatory=True,
+                        is_mandatory=is_mandatory,
                         confidence_score=Decimal("0.7200"),
                         explanation_json={
                             **_candidate_explanation(
@@ -3186,7 +3233,7 @@ def _augment_section_candidates_from_table_guards(
                                 text=requirement,
                                 heading_path=chunk.heading_path,
                                 risk_level=risk_level,
-                                is_mandatory=True,
+                                is_mandatory=is_mandatory,
                                 extraction_provider=extraction_provider,
                             ),
                             "source_quote": requirement[:300],
@@ -3718,6 +3765,7 @@ def _augment_section_candidates_from_text_guards(
                 continue
             seen.add(normalized)
             risk_level = _risk_level(item_type, requirement)
+            is_mandatory = _candidate_is_mandatory(item_type, risk_level, requirement)
             augmented.append(
                 ComplianceCandidate(
                     source_chunk_index=chunk.chunk_index,
@@ -3726,7 +3774,7 @@ def _augment_section_candidates_from_text_guards(
                     normalized_requirement=normalized,
                     response_suggestion=_response_suggestion(item_type, requirement),
                     risk_level=risk_level,
-                    is_mandatory=True,
+                    is_mandatory=is_mandatory,
                     confidence_score=Decimal("0.7200"),
                     explanation_json={
                         **_candidate_explanation(
@@ -3734,7 +3782,7 @@ def _augment_section_candidates_from_text_guards(
                             text=requirement,
                             heading_path=chunk.heading_path,
                             risk_level=risk_level,
-                            is_mandatory=True,
+                            is_mandatory=is_mandatory,
                             extraction_provider=extraction_provider,
                         ),
                             "source_quote": source_quote[:300],
@@ -4192,7 +4240,11 @@ def _extract_sectioned_compliance_candidates_fork_join(
     section_by_id = {section.id: section for section in sections}
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="matrix-section") as executor:
         future_by_section = {
+            # Run each section in a *copy* of the current context so structlog's
+            # request_id/task_id correlation propagates into the worker thread
+            # (contextvars are not inherited by ThreadPoolExecutor threads).
             executor.submit(
+                contextvars.copy_context().run,
                 _extract_one_section_for_fork_join,
                 task_id=task.id,
                 semantic_section_id=section.id,
@@ -4492,6 +4544,7 @@ def _source_create_method(explanation_json: dict[str, Any], default: str) -> str
     return provider[:32]
 
 
+@observed_task("matrix_generate")
 def execute_compliance_matrix_generation_task(
     db: Session,
     task_id: uuid.UUID | str,
@@ -4761,6 +4814,7 @@ def execute_compliance_matrix_generation_task(
         return {"status": "failed", "error_code": error_code}
 
 
+@observed_task("section_compliance_extract")
 def execute_section_compliance_extract_task(
     db: Session,
     task_id: uuid.UUID | str,

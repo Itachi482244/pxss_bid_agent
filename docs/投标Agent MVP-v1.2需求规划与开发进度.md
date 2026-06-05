@@ -159,7 +159,7 @@ ContextPack 建议采用版本化 JSON 结构，至少包含以下字段：
 2. `draft_section_context_packs`：已新增，用于章节级上下文裁剪。
 3. `draft_blocks`：已新增，用于段落、表格、清单等结构化 block。
 4. `draft_coverage_reviews`：已新增，用于覆盖检查和生成后收敛。
-5. `draft_generation_tasks`：暂未新增，当前生成仍是同步接口；后续大文档可异步化。
+5. `draft_generation_tasks`：未单独建表，已通过复用 `async_tasks`（新增 `business_draft_generate` 任务类型，迁移 `a3c9e7d2b5f1`）实现异步生成；大文档可走 `generate-async` 异步通道，沿用通用 `/tasks/{id}` 轮询。
 6. `draft_block_links`：暂未单独建表，首版合并在 `draft_blocks.links_json`。
 7. `draft_review_actions`：暂未新增，后续做 block 级审阅动作时补。
 
@@ -171,7 +171,8 @@ ContextPack 建议采用版本化 JSON 结构，至少包含以下字段：
 4. `POST /projects/{project_id}/sections/{section_id}/business-draft/context-pack/{context_pack_id}/generate`
 5. `POST /projects/{project_id}/sections/{section_id}/business-draft/context-pack/{context_pack_id}/coverage-review`
 6. `GET /projects/{project_id}/sections/{section_id}/business-draft/blocks`
-7. 旧章节编辑、事实校验和 Word 导出接口继续保留。
+7. `POST /projects/{project_id}/sections/{section_id}/business-draft/context-pack/{context_pack_id}/generate-async`（异步生成，返回 `AsyncTaskRead`，经 `/tasks/{id}` 轮询）
+8. 旧章节编辑、事实校验和 Word 导出接口继续保留。
 
 ## 10. 验收标准
 

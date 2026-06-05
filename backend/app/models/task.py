@@ -17,7 +17,8 @@ class AsyncTask(Base):
     __table_args__ = (
         CheckConstraint(
             "task_type IN ('file_acquisition', 'document_parse', 'matrix_generate', "
-            "'excel_export', 'document_section_plan', 'section_compliance_extract')",
+            "'excel_export', 'document_section_plan', 'section_compliance_extract', "
+            "'business_draft_generate')",
             name="async_task_type_allowed",
         ),
         CheckConstraint(

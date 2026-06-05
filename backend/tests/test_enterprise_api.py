@@ -347,11 +347,11 @@ def test_compliance_evidence_requirement_can_be_waived() -> None:
             source_chunk_id=chunk.id,
             source_page_no=chunk.page_no,
             item_type="mandatory_response",
-            requirement_text=f"采用资格后审方式 {unique}",
-            normalized_requirement=f"采用资格后审方式 {unique}",
-            response_suggestion="该条为评审方式说明，无需企业资料证据。",
-            evidence_text="招标文件载明采用资格后审方式。",
-            explanation_json={"source_quote": "采用资格后审方式"},
+            requirement_text=f"履约担保：履约担保金额为合同总价的2%。{unique}",
+            normalized_requirement=f"履约担保 {unique}",
+            response_suggestion="该条默认需要补充担保资料或人工豁免说明。",
+            evidence_text="招标文件载明履约担保要求。",
+            explanation_json={"source_quote": "履约担保"},
             status="needs_material",
             risk_level="medium",
             is_mandatory=True,
@@ -374,12 +374,12 @@ def test_compliance_evidence_requirement_can_be_waived() -> None:
             f"/api/v1/projects/{project['id']}/sections/{section['id']}"
             f"/compliance-items/{item_id}/evidence-not-required"
         ),
-        json={"reason": "资格后审方式为评审流程说明，无需绑定企业资料证据"},
+        json={"reason": "该履约担保条款当前仅作为商务承诺响应，暂不绑定企业资料证据"},
     )
     assert waive_response.status_code == 200
     waived_item = waive_response.json()
     assert waived_item["enterprise_evidence_not_required"] is True
-    assert waived_item["enterprise_evidence_not_required_reason"] == "资格后审方式为评审流程说明，无需绑定企业资料证据"
+    assert waived_item["enterprise_evidence_not_required_reason"] == "该履约担保条款当前仅作为商务承诺响应，暂不绑定企业资料证据"
     assert waived_item["status"] == "pending_confirm"
 
     after_preflight = client.get(

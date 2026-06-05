@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     app_name: str = Field(default="pxss-bid-agent", alias="APP_NAME")
     app_env: str = Field(default="local", alias="APP_ENV")
     app_debug: bool = Field(default=True, alias="APP_DEBUG")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     backend_cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",

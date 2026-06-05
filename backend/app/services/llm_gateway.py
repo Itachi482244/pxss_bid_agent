@@ -10,8 +10,11 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.models import AuditLog, ModelInvocationLog
 from app.services.model_config import RuntimeChatModelConfig, resolve_chat_model_config
+
+logger = get_logger("llm")
 
 Complexity = Literal["simple", "complex"]
 ComplexityInput = Literal["simple", "complex", "auto"]
@@ -240,6 +243,15 @@ def chat_completion(
             reason="远程模型未配置，业务逻辑将使用本地兜底。",
         )
         db.flush()
+        logger.warning(
+            "llm.skipped",
+            task_type=task_type,
+            provider=provider,
+            model_name=model_name,
+            complexity=resolved_complexity,
+            error_code=log.error_code,
+            log_id=str(log.id),
+        )
         raise LLMGatewayError(log.error_message, code=log.error_code, log_id=log.id)
 
     payload: dict[str, Any] = {
@@ -291,6 +303,19 @@ def chat_completion(
             reason="远程模型调用成功。",
         )
         db.flush()
+        logger.info(
+            "llm.call",
+            status="succeeded",
+            task_type=task_type,
+            provider=provider,
+            model_name=model_name,
+            complexity=resolved_complexity,
+            duration_ms=duration_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            log_id=str(log.id),
+        )
         return LLMResult(
             content=content,
             provider=provider,
@@ -317,4 +342,16 @@ def chat_completion(
             reason="远程模型调用失败，业务逻辑将使用本地兜底。",
         )
         db.flush()
+        logger.warning(
+            "llm.call",
+            status="failed",
+            task_type=task_type,
+            provider=provider,
+            model_name=model_name,
+            complexity=resolved_complexity,
+            duration_ms=log.duration_ms,
+            error_code=log.error_code,
+            error=log.error_message,
+            log_id=str(log.id),
+        )
         raise LLMGatewayError(log.error_message, code=log.error_code, log_id=log.id) from exc

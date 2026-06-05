@@ -1360,6 +1360,21 @@ export async function generateBusinessDraftFromContextPack(
   return response.data;
 }
 
+export async function generateBusinessDraftFromContextPackAsync(
+  projectId: string,
+  sectionId: string,
+  contextPackId: string,
+  payload: {
+    allow_blocked_internal_draft?: boolean;
+  } = {}
+) {
+  const response = await apiClient.post<AsyncTask>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack/${contextPackId}/generate-async`,
+    payload
+  );
+  return response.data;
+}
+
 export async function runBusinessDraftContextPackCoverageReview(
   projectId: string,
   sectionId: string,

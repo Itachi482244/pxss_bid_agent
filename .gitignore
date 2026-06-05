@@ -31,3 +31,6 @@ data/storage/
 .idea/
 .vscode/
 .gstack/
+
+# Local debug / QA dumps and screenshots
+test-artifacts/

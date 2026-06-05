@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.observability import observed_task
 from app.models import AsyncTask, AuditLog, BidSection, ComplianceItem, Document, ExportFile, Project, User
 from app.services.storage import put_object_bytes
 
@@ -208,6 +209,7 @@ def _add_export_audit(
     )
 
 
+@observed_task("excel_export")
 def execute_compliance_matrix_excel_export_task(
     db: Session,
     task_id: uuid.UUID | str,

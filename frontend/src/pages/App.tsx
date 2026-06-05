@@ -84,7 +84,7 @@ import {
   listDocumentSemanticSections,
   exportBusinessDraftWord,
   exportComplianceMatrixExcel,
-  generateBusinessDraftFromContextPack,
+  generateBusinessDraftFromContextPackAsync,
   generateBusinessDraftChapters,
   generateComplianceMatrix,
   getDocumentExtractionQualityReport,
@@ -301,6 +301,15 @@ function workflowStepForPreflightCheck(item: PreflightCheck["checks"][number]) {
 function preflightActionText(item: PreflightCheck["checks"][number]) {
   if (item.code === "high_risk") return "打开审阅台";
   return item.action_label ?? "去处理";
+}
+
+function workflowStepForContextPackCheck(check: Record<string, unknown>): WorkflowStepKey {
+  const code = String(check.code ?? "");
+  if (code.startsWith("qualification.")) return "qualification";
+  if (code.startsWith("evidence.")) return "evidence";
+  if (code.startsWith("project_fields.")) return "matrix";
+  if (code.startsWith("matrix.")) return "review";
+  return "chapter";
 }
 
 type ReviewChunk = Pick<
@@ -881,6 +890,65 @@ function isMatrixItemResolved(row: MatrixRow) {
   return ["confirmed", "rejected", "superseded"].includes(row.statusCode);
 }
 
+function isHttpNotFoundError(error: unknown) {
+  return error instanceof Error && error.message.includes("404");
+}
+
+function buildMatrixTableRows(
+  rows: MatrixRow[],
+  filters: {
+    status?: string;
+    owner?: string;
+    risk?: string;
+    mandatory?: string;
+    prioritySortEnabled: boolean;
+  }
+) {
+  const filteredRows = rows.filter((row) => {
+    if (filters.status && row.statusCode !== filters.status) return false;
+    if (filters.owner && row.ownerUserId !== filters.owner) return false;
+    if (filters.risk && row.riskCode !== filters.risk) return false;
+    if (filters.mandatory === "mandatory" && !row.mandatory) return false;
+    if (filters.mandatory === "normal" && row.mandatory) return false;
+    return true;
+  });
+  if (!filters.prioritySortEnabled) return filteredRows;
+  return [...filteredRows].sort((left, right) => {
+    if (left.raw.priority_rank !== right.raw.priority_rank) {
+      return left.raw.priority_rank - right.raw.priority_rank;
+    }
+    const riskOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
+  });
+}
+
+function buildMatrixReviewRows(rows: MatrixRow[], filter: MatrixReviewFilter) {
+  const reviewRows = [...rows].sort((left, right) => {
+    const leftChunk = left.raw.source_chunk_index ?? 999999;
+    const rightChunk = right.raw.source_chunk_index ?? 999999;
+    if (leftChunk !== rightChunk) return leftChunk - rightChunk;
+    if (left.raw.priority_rank !== right.raw.priority_rank) return left.raw.priority_rank - right.raw.priority_rank;
+    const riskOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
+  });
+  return reviewRows.filter((row) => {
+    if (filter === "unconfirmed") return !isMatrixItemResolved(row);
+    if (filter === "high") return row.riskCode === "high";
+    if (filter === "mandatory") return row.mandatory;
+    if (filter === "missing_evidence") {
+      return !row.enterpriseEvidenceNotRequired && (row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material");
+    }
+    return true;
+  });
+}
+
+function findNextUnresolvedMatrixRow(queue: MatrixRow[], currentKey: string) {
+  const currentIndex = queue.findIndex((row) => row.key === currentKey);
+  const orderedRows =
+    currentIndex >= 0 ? [...queue.slice(currentIndex + 1), ...queue.slice(0, currentIndex)] : queue;
+  return orderedRows.find((row) => row.key !== currentKey && !isMatrixItemResolved(row)) ?? null;
+}
+
 function mapMatrixRow(item: ComplianceItem): MatrixRow {
   const sourceDocument = item.source_document_title ?? "招标文件";
   const page = item.source_page_no ? ` P${item.source_page_no}` : "";
@@ -1040,6 +1108,7 @@ export function App() {
   const reviewItemPaneRef = useRef<HTMLDivElement | null>(null);
   const locateReviewTimerRef = useRef<number | null>(null);
   const terminalTaskRefreshKeysRef = useRef<Set<string>>(new Set());
+  const businessDraftTerminalTaskRef = useRef<Set<string>>(new Set());
   const [materialSearchQuery, setMaterialSearchQuery] = useState("");
   const [materialSearchResults, setMaterialSearchResults] = useState<EnterpriseMaterialSearchResult[]>([]);
   const [loadingMaterialSearch, setLoadingMaterialSearch] = useState(false);
@@ -1109,6 +1178,8 @@ export function App() {
   const [loadingMatrix, setLoadingMatrix] = useState(false);
   const [savingMatrixAction, setSavingMatrixAction] = useState(false);
   const [loadingBusinessDraft, setLoadingBusinessDraft] = useState(false);
+  const [businessDraftGenerationTaskId, setBusinessDraftGenerationTaskId] = useState<string | null>(null);
+  const [businessDraftGenerationTask, setBusinessDraftGenerationTask] = useState<AsyncTask | null>(null);
   const [loadingContextPack, setLoadingContextPack] = useState(false);
   const [savingBusinessDraft, setSavingBusinessDraft] = useState(false);
   const [exportingWord, setExportingWord] = useState(false);
@@ -1688,47 +1759,20 @@ export function App() {
     return "合规矩阵";
   }, [activeTab]);
 
-  const filteredMatrixRows = useMemo(() => {
-    return matrixRows.filter((row) => {
-      if (statusFilter && row.statusCode !== statusFilter) return false;
-      if (ownerFilter && row.ownerUserId !== ownerFilter) return false;
-      if (riskFilter && row.riskCode !== riskFilter) return false;
-      if (mandatoryFilter === "mandatory" && !row.mandatory) return false;
-      if (mandatoryFilter === "normal" && row.mandatory) return false;
-      return true;
-    });
-  }, [mandatoryFilter, matrixRows, ownerFilter, riskFilter, statusFilter]);
   const displayedMatrixRows = useMemo(() => {
-    if (!prioritySortEnabled) return filteredMatrixRows;
-    return [...filteredMatrixRows].sort((left, right) => {
-      if (left.raw.priority_rank !== right.raw.priority_rank) {
-        return left.raw.priority_rank - right.raw.priority_rank;
-      }
-      const riskOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
-      return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
+    return buildMatrixTableRows(matrixRows, {
+      status: statusFilter,
+      owner: ownerFilter,
+      risk: riskFilter,
+      mandatory: mandatoryFilter,
+      prioritySortEnabled
     });
-  }, [filteredMatrixRows, prioritySortEnabled]);
+  }, [mandatoryFilter, matrixRows, ownerFilter, prioritySortEnabled, riskFilter, statusFilter]);
   const allMatrixReviewRows = useMemo(() => {
-    return [...matrixRows]
-      .sort((left, right) => {
-        const leftChunk = left.raw.source_chunk_index ?? 999999;
-        const rightChunk = right.raw.source_chunk_index ?? 999999;
-        if (leftChunk !== rightChunk) return leftChunk - rightChunk;
-        if (left.raw.priority_rank !== right.raw.priority_rank) return left.raw.priority_rank - right.raw.priority_rank;
-        const riskOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
-        return (riskOrder[left.riskCode] ?? 3) - (riskOrder[right.riskCode] ?? 3);
-      });
+    return buildMatrixReviewRows(matrixRows, "all");
   }, [matrixRows]);
   const matrixReviewRows = useMemo(() => {
-    return allMatrixReviewRows.filter((row) => {
-      if (matrixReviewFilter === "unconfirmed") return !isMatrixItemResolved(row);
-      if (matrixReviewFilter === "high") return row.riskCode === "high";
-      if (matrixReviewFilter === "mandatory") return row.mandatory;
-      if (matrixReviewFilter === "missing_evidence") {
-        return !row.enterpriseEvidenceNotRequired && (row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material");
-      }
-      return true;
-    });
+    return buildMatrixReviewRows(allMatrixReviewRows, matrixReviewFilter);
   }, [allMatrixReviewRows, matrixReviewFilter]);
   const pagedMatrixReviewRows = useMemo(() => {
     const start = (reviewQueuePage - 1) * reviewQueuePageSize;
@@ -1880,6 +1924,18 @@ export function App() {
       (row) => !row.enterpriseEvidenceNotRequired && (row.enterpriseEvidenceCount === 0 || row.statusCode === "needs_material")
     );
   }, [matrixRows]);
+  const blockingQualificationEvaluations = useMemo(
+    () => qualificationEvaluations.filter((item) => item.is_blocking),
+    [qualificationEvaluations]
+  );
+  const missingQualificationEvaluations = useMemo(
+    () => blockingQualificationEvaluations.filter((item) => item.evaluation_status === "needs_material"),
+    [blockingQualificationEvaluations]
+  );
+  const notSatisfiedQualificationEvaluations = useMemo(
+    () => blockingQualificationEvaluations.filter((item) => item.evaluation_status === "not_satisfied"),
+    [blockingQualificationEvaluations]
+  );
 
   const unresolvedMatrixRows = useMemo(
     () => matrixRows.filter((row) => !isMatrixItemResolved(row)),
@@ -1924,6 +1980,19 @@ export function App() {
             };
   const canConfirmContextPack = Boolean(selectedProjectId && selectedSectionId && qualificationDecisionConfirmed);
   const canGenerateContextPackDraft = Boolean(activeContextPack && qualificationDecisionConfirmed);
+  const businessDraftGenerationActive = isAsyncTaskActive(
+    businessDraftGenerationTask,
+    businessDraftGenerationTaskId
+  );
+  const businessDraftGenerationProgress = asyncTaskProgress(
+    businessDraftGenerationTask,
+    businessDraftGenerationTaskId
+  );
+  const businessDraftGenerationStatusText = asyncTaskStatusText(
+    businessDraftGenerationTask,
+    businessDraftGenerationTaskId
+  );
+  const blockingContextPackChecks = contextPackChecks.filter((check) => String(check.status ?? "warn") !== "pass");
   const rawParseTaskActive = isAsyncTaskActive(importProcessing?.parseTask ?? null, importProcessing?.parseTaskId ?? null);
   const rawMatrixTaskActive = isAsyncTaskActive(importProcessing?.matrixTask ?? null, importProcessing?.matrixTaskId ?? null);
   const importProcessingVisible = Boolean(
@@ -2543,12 +2612,13 @@ export function App() {
   }, []);
 
   const reloadMatrix = useCallback(async () => {
-    if (!selectedProjectId || !selectedSectionId) return;
+    if (!selectedProjectId || !selectedSectionId) return [];
     setLoadingMatrix(true);
     try {
       const data = await listComplianceItems(selectedProjectId, selectedSectionId, { limit: COMPLIANCE_ITEM_FETCH_LIMIT });
       setComplianceItems(data);
       setSelectedRowKeys([]);
+      return data;
     } finally {
       setLoadingMatrix(false);
     }
@@ -2563,6 +2633,7 @@ export function App() {
     setComplianceItems(review.items);
     setReviewUncoveredChunks(review.uncovered_chunks);
     setReviewDuplicateGroups(review.duplicate_groups);
+    return review;
   }, [activeTab, selectedProjectId, selectedSectionId]);
 
   const reloadAuditLogs = useCallback(async () => {
@@ -2635,10 +2706,8 @@ export function App() {
     setPreflightCheck(data);
   }, [selectedProjectId, selectedSectionId]);
 
-  const refreshAfterMatrixMutation = useCallback(async () => {
+  const refreshMatrixRelatedPanels = useCallback(async () => {
     await Promise.all([
-      reloadMatrix(),
-      reloadMatrixReview(),
       reloadAuditLogs(),
       reloadWorkspaceSummary(),
       reloadDocumentsAndExports(),
@@ -2655,12 +2724,24 @@ export function App() {
     reloadBusinessDraftChapters,
     reloadBusinessDraftContext,
     reloadDocumentsAndExports,
-    reloadMatrix,
-    reloadMatrixReview,
     reloadPreflightCheck,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
     reloadWorkspaceSummary
+  ]);
+
+  const refreshAfterMatrixMutation = useCallback(async () => {
+    const [matrixItems, review] = await Promise.all([reloadMatrix(), reloadMatrixReview()]);
+    void refreshMatrixRelatedPanels().catch((error) => {
+      if (isHttpNotFoundError(error)) return;
+      appendLog(error instanceof Error ? "后台刷新工作台摘要失败，矩阵结果已保存" : "后台刷新工作台摘要失败");
+    });
+    return review?.items ?? matrixItems ?? [];
+  }, [
+    appendLog,
+    reloadMatrix,
+    reloadMatrixReview,
+    refreshMatrixRelatedPanels
   ]);
 
   useEffect(() => {
@@ -2807,6 +2888,80 @@ export function App() {
     reloadWorkspaceSummary
   ]);
 
+  useEffect(() => {
+    if (!businessDraftGenerationTaskId) return;
+    let active = true;
+    let clearTimer: number | null = null;
+
+    const pollBusinessDraftTask = async () => {
+      const task = await getTask(businessDraftGenerationTaskId);
+      if (!active) return;
+      setBusinessDraftGenerationTask(task);
+
+      if (!isAsyncTaskTerminalStatus(task.status)) return;
+      const terminalKey = `${task.id}:${task.status}`;
+      if (businessDraftTerminalTaskRef.current.has(terminalKey)) return;
+      businessDraftTerminalTaskRef.current.add(terminalKey);
+      setLoadingBusinessDraft(false);
+
+      if (task.status === "succeeded") {
+        await Promise.all([
+          reloadBusinessDraftChapters(),
+          reloadBusinessDraftContext(),
+          reloadPreflightCheck(),
+          reloadApprovalTasks(),
+          reloadAuditLogs()
+        ]);
+        setViewMode("workspace");
+        setActiveTab("chapter");
+        setWorkspaceNode("chapter");
+        appendLog(
+          `商务草稿生成完成：${summaryNumber(task.output_json, "chapter_count")} 章，${summaryNumber(task.output_json, "block_count")} 个 block`
+        );
+        Modal.success({
+          title: "草稿已生成",
+          content: "已刷新商务标章节和结构化 block，请继续审阅待补证据和待补事实。",
+          okText: "知道了"
+        });
+      } else {
+        const message = task.error_message || "商务草稿生成任务失败";
+        setApiError(message);
+        appendLog(`商务草稿生成失败：${truncateText(message, 48)}`);
+      }
+
+      clearTimer = window.setTimeout(() => {
+        if (!active) return;
+        setBusinessDraftGenerationTaskId(null);
+        setBusinessDraftGenerationTask(null);
+      }, 8000);
+    };
+
+    void pollBusinessDraftTask().catch((error: unknown) => {
+      setLoadingBusinessDraft(false);
+      setApiError(error instanceof Error ? error.message : "商务草稿任务状态刷新失败");
+    });
+    const intervalId = window.setInterval(() => {
+      void pollBusinessDraftTask().catch((error: unknown) => {
+        setLoadingBusinessDraft(false);
+        setApiError(error instanceof Error ? error.message : "商务草稿任务状态刷新失败");
+      });
+    }, 1500);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+      if (clearTimer) window.clearTimeout(clearTimer);
+    };
+  }, [
+    appendLog,
+    businessDraftGenerationTaskId,
+    reloadApprovalTasks,
+    reloadAuditLogs,
+    reloadBusinessDraftChapters,
+    reloadBusinessDraftContext,
+    reloadPreflightCheck
+  ]);
+
   const runMaterialSearch = useCallback(async (query: string) => {
     setMaterialSearchQuery(query);
     setLoadingMaterialSearch(true);
@@ -2937,7 +3092,15 @@ export function App() {
               setEvidenceBindings([]);
               setMaterialSearchResults([]);
             }
-            await refreshAfterMatrixMutation();
+            if (activeTab === "review") {
+              await reloadMatrixReview();
+            } else {
+              await reloadMatrix();
+            }
+            void refreshMatrixRelatedPanels().catch((error) => {
+              if (isHttpNotFoundError(error)) return;
+              appendLog(error instanceof Error ? "后台刷新工作台摘要失败，证据豁免结果已保存" : "后台刷新工作台摘要失败");
+            });
           } catch (error) {
             setApiError(error instanceof Error ? error.message : "标记无需绑定证据失败");
             throw error;
@@ -2949,8 +3112,11 @@ export function App() {
     },
     [
       appendLog,
+      activeTab,
       evidenceDrawer?.key,
-      refreshAfterMatrixMutation,
+      refreshMatrixRelatedPanels,
+      reloadMatrix,
+      reloadMatrixReview,
       selectedProjectId,
       selectedSectionId,
       waiveComplianceEvidenceRequirement
@@ -3529,27 +3695,22 @@ export function App() {
         setLoadingBusinessDraft(true);
         setApiError("");
         try {
-          const result = await generateBusinessDraftFromContextPack(
+          const task = await generateBusinessDraftFromContextPackAsync(
             selectedProjectId,
             selectedSectionId,
             activeContextPack.id,
             { allow_blocked_internal_draft: isBlocked }
           );
-          setBusinessDraftContextPacks([result.context_pack]);
-          setBusinessDraftChapters(result.chapters);
-          setDraftBlocks(result.blocks);
-          setCoverageReview(result.coverage_review);
-          setSelectedDraftChapterId(result.chapters[0]?.id ?? "");
+          setBusinessDraftGenerationTaskId(task.id);
+          setBusinessDraftGenerationTask(task);
           setViewMode("workspace");
           setActiveTab("chapter");
           setWorkspaceNode("chapter");
-          appendLog(`ContextPack 生成草稿：${result.chapters.length} 章，${result.blocks.length} 个 block`);
-          await Promise.all([reloadApprovalTasks(), reloadAuditLogs(), reloadPreflightCheck()]);
+          appendLog(`商务草稿生成任务已启动：${task.id.slice(0, 8)}`);
         } catch (error) {
           setApiError(error instanceof Error ? error.message : "ContextPack 草稿生成失败");
-          throw error;
-        } finally {
           setLoadingBusinessDraft(false);
+          throw error;
         }
       }
     });
@@ -4284,17 +4445,47 @@ export function App() {
     confirmDraftGeneration();
   };
 
+  const buildCurrentConfirmationQueue = (rows: MatrixRow[]) => {
+    if (activeTab === "review") {
+      return buildMatrixReviewRows(rows, matrixReviewFilter);
+    }
+    return buildMatrixTableRows(rows, {
+      status: statusFilter,
+      owner: ownerFilter,
+      risk: riskFilter,
+      mandatory: mandatoryFilter,
+      prioritySortEnabled
+    });
+  };
+
+  const focusAutoConfirmationRow = (nextRow: MatrixRow) => {
+    if (activeTab === "review") {
+      focusReviewRow(nextRow);
+      return;
+    }
+    setHighlightedRowKey(nextRow.key);
+    window.setTimeout(() => {
+      document.querySelector(`[data-row-key="${nextRow.key}"]`)?.scrollIntoView({
+        block: "center",
+        behavior: "smooth"
+      });
+    }, 80);
+    window.setTimeout(() => setHighlightedRowKey(""), 2800);
+  };
+
   const handleConfirmItem = (row: MatrixRow) => {
     let reason = "人工逐条确认合规矩阵项";
     let sourceVerified = false;
     const needsSourceVerified = row.riskCode === "high" || row.mandatory || row.raw.item_type === "qualification";
-    Modal.confirm({
+    let confirmModal: ReturnType<typeof Modal.confirm>;
+    confirmModal = Modal.confirm({
       title: "确认合规矩阵项",
       content: (
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
           <Text>{truncateText(row.requirement, 52)}</Text>
           <Text type="secondary">
             确认后会记录确认人、确认时间和审计日志；若该条已进入人工确认关联组，将同步确认同组条目。
+            确认成功后会自动进入当前队列的下一条未确认项，取消可停止连续审阅。
           </Text>
           {needsSourceVerified && (
             <Checkbox onChange={(event) => { sourceVerified = event.target.checked; }}>
@@ -4341,18 +4532,37 @@ export function App() {
         });
         appendLog(`确认矩阵项：${truncateText(row.requirement, 18)}`);
         if (confirmed.cascade_affected_count > 0) {
-          Modal.success({
-            title: "已同步确认关联条目",
-            content: `已同步确认全文其他 ${confirmed.cascade_affected_count} 处相同要求。`
-          });
+          appendLog(`同步确认关联条目 ${confirmed.cascade_affected_count} 项`);
         }
-        await refreshAfterMatrixMutation();
-        if (unresolvedMatrixRows.length === 1 && !isMatrixItemResolved(row)) {
+        const review = activeTab === "review" ? await reloadMatrixReview() : undefined;
+        const refreshedItems = review?.items ?? await reloadMatrix();
+        void refreshMatrixRelatedPanels().catch((error) => {
+          appendLog(error instanceof Error ? "后台刷新工作台摘要失败，矩阵确认结果已保存" : "后台刷新工作台摘要失败");
+        });
+        const refreshedRows = refreshedItems.map(mapMatrixRow);
+        const nextRow = findNextUnresolvedMatrixRow(buildCurrentConfirmationQueue(refreshedRows), row.key);
+        confirmModal.destroy();
+        if (nextRow) {
+          focusAutoConfirmationRow(nextRow);
+          appendLog(`进入下一条待确认项：${truncateText(nextRow.requirement, 18)}`);
+          window.setTimeout(() => handleConfirmItem(nextRow), 180);
+          return;
+        }
+        if (refreshedRows.length > 0 && refreshedRows.every(isMatrixItemResolved)) {
           Modal.success({
             title: "合规矩阵已完成",
             content: "所有矩阵项已经完成确认。下一步建议处理证据绑定，再运行资格预评估。"
           });
+          return;
         }
+        if (confirmed.cascade_affected_count > 0) {
+          Modal.success({
+            title: "已同步确认关联条目",
+            content: `已同步确认全文其他 ${confirmed.cascade_affected_count} 处相同要求。当前队列暂无下一条待确认项。`
+          });
+          return;
+        }
+        appendLog("当前队列暂无下一条待确认矩阵项");
       }
     });
   };
@@ -6800,7 +7010,7 @@ export function App() {
                               满足 {qualificationEvaluations.filter((item) => item.evaluation_status === "satisfied").length}
                             </Tag>
                             <Tag color="red">
-                              阻断 {qualificationEvaluations.filter((item) => item.is_blocking).length}
+                              阻断 {blockingQualificationEvaluations.length}
                             </Tag>
                             <Tag color="gold">
                               待确认 {qualificationEvaluations.filter((item) => item.evaluation_status === "pending_confirm").length}
@@ -6867,6 +7077,40 @@ export function App() {
                             />
                           )}
                         </div>
+                        {blockingQualificationEvaluations.length > 0 && (
+                          <Alert
+                            className="qualification-blocker-alert"
+                            type="error"
+                            showIcon
+                            message={`当前存在 ${blockingQualificationEvaluations.length} 个资格阻断项`}
+                            description={
+                              <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                                <Text>
+                                  {missingQualificationEvaluations.length
+                                    ? `先处理 ${missingQualificationEvaluations.length} 项缺资料/未匹配企业资料；`
+                                    : ""}
+                                  {notSatisfiedQualificationEvaluations.length
+                                    ? `再复核 ${notSatisfiedQualificationEvaluations.length} 项不满足规则；`
+                                    : ""}
+                                  处理后重新运行资格预评估，并重新生成/确认参标建议。
+                                </Text>
+                                <Space wrap>
+                                  {missingQualificationEvaluations.length > 0 && (
+                                    <Button size="small" type="primary" onClick={() => activateWorkflowStep("evidence")}>
+                                      去补资料
+                                    </Button>
+                                  )}
+                                  <Button size="small" onClick={() => activateWorkflowStep("review")}>
+                                    回到矩阵审阅
+                                  </Button>
+                                  <Button size="small" loading={evaluatingQualification} onClick={handleRunQualificationEvaluation}>
+                                    重新评估
+                                  </Button>
+                                </Space>
+                              </Space>
+                            }
+                          />
+                        )}
                         <div className="qualification-next-step">
                           {!qualificationEvaluations.length ? (
                             <>
@@ -7917,6 +8161,38 @@ export function App() {
                               ) : (
                                 <Text type="secondary">生成前会固定项目字段、矩阵项、证据、缺项和章节范围。</Text>
                               )}
+                              {blockingContextPackChecks.length > 0 && (
+                                <div className="context-pack-blockers">
+                                  {blockingContextPackChecks.slice(0, 4).map((check, index) => {
+                                    const target = workflowStepForContextPackCheck(check);
+                                    return (
+                                      <div className="context-pack-blocker" key={`${String(check.code ?? index)}-blocker`}>
+                                        <Tag color={preflightColor(String(check.status ?? "warn"))}>
+                                          {String(check.summary ?? check.code ?? "待处理")}
+                                        </Tag>
+                                        <Text type="secondary">{String(check.action ?? "按提示处理后重新确认 ContextPack。")}</Text>
+                                        <Button size="small" onClick={() => activateWorkflowStep(target)}>
+                                          去处理
+                                        </Button>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                              {businessDraftGenerationTaskId && (
+                                <div className="context-pack-task-progress">
+                                  <Space wrap>
+                                    <Text strong>草稿生成任务</Text>
+                                    <Tag color={businessDraftGenerationActive ? "blue" : businessDraftGenerationTask?.status === "succeeded" ? "green" : "red"}>
+                                      {businessDraftGenerationStatusText}
+                                    </Tag>
+                                    {businessDraftGenerationTask?.error_message && (
+                                      <Text type="danger">{businessDraftGenerationTask.error_message}</Text>
+                                    )}
+                                  </Space>
+                                  <Progress percent={businessDraftGenerationProgress} size="small" />
+                                </div>
+                              )}
                             </div>
                             <Space wrap>
                               <Button loading={loadingContextPack} onClick={handlePreviewContextPack}>
@@ -7946,8 +8222,8 @@ export function App() {
                                   <Button
                                     type="primary"
                                     icon={<RobotOutlined />}
-                                    loading={loadingBusinessDraft}
-                                    disabled={!canGenerateContextPackDraft}
+                                    loading={loadingBusinessDraft || businessDraftGenerationActive}
+                                    disabled={!canGenerateContextPackDraft || businessDraftGenerationActive}
                                     onClick={confirmContextPackDraftGeneration}
                                   >
                                     {activeContextPack?.readiness_status === "block" || qualificationDecisionIsNoGo
@@ -7970,14 +8246,21 @@ export function App() {
                               <Button
                                 type="primary"
                                 icon={<RobotOutlined />}
-                                loading={loadingBusinessDraft}
+                                loading={loadingBusinessDraft || businessDraftGenerationActive}
+                                disabled={businessDraftGenerationActive}
                                 onClick={() =>
-                                  qualificationDecisionConfirmed && qualificationDecisionIsNoGo && !businessDraftChapters.length
+                                  activeContextPack
+                                    ? confirmContextPackDraftGeneration()
+                                    : qualificationDecisionConfirmed && qualificationDecisionIsNoGo && !businessDraftChapters.length
                                     ? confirmNoGoRiskAcceptance(confirmDraftGeneration)
                                     : confirmDraftGeneration()
                                 }
                               >
-                                {qualificationDecisionConfirmed && qualificationDecisionIsNoGo && !businessDraftChapters.length
+                                {activeContextPack
+                                  ? activeContextPack.readiness_status === "block" || qualificationDecisionIsNoGo
+                                    ? "生成内部草稿"
+                                    : "按 ContextPack 生成"
+                                  : qualificationDecisionConfirmed && qualificationDecisionIsNoGo && !businessDraftChapters.length
                                   ? "风险接受后生成草稿"
                                   : "生成商务标草稿"}
                               </Button>

@@ -5,6 +5,7 @@ from celery import Celery
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.services.compliance_generation import execute_compliance_matrix_generation_task
+from app.services.context_pack import execute_business_draft_generation_task
 from app.services.document_parse import execute_document_parse_task
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import execute_file_acquisition_task
@@ -50,6 +51,12 @@ def run_compliance_matrix_generation_task(task_id: str) -> dict[str, str | int]:
 def run_compliance_matrix_excel_export_task(task_id: str) -> dict[str, str | int]:
     with SessionLocal() as db:
         return execute_compliance_matrix_excel_export_task(db, task_id)
+
+
+@celery_app.task(name="tasks.business_draft_generate")
+def run_business_draft_generation_task(task_id: str) -> dict[str, str | int]:
+    with SessionLocal() as db:
+        return execute_business_draft_generation_task(db, task_id)
 
 
 @celery_app.task(name="tasks.import_processing")
