@@ -1871,9 +1871,11 @@ def test_compliance_matrix_generation_creates_items_from_word_chunks(monkeypatch
         assert task.output_json["section_count"] >= 1
 
         sections = db.scalars(
-            select(DocumentSemanticSection).where(
+            select(DocumentSemanticSection)
+            .where(
                 DocumentSemanticSection.document_version_id == UUID(document["current_version_id"])
             )
+            .order_by(DocumentSemanticSection.section_index)
         ).all()
         assert len(sections) == task.output_json["section_count"]
         assert sections[0].start_page == 1

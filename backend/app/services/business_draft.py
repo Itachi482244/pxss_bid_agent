@@ -21,6 +21,7 @@ from app.models import (
     BusinessDraftEvidenceRef,
     ComplianceEvidenceBinding,
     ComplianceItem,
+    DraftContextPack,
     DraftFactCheck,
     ExportFile,
     Project,
@@ -147,12 +148,30 @@ def _json_from_model_text(content: str) -> dict[str, Any]:
     return json.loads(content)
 
 
+def _directive_prompt_block(directives: list[dict[str, Any]] | None) -> str:
+    """Render author directives for the LLM prompt with a hard fact boundary.
+
+    Style / emphasis steer wording and focus; mandatory_text must appear
+    verbatim. None of them may introduce facts that lack evidence — the boundary
+    statement makes that explicit and the downstream fact-check enforces it.
+    """
+    if not directives:
+        return ""
+    label = {"style": "风格", "emphasis": "内容侧重", "mandatory_text": "强制措辞（须原样保留）"}
+    lines = ["人工生成指令（仅影响表达与侧重，禁止据此新增任何无证据事实）："]
+    for directive in directives:
+        directive_type = directive.get("directive_type")
+        lines.append(f"- [{label.get(directive_type, directive_type)}] {directive.get('text')}")
+    return "\n".join(lines)
+
+
 def _chapter_prompt(
     *,
     project: Project,
     title: str,
     template_content: str,
     refs: list[dict[str, Any]],
+    directives: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     evidence_payload = [
         {
@@ -162,6 +181,8 @@ def _chapter_prompt(
         }
         for ref in refs[:80]
     ]
+    directive_block = _directive_prompt_block(directives)
+    directive_section = f"\n\n{directive_block}" if directive_block else ""
     return [
         {
             "role": "system",
@@ -169,6 +190,7 @@ def _chapter_prompt(
                 "你是商务标书草稿助手。只输出 JSON，不要输出解释。"
                 "你只能基于输入的合规矩阵草稿和证据改写商务标章节，禁止编造项目名称、证书编号、人员、金额、日期。"
                 "无法从证据确认的事实必须写成 [请人工确认]。"
+                "人工生成指令只能调整表达、侧重或保留指定措辞，不得作为新增事实的依据。"
             ),
         },
         {
@@ -179,7 +201,7 @@ def _chapter_prompt(
                 "请将下面的模板草稿整理为可人工复核的商务标章节正文，保留逐项响应关系，"
                 "语言可以更正式，但不得新增没有证据的事实。\n\n"
                 "输出 JSON 格式：{\"content_text\":\"章节正文\"}\n\n"
-                f"模板草稿：\n{template_content}\n\n"
+                f"模板草稿：\n{template_content}{directive_section}\n\n"
                 f"证据：\n{json.dumps(evidence_payload, ensure_ascii=False)}"
             ),
         },
@@ -197,12 +219,14 @@ def _generate_chapter_content_with_llm(
     template_content: str,
     refs: list[dict[str, Any]],
     item_count: int,
+    directives: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str, uuid.UUID | None]:
     messages = _chapter_prompt(
         project=project,
         title=title,
         template_content=template_content,
         refs=refs,
+        directives=directives,
     )
     try:
         result = chat_completion(
@@ -458,6 +482,25 @@ def generate_business_draft_chapters(
     for chapter in existing:
         chapter.status = "superseded"
 
+    latest_pack = db.scalar(
+        select(DraftContextPack)
+        .where(
+            DraftContextPack.tenant_id == tenant_id,
+            DraftContextPack.project_id == project_id,
+            DraftContextPack.section_id == section_id,
+            DraftContextPack.status != "superseded",
+        )
+        .order_by(DraftContextPack.created_at.desc())
+    )
+    pack_directives = [
+        directive
+        for directive in ((latest_pack.context_json if latest_pack else {}) or {}).get(
+            "author_directives"
+        )
+        or []
+        if directive.get("scope") == "pack"
+    ]
+
     chapters: list[BusinessDraftChapter] = []
     for sort_order, (chapter_type, title, group_items) in enumerate(_chapter_groups(items), start=1):
         template_content, refs = _build_chapter_content(
@@ -475,6 +518,7 @@ def generate_business_draft_chapters(
             template_content=template_content,
             refs=refs,
             item_count=len(group_items),
+            directives=pack_directives,
         )
         chapter = BusinessDraftChapter(
             tenant_id=tenant_id,

@@ -23,9 +23,12 @@ from sqlalchemy import select
 from app.db.session import SessionLocal
 from app.main import app
 from app.models import (
+    AuditLog,
     BusinessDraftChapter,
     ComplianceItem,
+    DraftBlock,
     DraftContextPack,
+    DraftFactCheck,
     QualificationDecision,
     Tenant,
     User,
@@ -364,3 +367,399 @@ def test_performance_fact_candidates_detect_amount_and_contract() -> None:
     facts = _performance_fact_candidates(text)
     assert ("amount", "325.5万元") in facts
     assert ("other", "某老旧小区改造工程") in facts
+
+
+# --- #2(扩展) 章节级目录编辑：增/删/改名/重排 ---
+
+
+def _outline_sections(client: TestClient, project_id: str, section_id: str, outline=None):
+    payload: dict = {"profile_id": "engineering_construction_business_v1"}
+    if outline is not None:
+        payload["outline"] = outline
+    resp = client.post(f"{_base(project_id, section_id)}/context-pack/preview", json=payload)
+    assert resp.status_code == 200, resp.text
+    return resp.json()["outline_plan_json"]["sections"]
+
+
+def test_outline_override_reorders_renames_and_adds_custom_chapter() -> None:
+    client = TestClient(app)
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+
+    # 重排（反转）+ 改名第一章 + 末尾新增自定义章节。
+    reordered = list(reversed(SECTION_TYPES))
+    outline = [{"section_type": st} for st in reordered]
+    outline[0]["title"] = "重命名后的开标函"
+    outline.append({"section_type": "custom_extra", "title": "我方补充说明", "custom": True})
+
+    sections = _outline_sections(client, project_id, section_id, outline)
+
+    assert [s["section_type"] for s in sections] == reordered + ["custom_extra"]
+    assert sections[0]["title"] == "重命名后的开标函"
+
+    custom = sections[-1]
+    assert custom["custom"] is True
+    assert custom["title"] == "我方补充说明"
+    assert custom["generation_mode"] == "manual_placeholder"
+
+
+def test_outline_removal_shrinks_sections() -> None:
+    client = TestClient(app)
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+
+    full = _outline_sections(client, project_id, section_id)
+    full_types = [s["section_type"] for s in full]
+    assert len(full_types) >= 2
+
+    kept = [{"section_type": full_types[0]}]
+    trimmed = _outline_sections(client, project_id, section_id, kept)
+    assert [s["section_type"] for s in trimmed] == [full_types[0]]
+
+
+def test_create_with_edited_outline_generates_custom_placeholder_block() -> None:
+    client = TestClient(app)
+    project_id, section_id = _add_mingzhu_project_with_items()
+    with SessionLocal() as db:
+        tenant = db.scalar(select(Tenant).where(Tenant.code == DEMO_TENANT_CODE))
+        user = db.scalar(select(User).where(User.external_id == DEMO_USER_EXTERNAL_ID))
+        assert tenant is not None and user is not None
+        seed_mingzhu_mock_enterprise_data(db, tenant, user)
+        items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.project_id == UUID(project_id),
+                ComplianceItem.section_id == UUID(section_id),
+            )
+        ).all()
+        for item in items:
+            item.status = "confirmed"
+        db.commit()
+
+    decision = client.post(
+        f"{API}/projects/{project_id}/sections/{section_id}/qualification-decision/generate"
+    ).json()
+    with SessionLocal() as db:
+        row = db.get(QualificationDecision, UUID(decision["id"]))
+        assert row is not None
+        row.recommendation = "go"
+        db.commit()
+    client.post(
+        f"{API}/projects/{project_id}/sections/{section_id}/"
+        f"qualification-decision/{decision['id']}/confirm",
+        json={"reason": "目录编辑测试：确认参标建议"},
+    )
+
+    outline = [
+        {"section_type": "bid_letter"},
+        {"section_type": "custom_extra", "title": "我方补充说明", "custom": True},
+    ]
+    cp = client.post(
+        f"{_base(project_id, section_id)}/context-pack",
+        json={"profile_id": "engineering_construction_business_v1", "outline": outline},
+    )
+    assert cp.status_code == 200, cp.text
+    context_pack = cp.json()
+    pack_types = {p["section_type"] for p in context_pack["section_context_packs"]}
+    assert pack_types == {"bid_letter", "custom_extra"}
+
+    result = client.post(
+        f"{_base(project_id, section_id)}/context-pack/{context_pack['id']}/generate",
+        json={"allow_blocked_internal_draft": False},
+    )
+    assert result.status_code == 200, result.text
+    blocks = result.json()["blocks"]
+    custom_blocks = [
+        b
+        for b in blocks
+        if b["links_json"].get("section_type") == "custom_extra"
+    ]
+    assert custom_blocks, "自定义章节应至少生成一个占位块"
+    placeholder = next((b for b in custom_blocks if b["block_type"] == "placeholder"), None)
+    assert placeholder is not None
+    assert "人工新增" in placeholder["content_text"]
+    assert placeholder["review_status"] == "needs_fact"
+
+
+def test_outline_duplicate_section_type_rejected() -> None:
+    client = TestClient(app)
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+    resp = client.post(
+        f"{_base(project_id, section_id)}/context-pack/preview",
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "outline": [
+                {"section_type": "bid_letter"},
+                {"section_type": "bid_letter"},
+            ],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_outline_custom_without_title_rejected() -> None:
+    client = TestClient(app)
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+    resp = client.post(
+        f"{_base(project_id, section_id)}/context-pack/preview",
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "outline": [{"section_type": "custom_only", "custom": True}],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_outline_unknown_section_type_rejected() -> None:
+    client = TestClient(app)
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+    resp = client.post(
+        f"{_base(project_id, section_id)}/context-pack/preview",
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "outline": [{"section_type": "does_not_exist_section"}],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+
+
+# --- 指令层（author directives）：风格/侧重/强制措辞 ---
+
+
+def _create_pack_with_directives(client: TestClient, directives: list[dict]):
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+    cp = client.post(
+        f"{_base(project_id, section_id)}/context-pack",
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "section_types": SECTION_TYPES,
+            "directives": directives,
+        },
+    )
+    assert cp.status_code == 200, cp.text
+    return project_id, section_id, cp.json()
+
+
+def test_directives_attach_to_pack_and_section_context() -> None:
+    client = TestClient(app)
+    project_id, section_id, pack = _create_pack_with_directives(
+        client,
+        [
+            {"scope": "pack", "directive_type": "style", "text": "语气更正式、简洁。"},
+            {
+                "scope": "bid_letter",
+                "directive_type": "emphasis",
+                "text": "突出我方对工期的承诺。",
+            },
+        ],
+    )
+
+    pack_directives = pack["context_json"]["author_directives"]
+    assert len(pack_directives) == 2
+    assert {d["directive_type"] for d in pack_directives} == {"style", "emphasis"}
+    assert all(d.get("id") and d.get("author_user_id") for d in pack_directives)
+
+    # Pack-scoped directive reaches every section; section-scoped only its section.
+    bid_letter = next(
+        p for p in pack["section_context_packs"] if p["section_type"] == "bid_letter"
+    )
+    other = next(
+        p for p in pack["section_context_packs"] if p["section_type"] != "bid_letter"
+    )
+    bid_letter_types = {
+        d["directive_type"] for d in bid_letter["context_json"]["author_directives"]
+    }
+    other_types = {
+        d["directive_type"] for d in other["context_json"]["author_directives"]
+    }
+    assert bid_letter_types == {"style", "emphasis"}
+    assert other_types == {"style"}
+
+
+def test_mandatory_text_directive_becomes_needs_confirm_block() -> None:
+    client = TestClient(app)
+    project_id, section_id, pack = _create_pack_with_directives(
+        client,
+        [
+            {
+                "scope": "bid_letter",
+                "directive_type": "mandatory_text",
+                "text": "我方郑重承诺严格遵守招标文件全部商务条款。",
+            }
+        ],
+    )
+
+    result = client.post(
+        f"{_base(project_id, section_id)}/context-pack/{pack['id']}/generate",
+        json={"allow_blocked_internal_draft": False},
+    )
+    assert result.status_code == 200, result.text
+    body = result.json()
+    mandatory = [
+        b
+        for b in body["blocks"]
+        if (b["links_json"] or {}).get("source") == "author_mandatory_text"
+    ]
+    assert len(mandatory) == 1, "强制措辞应生成一个独立块"
+    block = mandatory[0]
+    assert block["review_status"] == "needs_confirm"
+    assert "我方郑重承诺" in block["content_text"]
+
+    coverage = body["coverage_review"]
+    assert coverage["summary_json"]["mandatory_text_pending_count"] == 1
+    assert any(
+        issue["code"] == "coverage.mandatory_text_needs_confirm"
+        for issue in coverage["issues_json"]
+    )
+
+
+def test_mandatory_text_smuggled_hard_fact_is_flagged_by_fact_check() -> None:
+    client = TestClient(app)
+    project_id, section_id, pack = _create_pack_with_directives(
+        client,
+        [
+            {
+                "scope": "bid_letter",
+                "directive_type": "mandatory_text",
+                "text": "我方持有证书编号ZZ20260101FAKE9，符合全部资格要求。",
+            }
+        ],
+    )
+    result = client.post(
+        f"{_base(project_id, section_id)}/context-pack/{pack['id']}/generate",
+        json={"allow_blocked_internal_draft": False},
+    )
+    assert result.status_code == 200, result.text
+
+    with SessionLocal() as db:
+        unverified = db.scalars(
+            select(DraftFactCheck).where(
+                DraftFactCheck.project_id == UUID(project_id),
+                DraftFactCheck.section_id == UUID(section_id),
+                DraftFactCheck.fact_text == "ZZ20260101FAKE9",
+            )
+        ).all()
+    assert unverified, "强制措辞中夹带的硬事实必须进入事实核查"
+    assert all(check.check_status == "unverified" for check in unverified)
+    assert all(check.risk_level == "high" for check in unverified)
+
+
+def test_export_gated_until_mandatory_text_block_confirmed() -> None:
+    client = TestClient(app)
+    project_id, section_id, pack = _create_pack_with_directives(
+        client,
+        [
+            {
+                "scope": "bid_letter",
+                "directive_type": "mandatory_text",
+                "text": "我方承诺按招标文件要求提供售后服务。",
+            }
+        ],
+    )
+    client.post(
+        f"{_base(project_id, section_id)}/context-pack/{pack['id']}/generate",
+        json={"allow_blocked_internal_draft": False},
+    )
+
+    preflight = client.get(
+        f"{API}/projects/{project_id}/sections/{section_id}/preflight-check"
+    ).json()
+    block_review = next(
+        c for c in preflight["checks"] if c["code"] == "draft_block_review"
+    )
+    assert block_review["status"] != "pass", "存在待确认强制措辞时不应放行导出"
+
+    # Confirming (approving) the mandatory-text block is accepted by the API.
+    blocks = client.get(f"{_base(project_id, section_id)}/blocks").json()
+    mandatory = next(
+        b for b in blocks if (b["links_json"] or {}).get("source") == "author_mandatory_text"
+    )
+    confirmed = client.patch(
+        f"{_base(project_id, section_id)}/blocks/{mandatory['id']}",
+        json={"review_status": "approved", "reason": "人工确认强制措辞"},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["review_status"] == "approved"
+
+
+def test_lightweight_rebuild_reuses_fact_snapshot_and_supersedes() -> None:
+    client = TestClient(app)
+    project_id, section_id, pack = _create_pack_with_directives(
+        client,
+        [{"scope": "pack", "directive_type": "style", "text": "语气正式。"}],
+    )
+    original_matrix = pack["context_json"]["matrix_items"]
+
+    rebuilt = client.put(
+        f"{_base(project_id, section_id)}/context-pack/{pack['id']}/directives",
+        json={
+            "directives": [
+                {"scope": "pack", "directive_type": "emphasis", "text": "突出本地化服务。"},
+                {
+                    "scope": "bid_letter",
+                    "directive_type": "mandatory_text",
+                    "text": "我方承诺响应全部商务条款。",
+                },
+            ]
+        },
+    )
+    assert rebuilt.status_code == 200, rebuilt.text
+    new_pack = rebuilt.json()
+
+    assert new_pack["id"] != pack["id"]
+    assert new_pack["status"] == "confirmed"
+    # Fact snapshot is reused verbatim (no upstream re-query).
+    assert new_pack["context_json"]["matrix_items"] == original_matrix
+    new_types = {d["directive_type"] for d in new_pack["context_json"]["author_directives"]}
+    assert new_types == {"emphasis", "mandatory_text"}
+
+    with SessionLocal() as db:
+        prior = db.get(DraftContextPack, UUID(pack["id"]))
+        assert prior is not None and prior.status == "superseded"
+        audit = db.scalars(
+            select(AuditLog).where(
+                AuditLog.project_id == UUID(project_id),
+                AuditLog.action == "business_draft.context_pack_directives_updated",
+            )
+        ).all()
+        assert audit, "轻量重建必须写审计日志"
+        assert audit[-1].after_json.get("lightweight_rebuild") is True
+
+    # Only the new pack survives the active listing.
+    listed = client.get(f"{_base(project_id, section_id)}/context-pack").json()
+    active_ids = {p["id"] for p in listed}
+    assert new_pack["id"] in active_ids
+    assert pack["id"] not in active_ids
+
+
+def test_directive_unknown_scope_rejected() -> None:
+    client = TestClient(app)
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+    resp = client.post(
+        f"{_base(project_id, section_id)}/context-pack",
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "section_types": SECTION_TYPES,
+            "directives": [
+                {
+                    "scope": "no_such_section",
+                    "directive_type": "style",
+                    "text": "语气正式。",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+
+
+def test_directive_invalid_type_rejected() -> None:
+    client = TestClient(app)
+    project_id, section_id, _ = _prepare_confirmed_context_pack(client)
+    resp = client.post(
+        f"{_base(project_id, section_id)}/context-pack",
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "section_types": SECTION_TYPES,
+            "directives": [
+                {"scope": "pack", "directive_type": "rewrite_facts", "text": "改写事实。"}
+            ],
+        },
+    )
+    assert resp.status_code == 422, resp.text

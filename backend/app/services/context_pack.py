@@ -551,43 +551,170 @@ def _items_for_section(section_def: dict[str, Any], items: list[ComplianceItem])
     return [item for item in items if _section_matches_item(section_def, item)]
 
 
+def _outline_section_from_def(
+    section_def: dict[str, Any],
+    matched_items: list[ComplianceItem],
+    *,
+    title: str | None = None,
+    order_index: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "section_type": section_def["section_type"],
+        "title": title or section_def["title"],
+        "volume_id": section_def.get("volume_id"),
+        "volume_title": section_def.get("volume_title"),
+        "required": bool(section_def.get("required")),
+        "generation_mode": section_def.get("generation_mode"),
+        "order_index": section_def.get("order_index") if order_index is None else order_index,
+        "required_fields": list(section_def.get("required_fields") or []),
+        "covers_item_types": list(section_def.get("covers_item_types") or []),
+        "compliance_item_ids": [str(item.id) for item in matched_items],
+        "evidence_required": any(_requires_enterprise_evidence(item) for item in matched_items),
+        "output_format": "structured_blocks",
+        "review_policy": "manual_required",
+        "custom": False,
+    }
+
+
+def _custom_outline_section(*, section_type: str, title: str, order_index: int) -> dict[str, Any]:
+    return {
+        "section_type": section_type,
+        "title": title,
+        "volume_id": None,
+        "volume_title": None,
+        "required": False,
+        "generation_mode": "manual_placeholder",
+        "order_index": order_index,
+        "required_fields": [],
+        "covers_item_types": [],
+        "compliance_item_ids": [],
+        "evidence_required": False,
+        "output_format": "structured_blocks",
+        "review_policy": "manual_required",
+        "custom": True,
+    }
+
+
 def _build_outline_plan(
     *,
     profile: dict[str, Any],
     items: list[ComplianceItem],
     section_types: list[str] | None,
+    outline: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    section_defs = {
+        section_def["section_type"]: section_def for section_def in iter_profile_sections(profile)
+    }
+
+    if outline:
+        sections: list[dict[str, Any]] = []
+        for order, chapter in enumerate(outline, start=1):
+            section_type = str(chapter.get("section_type") or "").strip()
+            if not section_type:
+                raise BusinessDraftError("章节类型不能为空")
+            title = (chapter.get("title") or "").strip() or None
+            if chapter.get("custom"):
+                if not title:
+                    raise BusinessDraftError(f"自定义章节需提供标题：{section_type}")
+                sections.append(
+                    _custom_outline_section(
+                        section_type=section_type, title=title, order_index=order * 10
+                    )
+                )
+                continue
+            section_def = section_defs.get(section_type)
+            if section_def is None:
+                raise BusinessDraftError(f"未知章节类型：{section_type}")
+            matched_items = _items_for_section(section_def, items)
+            sections.append(
+                _outline_section_from_def(
+                    section_def, matched_items, title=title, order_index=order * 10
+                )
+            )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "source": "template_profile + compliance_matrix + manual_outline",
+            "sections": sections,
+        }
+
     requested = set(section_types or [])
-    sections: list[dict[str, Any]] = []
-    for section_def in iter_profile_sections(profile):
+    sections = []
+    for section_def in section_defs.values():
         matched_items = _items_for_section(section_def, items)
         include = bool(section_def.get("required")) or bool(matched_items)
         if requested:
             include = section_def["section_type"] in requested
         if not include:
             continue
-        sections.append(
-            {
-                "section_type": section_def["section_type"],
-                "title": section_def["title"],
-                "volume_id": section_def.get("volume_id"),
-                "volume_title": section_def.get("volume_title"),
-                "required": bool(section_def.get("required")),
-                "generation_mode": section_def.get("generation_mode"),
-                "order_index": section_def.get("order_index"),
-                "required_fields": list(section_def.get("required_fields") or []),
-                "covers_item_types": list(section_def.get("covers_item_types") or []),
-                "compliance_item_ids": [str(item.id) for item in matched_items],
-                "evidence_required": any(_requires_enterprise_evidence(item) for item in matched_items),
-                "output_format": "structured_blocks",
-                "review_policy": "manual_required",
-            }
-        )
+        sections.append(_outline_section_from_def(section_def, matched_items))
     return {
         "schema_version": SCHEMA_VERSION,
         "source": "template_profile + compliance_matrix",
         "sections": sections,
     }
+
+
+DIRECTIVE_TYPES = {"style", "emphasis", "mandatory_text"}
+AUTHOR_MANDATORY_TEXT_SOURCE = "author_mandatory_text"
+
+
+def _normalize_directives(
+    directives: list[dict[str, Any]] | None,
+    *,
+    valid_section_types: set[str],
+    actor_user_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Validate + stamp author directives before they enter a pack snapshot.
+
+    ``scope`` must be ``"pack"`` or one of the pack's section types; type must be
+    one of :data:`DIRECTIVE_TYPES`. Each directive gets a stable id plus author /
+    timestamp provenance so instruction edits stay auditable.
+    """
+    if not directives:
+        return []
+    normalized: list[dict[str, Any]] = []
+    stamped_at = datetime.now(UTC).isoformat()
+    for raw in directives:
+        scope = str(raw.get("scope") or "pack").strip() or "pack"
+        directive_type = str(raw.get("directive_type") or "").strip()
+        text = str(raw.get("text") or "").strip()
+        if directive_type not in DIRECTIVE_TYPES:
+            raise BusinessDraftError(f"未知指令类型：{directive_type or '(空)'}")
+        if not text:
+            raise BusinessDraftError("指令内容不能为空")
+        if scope != "pack" and scope not in valid_section_types:
+            raise BusinessDraftError(f"指令作用域不在当前目录章节内：{scope}")
+        normalized.append(
+            {
+                "id": str(raw.get("id") or uuid.uuid4()),
+                "scope": scope,
+                "directive_type": directive_type,
+                "text": text,
+                "author_user_id": str(actor_user_id),
+                "created_at": str(raw.get("created_at") or stamped_at),
+            }
+        )
+    return normalized
+
+
+def _section_directives(
+    directives: list[dict[str, Any]] | None, section_type: str
+) -> list[dict[str, Any]]:
+    """Directives that apply to a section: pack-scoped + same section_type."""
+    return [
+        directive
+        for directive in directives or []
+        if directive.get("scope") in ("pack", section_type)
+    ]
+
+
+def _directive_counts(directives: list[dict[str, Any]] | None) -> dict[str, int]:
+    counts = {directive_type: 0 for directive_type in DIRECTIVE_TYPES}
+    for directive in directives or []:
+        directive_type = directive.get("directive_type")
+        if directive_type in counts:
+            counts[directive_type] += 1
+    return counts
 
 
 def build_context_pack_preview(
@@ -598,6 +725,9 @@ def build_context_pack_preview(
     section_id: uuid.UUID,
     profile_id: str | None = None,
     section_types: list[str] | None = None,
+    outline: list[dict[str, Any]] | None = None,
+    directives: list[dict[str, Any]] | None = None,
+    actor_user_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     project = db.get(Project, project_id)
     section = db.get(BidSection, section_id)
@@ -637,7 +767,17 @@ def build_context_pack_preview(
         source_document=source_document,
         qualification_decision=qualification_decision,
     )
-    outline_plan = _build_outline_plan(profile=profile, items=items, section_types=section_types)
+    outline_plan = _build_outline_plan(
+        profile=profile, items=items, section_types=section_types, outline=outline
+    )
+    valid_section_types = {
+        section["section_type"] for section in outline_plan.get("sections") or []
+    }
+    author_directives = _normalize_directives(
+        directives,
+        valid_section_types=valid_section_types,
+        actor_user_id=actor_user_id or uuid.UUID(int=0),
+    )
     matrix_items = [_item_snapshot(item, bindings_by_item) for item in items]
     context_json = {
         "schema_version": SCHEMA_VERSION,
@@ -657,6 +797,7 @@ def build_context_pack_preview(
             "generation_mode": profile["generation_mode"],
         },
         "matrix_summary": _matrix_summary(items, bindings_by_item),
+        "author_directives": author_directives,
         "matrix_items": matrix_items,
         "bound_evidence": _deduplicated_binding_snapshots(bindings_by_item),
         "manual_notes": [
@@ -773,6 +914,9 @@ def _section_context_from_outline(
         },
         "project_facts": project_facts,
         "qualification_decision": global_context.get("qualification_decision"),
+        "author_directives": _section_directives(
+            global_context.get("author_directives"), outline_section["section_type"]
+        ),
         "matrix_items": matrix_items,
         "bound_evidence": bound_evidence,
         "manual_notes": [
@@ -799,6 +943,8 @@ def create_context_pack(
     actor_user_id: uuid.UUID,
     profile_id: str | None = None,
     section_types: list[str] | None = None,
+    outline: list[dict[str, Any]] | None = None,
+    directives: list[dict[str, Any]] | None = None,
 ) -> DraftContextPack:
     preview = build_context_pack_preview(
         db,
@@ -807,6 +953,9 @@ def create_context_pack(
         section_id=section_id,
         profile_id=profile_id,
         section_types=section_types,
+        outline=outline,
+        directives=directives,
+        actor_user_id=actor_user_id,
     )
     _assert_context_pack_can_be_confirmed(preview)
     existing = db.scalars(
@@ -874,9 +1023,142 @@ def create_context_pack(
                 "readiness_status": context_pack.readiness_status,
                 "profile_id": context_pack.profile_id,
                 "section_count": len(preview["outline_plan_json"]["sections"]),
+                "outline_edited": bool(outline),
+                "custom_section_count": sum(
+                    1
+                    for section in preview["outline_plan_json"]["sections"]
+                    if section.get("custom")
+                ),
+                "directive_count": len(preview["context_json"].get("author_directives") or []),
+                "directive_counts": _directive_counts(
+                    preview["context_json"].get("author_directives")
+                ),
             },
             reason="构建商务/资格草稿生成 ContextPack",
             severity="warning" if context_pack.readiness_status == "block" else "info",
+        )
+    )
+    return context_pack
+
+
+def update_context_pack_directives(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    context_pack_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    directives: list[dict[str, Any]] | None,
+) -> DraftContextPack:
+    """Replace a confirmed pack's instruction layer via a lightweight rebuild.
+
+    The prior fact snapshot (matrix / evidence / facts / readiness / outline) is
+    reused *verbatim* — no upstream re-query — so editing directives can never
+    silently pull in new facts. The prior pack and its section packs are
+    superseded and a fresh immutable version is produced carrying only the new
+    directives, keeping "one generation = one fully reproducible frozen pack".
+    """
+    prior = db.get(DraftContextPack, context_pack_id)
+    if (
+        prior is None
+        or prior.tenant_id != tenant_id
+        or prior.project_id != project_id
+        or prior.section_id != section_id
+    ):
+        raise BusinessDraftError("ContextPack 不属于当前项目标段")
+    if prior.status == "superseded":
+        raise BusinessDraftError("该 ContextPack 已失效，请基于最新版本编辑指令")
+
+    valid_section_types = {
+        section["section_type"]
+        for section in (prior.outline_plan_json or {}).get("sections") or []
+    }
+    normalized = _normalize_directives(
+        directives,
+        valid_section_types=valid_section_types,
+        actor_user_id=actor_user_id,
+    )
+
+    prior_section_packs = db.scalars(
+        select(DraftSectionContextPack)
+        .where(
+            DraftSectionContextPack.tenant_id == tenant_id,
+            DraftSectionContextPack.context_pack_id == prior.id,
+            DraftSectionContextPack.status != "superseded",
+        )
+        .order_by(DraftSectionContextPack.sort_order.asc())
+    ).all()
+
+    new_context_json = dict(prior.context_json or {})
+    new_context_json["author_directives"] = normalized
+
+    prior_section_status = {pack.id: pack.status for pack in prior_section_packs}
+    prior.status = "superseded"
+    for section_pack in prior_section_packs:
+        section_pack.status = "superseded"
+
+    context_pack = DraftContextPack(
+        tenant_id=tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        profile_id=prior.profile_id,
+        profile_version=prior.profile_version,
+        schema_version=prior.schema_version,
+        status="confirmed",
+        readiness_status=prior.readiness_status,
+        context_json=_jsonable(new_context_json),
+        readiness_json=prior.readiness_json,
+        outline_plan_json=prior.outline_plan_json,
+        created_by=actor_user_id,
+        confirmed_by=actor_user_id,
+        confirmed_at=datetime.now(UTC),
+    )
+    db.add(context_pack)
+    db.flush()
+
+    for section_pack in prior_section_packs:
+        section_context = dict(section_pack.context_json or {})
+        section_context["author_directives"] = _section_directives(
+            normalized, section_pack.section_type
+        )
+        db.add(
+            DraftSectionContextPack(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                section_id=section_id,
+                context_pack_id=context_pack.id,
+                section_type=section_pack.section_type,
+                title=section_pack.title,
+                sort_order=section_pack.sort_order,
+                generation_mode=section_pack.generation_mode,
+                status=prior_section_status.get(section_pack.id, "ready"),
+                context_json=_jsonable(section_context),
+                created_by=actor_user_id,
+            )
+        )
+    db.add(
+        AuditLog(
+            tenant_id=tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=actor_user_id,
+            actor_type="user",
+            action="business_draft.context_pack_directives_updated",
+            object_type="draft_context_pack",
+            object_id=context_pack.id,
+            before_json={
+                "context_pack_id": str(prior.id),
+                "directive_count": len((prior.context_json or {}).get("author_directives") or []),
+            },
+            after_json={
+                "context_pack_id": str(context_pack.id),
+                "directive_count": len(normalized),
+                "directive_counts": _directive_counts(normalized),
+                "lightweight_rebuild": True,
+            },
+            reason="编辑 ContextPack 指令层（轻量重建，复用事实快照）",
+            severity="info",
         )
     )
     return context_pack
@@ -930,6 +1212,10 @@ def _build_section_draft_content(section_pack: DraftSectionContextPack) -> tuple
         lines.append("本章节应绑定外部报价或附件文件，系统不自动编造清单、报价和附件内容。")
         lines.append("[请人工绑定或确认外部附件]")
         lines.append("")
+    elif section.get("generation_mode") == "manual_placeholder":
+        lines.append("本章为人工新增章节，系统不自动生成正文。")
+        lines.append("[请人工撰写本章内容]")
+        lines.append("")
     else:
         facts = context_json.get("project_facts") or {}
         project_name = facts.get("project_name") or "[请人工补充：project_name]"
@@ -972,6 +1258,17 @@ def _build_section_draft_content(section_pack: DraftSectionContextPack) -> tuple
                     "quote_text": evidence_ref.get("evidence_text"),
                 }
             )
+        lines.append("")
+
+    mandatory = [
+        directive
+        for directive in context_json.get("author_directives") or []
+        if directive.get("directive_type") == "mandatory_text"
+    ]
+    if mandatory:
+        lines.append("人工强制措辞（待人工确认，仍需通过事实核查）：")
+        for directive in mandatory:
+            lines.append(str(directive.get("text") or ""))
         lines.append("")
     return "\n".join(lines).strip(), refs
 
@@ -1092,6 +1389,16 @@ def _add_draft_blocks(
             risk_flags_json=[],
             review_status="needs_evidence",
         )
+    elif generation_mode == "manual_placeholder":
+        add_block(
+            block_type="placeholder",
+            content_text="[请人工撰写本章内容] 本章为人工新增章节，系统不自动生成正文。",
+            links_json=_section_level_links(section_pack),
+            fact_claims_json=[],
+            missing_fact_placeholders_json=[],
+            risk_flags_json=[],
+            review_status="needs_fact",
+        )
 
     for item in matrix_items:
         item_id = item.get("compliance_item_id")
@@ -1144,6 +1451,32 @@ def _add_draft_blocks(
             missing_fact_placeholders_json=item_missing,
             risk_flags_json=risk_flags,
             review_status=review_status,
+        )
+
+    # Author "forced phrasing" (强制措辞) becomes a dedicated, verbatim block that
+    # is explicitly marked author-sourced, defaults to needs_confirm so the final
+    # preflight forces a per-block human confirmation, and is still fact-checked
+    # via the recomposed chapter text (smuggled hard facts cannot backlink).
+    for directive in context_json.get("author_directives") or []:
+        if directive.get("directive_type") != "mandatory_text":
+            continue
+        mandatory_links = _section_level_links(section_pack)
+        mandatory_links["source"] = AUTHOR_MANDATORY_TEXT_SOURCE
+        mandatory_links["directive_id"] = directive.get("id")
+        add_block(
+            block_type="paragraph",
+            content_text=str(directive.get("text") or ""),
+            links_json=mandatory_links,
+            fact_claims_json=[],
+            missing_fact_placeholders_json=[],
+            risk_flags_json=[
+                {
+                    "code": "author_mandatory_text",
+                    "summary": "人工强制措辞，需逐条人工确认并通过事实核查后方可导出。",
+                    "directive_id": directive.get("id"),
+                }
+            ],
+            review_status="needs_confirm",
         )
 
     return blocks
@@ -1399,6 +1732,21 @@ def create_coverage_review(
                 "block_ids": [str(block.id) for block in needs_fact[:20]],
             }
         )
+    mandatory_text_pending = [
+        block
+        for block in blocks
+        if (block.links_json or {}).get("source") == AUTHOR_MANDATORY_TEXT_SOURCE
+        and block.review_status != "approved"
+    ]
+    if mandatory_text_pending:
+        issues.append(
+            {
+                "code": "coverage.mandatory_text_needs_confirm",
+                "severity": "warn",
+                "summary": f"含 {len(mandatory_text_pending)} 处人工强制措辞，需逐条人工确认后方可导出。",
+                "block_ids": [str(block.id) for block in mandatory_text_pending[:20]],
+            }
+        )
     if context_pack.readiness_status == "block":
         issues.append(
             {
@@ -1454,6 +1802,7 @@ def create_coverage_review(
             "evidence_reference_rate": evidence_reference_rate,
             "needs_evidence_count": len(needs_evidence),
             "needs_fact_count": len(needs_fact),
+            "mandatory_text_pending_count": len(mandatory_text_pending),
             "missing_coverage_count": len(missing_coverage),
             "issue_count": len(issues),
             "quality_score": quality_score,

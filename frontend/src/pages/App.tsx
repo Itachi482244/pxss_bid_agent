@@ -71,6 +71,8 @@ import {
   confirmProjectImportDraft,
   createApprovalTask,
   createBusinessDraftContextPack,
+  updateBusinessDraftContextPackDirectives,
+  type AuthorDirectiveInput,
   createComplianceItemFromSource,
   createParseTask,
   createProjectImportDraftFromFile,
@@ -173,9 +175,15 @@ import type {
   ReviewDocumentRun,
   MatrixReviewUncoveredChunk,
   TextDiffSegment,
-  AsyncTask
+  AsyncTask,
+  OutlineChapterInput
 } from "../api/bid";
 import { ContextPackPreviewDrawer } from "../components/ContextPackPreviewDrawer";
+import { OutlineEditorModal, type OutlineSeedChapter } from "../components/OutlineEditorModal";
+import {
+  DirectiveEditorModal,
+  type DirectiveScopeOption
+} from "../components/DirectiveEditorModal";
 import "./app.css";
 
 const { Header, Content } = Layout;
@@ -621,6 +629,7 @@ const draftBlockStatusLabels: Record<string, string> = {
   covered: "已覆盖",
   needs_evidence: "缺证据",
   needs_fact: "待补事实",
+  needs_confirm: "待确认强制措辞",
   approved: "已通过",
   rejected: "已退回"
 };
@@ -630,6 +639,7 @@ const draftBlockStatusColors: Record<string, string> = {
   covered: "blue",
   needs_evidence: "red",
   needs_fact: "orange",
+  needs_confirm: "purple",
   approved: "green",
   rejected: "red"
 };
@@ -1211,6 +1221,11 @@ export function App() {
   const [businessDraftContextPacks, setBusinessDraftContextPacks] = useState<BusinessDraftContextPack[]>([]);
   const [contextPackPreview, setContextPackPreview] = useState<BusinessDraftContextPackPreview | null>(null);
   const [contextPackPreviewOpen, setContextPackPreviewOpen] = useState(false);
+  const [outlineEditorOpen, setOutlineEditorOpen] = useState(false);
+  const [outlineSeed, setOutlineSeed] = useState<OutlineSeedChapter[]>([]);
+  const [editedOutline, setEditedOutline] = useState<OutlineChapterInput[] | null>(null);
+  const [directiveEditorOpen, setDirectiveEditorOpen] = useState(false);
+  const [editedDirectives, setEditedDirectives] = useState<AuthorDirectiveInput[] | null>(null);
   const [draftBlocks, setDraftBlocks] = useState<DraftBlock[]>([]);
   const [activeDraftBlockId, setActiveDraftBlockId] = useState("");
   const [coverageReview, setCoverageReview] = useState<DraftCoverageReview | null>(null);
@@ -1421,6 +1436,8 @@ export function App() {
 	    setDraftBlocks([]);
 	    setContextPackPreview(null);
 	    setContextPackPreviewOpen(false);
+	    setEditedOutline(null);
+	    setOutlineEditorOpen(false);
 	    setApprovalTasks([]);
 	    setDocuments([]);
 	    setExportFiles([]);
@@ -3873,17 +3890,156 @@ export function App() {
     setApiError("");
     try {
       const preview = await previewBusinessDraftContextPack(selectedProjectId, selectedSectionId, {
-        profile_id: "engineering_construction_business_v1"
+        profile_id: "engineering_construction_business_v1",
+        outline: editedOutline ?? undefined,
+        directives: editedDirectives ?? undefined
       });
       const outline = preview.outline_plan_json as { sections?: unknown[] };
       setContextPackPreview(preview);
       setContextPackPreviewOpen(true);
-      appendLog(`预览 ContextPack：${outline.sections?.length ?? 0} 个章节计划`);
+      appendLog(
+        `预览 ContextPack：${outline.sections?.length ?? 0} 个章节计划${editedOutline ? "（已编辑目录）" : ""}${editedDirectives && editedDirectives.length ? `（${editedDirectives.length} 条指令）` : ""}`
+      );
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "ContextPack 预览失败");
     } finally {
       setLoadingContextPack(false);
     }
+  };
+
+  const outlineSectionsFromPreview = (
+    preview: BusinessDraftContextPackPreview
+  ): OutlineSeedChapter[] => {
+    const outline = preview.outline_plan_json as { sections?: Record<string, unknown>[] };
+    return (outline.sections ?? []).map((section) => ({
+      section_type: String(section.section_type ?? ""),
+      title: String(section.title ?? section.section_type ?? ""),
+      custom: Boolean(section.custom)
+    }));
+  };
+
+  const handleOpenOutlineEditor = async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    setLoadingContextPack(true);
+    setApiError("");
+    try {
+      const preview = await previewBusinessDraftContextPack(selectedProjectId, selectedSectionId, {
+        profile_id: "engineering_construction_business_v1",
+        outline: editedOutline ?? undefined,
+        directives: editedDirectives ?? undefined
+      });
+      setContextPackPreview(preview);
+      setOutlineSeed(outlineSectionsFromPreview(preview));
+      setOutlineEditorOpen(true);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "加载章节目录失败");
+    } finally {
+      setLoadingContextPack(false);
+    }
+  };
+
+  const handleApplyOutline = async (outline: OutlineChapterInput[]) => {
+    setEditedOutline(outline);
+    setOutlineEditorOpen(false);
+    if (!selectedProjectId || !selectedSectionId) return;
+    setLoadingContextPack(true);
+    setApiError("");
+    try {
+      const preview = await previewBusinessDraftContextPack(selectedProjectId, selectedSectionId, {
+        profile_id: "engineering_construction_business_v1",
+        outline,
+        directives: editedDirectives ?? undefined
+      });
+      setContextPackPreview(preview);
+      setContextPackPreviewOpen(true);
+      appendLog(`已应用编辑后的目录：${outline.length} 个章节`);
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "应用目录失败");
+    } finally {
+      setLoadingContextPack(false);
+    }
+  };
+
+  const handleResetOutline = () => {
+    setEditedOutline(null);
+    appendLog("已重置章节目录为模板默认");
+  };
+
+  const directiveScopeOptions = useMemo<DirectiveScopeOption[]>(() => {
+    const sections =
+      activeContextPack?.section_context_packs.map((pack) => ({
+        section_type: pack.section_type,
+        title: pack.title
+      })) ??
+      ((contextPackPreview?.outline_plan_json as { sections?: Record<string, unknown>[] })?.sections ?? []).map(
+        (section) => ({
+          section_type: String(section.section_type ?? ""),
+          title: String(section.title ?? section.section_type ?? "")
+        })
+      );
+    const seen = new Set<string>();
+    const options: DirectiveScopeOption[] = [];
+    for (const section of sections) {
+      if (!section.section_type || seen.has(section.section_type)) continue;
+      seen.add(section.section_type);
+      options.push({ value: section.section_type, label: `${section.title}（${section.section_type}）` });
+    }
+    return options;
+  }, [activeContextPack, contextPackPreview]);
+
+  const directiveSeed = useMemo<AuthorDirectiveInput[]>(() => {
+    if (editedDirectives) return editedDirectives;
+    const fromPack = (activeContextPack?.context_json?.author_directives as
+      | Array<{ scope?: unknown; directive_type?: unknown; text?: unknown }>
+      | undefined) ?? [];
+    return fromPack.map((directive) => ({
+      scope: String(directive.scope ?? "pack"),
+      directive_type: (directive.directive_type as AuthorDirectiveInput["directive_type"]) ?? "style",
+      text: String(directive.text ?? "")
+    }));
+  }, [editedDirectives, activeContextPack]);
+
+  const activePackDirectiveCount = useMemo(() => {
+    const fromPack = activeContextPack?.context_json?.author_directives;
+    return Array.isArray(fromPack) ? fromPack.length : 0;
+  }, [activeContextPack]);
+
+  const handleApplyDirectives = async (directives: AuthorDirectiveInput[]) => {
+    setDirectiveEditorOpen(false);
+    if (!selectedProjectId || !selectedSectionId) return;
+    // When a pack is already confirmed, editing directives triggers a lightweight rebuild.
+    if (activeContextPack) {
+      setLoadingContextPack(true);
+      setApiError("");
+      try {
+        const rebuilt = await updateBusinessDraftContextPackDirectives(
+          selectedProjectId,
+          selectedSectionId,
+          activeContextPack.id,
+          directives
+        );
+        setBusinessDraftContextPacks([rebuilt]);
+        setEditedDirectives(null);
+        setCoverageReview(null);
+        appendLog(
+          `指令已更新（轻量重建）：${directives.length} 条，复用事实快照，请重新生成草稿以应用新指令`
+        );
+        await reloadAuditLogs();
+      } catch (error) {
+        setApiError(error instanceof Error ? error.message : "指令更新失败");
+      } finally {
+        setLoadingContextPack(false);
+      }
+      return;
+    }
+    // No confirmed pack yet: stage directives for the next preview/confirm.
+    setEditedDirectives(directives.length ? directives : null);
+    appendLog(`已暂存生成指令：${directives.length} 条，将随预览/确认 ContextPack 应用`);
+  };
+
+  const handleResetDirectives = () => {
+    setEditedDirectives(null);
+    appendLog("已清空暂存的生成指令");
   };
 
   const handleCreateContextPack = async () => {
@@ -3901,11 +4057,15 @@ export function App() {
     setApiError("");
     try {
       const contextPack = await createBusinessDraftContextPack(selectedProjectId, selectedSectionId, {
-        profile_id: "engineering_construction_business_v1"
+        profile_id: "engineering_construction_business_v1",
+        outline: editedOutline ?? undefined,
+        directives: editedDirectives ?? undefined
       });
       setBusinessDraftContextPacks([contextPack]);
       setContextPackPreview(null);
       setContextPackPreviewOpen(false);
+      setEditedOutline(null);
+      setEditedDirectives(null);
       setCoverageReview(null);
       appendLog(`确认 ContextPack：${contextPack.section_context_packs.length} 个章节上下文`);
       await reloadAuditLogs();
@@ -8509,6 +8669,36 @@ export function App() {
                               <Button loading={loadingContextPack} onClick={handlePreviewContextPack}>
                                 预览
                               </Button>
+                              <Button loading={loadingContextPack} onClick={handleOpenOutlineEditor}>
+                                编辑目录
+                              </Button>
+                              {editedOutline && (
+                                <Tag color="purple" closable onClose={handleResetOutline}>
+                                  目录已编辑 {editedOutline.length} 章
+                                </Tag>
+                              )}
+                              <Tooltip
+                                title={
+                                  activeContextPack
+                                    ? "编辑生成指令将触发轻量重建（复用事实快照）"
+                                    : "生成指令只影响表达与侧重，随预览/确认 ContextPack 应用"
+                                }
+                              >
+                                <Button
+                                  loading={loadingContextPack}
+                                  onClick={() => setDirectiveEditorOpen(true)}
+                                >
+                                  编辑生成指令
+                                </Button>
+                              </Tooltip>
+                              {editedDirectives && editedDirectives.length > 0 && (
+                                <Tag color="geekblue" closable onClose={handleResetDirectives}>
+                                  指令已暂存 {editedDirectives.length} 条
+                                </Tag>
+                              )}
+                              {!editedDirectives && activePackDirectiveCount > 0 && (
+                                <Tag color="geekblue">指令 {activePackDirectiveCount} 条</Tag>
+                              )}
                               <Tooltip title={canConfirmContextPack ? "" : contextPackConfirmDisabledReason}>
                                 <span>
                                   <Button
@@ -9558,6 +9748,22 @@ export function App() {
         onClose={() => setContextPackPreviewOpen(false)}
         onAction={handleContextPackCheckAction}
         actionLabel={contextPackCheckActionText}
+      />
+      <OutlineEditorModal
+        open={outlineEditorOpen}
+        loading={loadingContextPack}
+        seed={outlineSeed}
+        onCancel={() => setOutlineEditorOpen(false)}
+        onApply={handleApplyOutline}
+      />
+      <DirectiveEditorModal
+        open={directiveEditorOpen}
+        loading={loadingContextPack}
+        seed={directiveSeed}
+        scopeOptions={directiveScopeOptions}
+        rebuildMode={Boolean(activeContextPack)}
+        onCancel={() => setDirectiveEditorOpen(false)}
+        onApply={handleApplyDirectives}
       />
       <Drawer
         title="查看/修正解析分块"

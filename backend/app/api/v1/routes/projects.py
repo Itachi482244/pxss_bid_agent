@@ -57,6 +57,7 @@ from app.schemas.project import (
     BusinessDraftContextPackPreviewRead,
     BusinessDraftContextPackRead,
     BusinessDraftContextPackRequest,
+    BusinessDraftDirectivesRequest,
     BusinessDraftEvidenceRefRead,
     BusinessDraftExportRequest,
     BusinessDraftGenerateRequest,
@@ -124,6 +125,7 @@ from app.services.context_pack import (
     create_coverage_review,
     execute_business_draft_generation_task,
     generate_draft_from_context_pack,
+    update_context_pack_directives,
 )
 from app.services.compliance_generation import execute_compliance_matrix_generation_task
 from app.services.document_utils import MAX_FILE_BYTES
@@ -2699,6 +2701,13 @@ def preview_business_draft_context_pack(
             section_id=section_id,
             profile_id=payload.profile_id,
             section_types=payload.section_types,
+            outline=[chapter.model_dump() for chapter in payload.outline]
+            if payload.outline
+            else None,
+            directives=[directive.model_dump() for directive in payload.directives]
+            if payload.directives
+            else None,
+            actor_user_id=ctx.user_id,
         )
     except BusinessDraftError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -2750,6 +2759,42 @@ def create_business_draft_context_pack(
             actor_user_id=ctx.user_id,
             profile_id=payload.profile_id,
             section_types=payload.section_types,
+            outline=[chapter.model_dump() for chapter in payload.outline]
+            if payload.outline
+            else None,
+            directives=[directive.model_dump() for directive in payload.directives]
+            if payload.directives
+            else None,
+        )
+    except BusinessDraftError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(context_pack)
+    return draft_context_pack_read(db, context_pack)
+
+
+@router.put(
+    "/{project_id}/sections/{section_id}/business-draft/context-pack/{context_pack_id}/directives",
+    response_model=BusinessDraftContextPackRead,
+)
+def update_business_draft_context_pack_directives(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    context_pack_id: uuid.UUID,
+    payload: BusinessDraftDirectivesRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> BusinessDraftContextPackRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        context_pack = update_context_pack_directives(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            context_pack_id=context_pack_id,
+            actor_user_id=ctx.user_id,
+            directives=[directive.model_dump() for directive in payload.directives],
         )
     except BusinessDraftError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc

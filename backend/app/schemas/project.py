@@ -626,9 +626,84 @@ class BusinessDraftGenerateRequest(BaseModel):
     force: bool = True
 
 
+class OutlineChapterInput(BaseModel):
+    """One chapter in a manually edited outline plan (MVP1.3 enhancement).
+
+    The ordered list fully determines the chapter plan when provided: list
+    position is the sort order, ``title`` renames the chapter, omitting a
+    profile chapter removes it, and ``custom`` marks a user-added chapter that
+    carries no compliance items (placeholder content the author fills in).
+    """
+
+    section_type: str = Field(min_length=1, max_length=128)
+    title: str | None = Field(default=None, max_length=300)
+    custom: bool = False
+
+    @field_validator("section_type")
+    @classmethod
+    def strip_section_type(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("section_type 不能为空")
+        return normalized
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class AuthorDirectiveInput(BaseModel):
+    """One author instruction-layer directive (MVP1.3 instruction layer).
+
+    Directives steer *generation* without mutating the immutable fact layer.
+    ``scope`` is ``"pack"`` (applies to every chapter) or a concrete
+    ``section_type``. Three types are allowed: ``style`` (pure wording),
+    ``emphasis`` (content emphasis) and ``mandatory_text`` (forced phrasing that
+    is emitted verbatim as a confirmable block and still fact-checked).
+    """
+
+    scope: str = Field(default="pack", min_length=1, max_length=128)
+    directive_type: str = Field(pattern="^(style|emphasis|mandatory_text)$")
+    text: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("scope")
+    @classmethod
+    def strip_scope(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("scope 不能为空")
+        return normalized
+
+    @field_validator("text")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("指令内容不能为空")
+        return normalized
+
+
+class BusinessDraftDirectivesRequest(BaseModel):
+    """Replace the instruction layer of a confirmed ContextPack.
+
+    The full directive list is sent each time (declarative replace, not patch).
+    Applying it triggers a *lightweight rebuild*: the prior fact snapshot is
+    reused verbatim (no upstream re-query) and only the directives change, so a
+    new immutable pack version is produced while facts stay frozen.
+    """
+
+    directives: list[AuthorDirectiveInput] = Field(default_factory=list, max_length=200)
+
+
 class BusinessDraftContextPackRequest(BaseModel):
     profile_id: str = Field(default="engineering_construction_business_v1", max_length=128)
     section_types: list[str] | None = Field(default=None, max_length=50)
+    outline: list[OutlineChapterInput] | None = Field(default=None, max_length=80)
+    directives: list[AuthorDirectiveInput] | None = Field(default=None, max_length=200)
 
     @field_validator("section_types")
     @classmethod
@@ -637,6 +712,22 @@ class BusinessDraftContextPackRequest(BaseModel):
             return None
         normalized = [item.strip() for item in value if item.strip()]
         return normalized or None
+
+    @field_validator("outline")
+    @classmethod
+    def validate_outline(
+        cls, value: list[OutlineChapterInput] | None
+    ) -> list[OutlineChapterInput] | None:
+        if not value:
+            return None
+        seen: set[str] = set()
+        for chapter in value:
+            if chapter.section_type in seen:
+                raise ValueError(f"章节类型重复：{chapter.section_type}")
+            seen.add(chapter.section_type)
+            if chapter.custom and not chapter.title:
+                raise ValueError(f"自定义章节需提供标题：{chapter.section_type}")
+        return value
 
 
 class BusinessDraftContextPackPreviewRead(BaseModel):
@@ -687,7 +778,9 @@ class DraftBlockRead(BaseModel):
 
 
 class DraftBlockUpdateRequest(BaseModel):
-    review_status: str = Field(pattern="^(pending|covered|needs_evidence|needs_fact|approved|rejected)$")
+    review_status: str = Field(
+        pattern="^(pending|covered|needs_evidence|needs_fact|needs_confirm|approved|rejected)$"
+    )
     content_text: str | None = Field(default=None, min_length=1)
     reason: str = Field(default="更新结构化草稿 block 审阅状态", min_length=2, max_length=1000)
 

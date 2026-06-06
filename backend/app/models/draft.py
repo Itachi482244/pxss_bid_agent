@@ -256,7 +256,8 @@ class DraftBlock(Base):
             name="draft_block_type_allowed",
         ),
         CheckConstraint(
-            "review_status IN ('pending', 'covered', 'needs_evidence', 'needs_fact', 'approved', 'rejected')",
+            "review_status IN ('pending', 'covered', 'needs_evidence', 'needs_fact', "
+            "'needs_confirm', 'approved', 'rejected')",
             name="draft_block_review_status_allowed",
         ),
         Index("idx_draft_block_chapter", "tenant_id", "chapter_id", "sort_order"),

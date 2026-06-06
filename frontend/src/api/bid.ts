@@ -829,9 +829,31 @@ export type BusinessDraftContextPack = {
   section_context_packs: DraftSectionContextPack[];
 };
 
+export type OutlineChapterInput = {
+  section_type: string;
+  title?: string | null;
+  custom?: boolean;
+};
+
+export type AuthorDirectiveType = "style" | "emphasis" | "mandatory_text";
+
+export type AuthorDirectiveInput = {
+  scope: string;
+  directive_type: AuthorDirectiveType;
+  text: string;
+};
+
+export type AuthorDirective = AuthorDirectiveInput & {
+  id?: string;
+  author_user_id?: string;
+  created_at?: string;
+};
+
 export type BusinessDraftContextPackPayload = {
   profile_id?: string;
   section_types?: string[] | null;
+  outline?: OutlineChapterInput[] | null;
+  directives?: AuthorDirectiveInput[] | null;
 };
 
 export type BusinessDraftContextPackGenerateResult = {
@@ -1341,6 +1363,19 @@ export async function createBusinessDraftContextPack(
   const response = await apiClient.post<BusinessDraftContextPack>(
     `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack`,
     payload
+  );
+  return response.data;
+}
+
+export async function updateBusinessDraftContextPackDirectives(
+  projectId: string,
+  sectionId: string,
+  contextPackId: string,
+  directives: AuthorDirectiveInput[]
+) {
+  const response = await apiClient.put<BusinessDraftContextPack>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack/${contextPackId}/directives`,
+    { directives }
   );
   return response.data;
 }
