@@ -135,6 +135,7 @@ from app.services.evidence_policy import (
 from app.services.evidence_policy import requires_enterprise_evidence
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import FileAcquisitionError
+from app.services.material_identity import enterprise_material_identity_key, material_snapshot_identity_key
 from app.services.project_import import (
     ImportDraft,
     build_upload_import_draft,
@@ -330,6 +331,20 @@ def evidence_binding_read_from_binding(binding: ComplianceEvidenceBinding) -> Co
     )
 
 
+def dedupe_evidence_bindings(
+    bindings: list[ComplianceEvidenceBinding],
+) -> list[ComplianceEvidenceBinding]:
+    deduped: list[ComplianceEvidenceBinding] = []
+    seen_material_keys: set[str] = set()
+    for binding in bindings:
+        material_key = material_snapshot_identity_key(binding.material_snapshot)
+        if material_key in seen_material_keys:
+            continue
+        seen_material_keys.add(material_key)
+        deduped.append(binding)
+    return deduped
+
+
 def enterprise_evidence_summary_for_item(
     db: Session,
     tenant_id: uuid.UUID,
@@ -344,6 +359,7 @@ def enterprise_evidence_summary_for_item(
         )
         .order_by(ComplianceEvidenceBinding.created_at.desc())
     ).all()
+    bindings = dedupe_evidence_bindings(list(bindings))
     names = [
         str(binding.material_snapshot.get("name") or binding.evidence_text)
         for binding in bindings
@@ -354,6 +370,55 @@ def enterprise_evidence_summary_for_item(
     if len(names) > 2:
         summary = f"{summary} 等 {len(names)} 项"
     return len(names), summary
+
+
+def refresh_qualification_after_evidence_change(
+    db: Session,
+    ctx: RequestContext,
+    *,
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+) -> dict[str, int]:
+    evaluations = run_qualification_evaluation(
+        db,
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        actor_user_id=ctx.user_id,
+    )
+    active_decisions = list(
+        db.scalars(
+            select(QualificationDecision).where(
+                QualificationDecision.tenant_id == ctx.tenant_id,
+                QualificationDecision.project_id == project_id,
+                QualificationDecision.section_id == section_id,
+                QualificationDecision.status != "superseded",
+            )
+        ).all()
+    )
+    for decision in active_decisions:
+        decision.status = "superseded"
+    if active_decisions:
+        db.add(
+            AuditLog(
+                tenant_id=ctx.tenant_id,
+                project_id=project_id,
+                section_id=section_id,
+                actor_user_id=ctx.user_id,
+                actor_type="user",
+                action="qualification.decision_invalidated",
+                object_type="qualification_decision",
+                object_id=None,
+                before_json={"decision_ids": [str(item.id) for item in active_decisions]},
+                after_json={"reason": "enterprise_evidence_changed"},
+                reason="企业资料证据发生变化，原参标建议已失效",
+                severity="warning",
+            )
+        )
+    return {
+        "evaluation_count": len(evaluations),
+        "invalidated_decision_count": len(active_decisions),
+    }
 
 
 REVIEW_SIGNAL_KEYWORDS = (
@@ -4215,7 +4280,7 @@ def list_compliance_evidence_bindings(
         )
         .order_by(ComplianceEvidenceBinding.created_at.desc())
     ).all()
-    return [evidence_binding_read_from_binding(binding) for binding in bindings]
+    return [evidence_binding_read_from_binding(binding) for binding in dedupe_evidence_bindings(list(bindings))]
 
 
 @router.post(
@@ -4246,6 +4311,15 @@ def waive_compliance_evidence_requirement(
     item.modified_at = now
     item.modify_reason = reason
     refresh_batch_confirm_guard(item)
+    qualification_refresh = None
+    if item.item_type == "qualification":
+        db.flush()
+        qualification_refresh = refresh_qualification_after_evidence_change(
+            db,
+            ctx,
+            project_id=project_id,
+            section_id=section_id,
+        )
     add_matrix_audit_log(
         db,
         ctx,
@@ -4255,7 +4329,10 @@ def waive_compliance_evidence_requirement(
         object_type="compliance_item",
         object_id=item.id,
         before_json=before,
-        after_json=compliance_item_snapshot(item),
+        after_json={
+            "item": compliance_item_snapshot(item),
+            "qualification_refresh": qualification_refresh,
+        },
         reason=reason,
     )
     db.commit()
@@ -4291,16 +4368,27 @@ def bind_compliance_evidence(
             detail="Conflict or expired material cannot be bound as evidence",
         )
 
-    duplicate = db.scalar(
-        select(ComplianceEvidenceBinding).where(
-            ComplianceEvidenceBinding.tenant_id == ctx.tenant_id,
-            ComplianceEvidenceBinding.compliance_item_id == item_id,
-            ComplianceEvidenceBinding.enterprise_material_id == payload.enterprise_material_id,
-            ComplianceEvidenceBinding.status == "active",
-        )
+    active_bindings = list(
+        db.scalars(
+            select(ComplianceEvidenceBinding).where(
+                ComplianceEvidenceBinding.tenant_id == ctx.tenant_id,
+                ComplianceEvidenceBinding.compliance_item_id == item_id,
+                ComplianceEvidenceBinding.status == "active",
+            )
+        ).all()
+    )
+    material_key = enterprise_material_identity_key(material)
+    duplicate = next(
+        (
+            binding
+            for binding in active_bindings
+            if binding.enterprise_material_id == payload.enterprise_material_id
+            or material_snapshot_identity_key(binding.material_snapshot) == material_key
+        ),
+        None,
     )
     if duplicate is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Material already bound")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Equivalent material already bound")
 
     before = {
         "item": compliance_item_snapshot(item),
@@ -4342,10 +4430,19 @@ def bind_compliance_evidence(
         refresh_batch_confirm_guard(item)
 
     db.flush()
+    qualification_refresh = None
+    if item.item_type == "qualification":
+        qualification_refresh = refresh_qualification_after_evidence_change(
+            db,
+            ctx,
+            project_id=project_id,
+            section_id=section_id,
+        )
     after = {
         "item": compliance_item_snapshot(item),
         "binding": evidence_binding_snapshot(binding),
         "material": enterprise_material_snapshot(material),
+        "qualification_refresh": qualification_refresh,
     }
     add_matrix_audit_log(
         db,
@@ -4377,7 +4474,7 @@ def unbind_compliance_evidence(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceEvidenceBindingRead:
-    get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     binding = db.scalar(
         select(ComplianceEvidenceBinding).where(
             ComplianceEvidenceBinding.tenant_id == ctx.tenant_id,
@@ -4396,6 +4493,14 @@ def unbind_compliance_evidence(
     binding.deleted_by = ctx.user_id
     binding.deleted_at = datetime.now(UTC)
     db.flush()
+    qualification_refresh = None
+    if item.item_type == "qualification":
+        qualification_refresh = refresh_qualification_after_evidence_change(
+            db,
+            ctx,
+            project_id=project_id,
+            section_id=section_id,
+        )
     add_matrix_audit_log(
         db,
         ctx,
@@ -4405,7 +4510,10 @@ def unbind_compliance_evidence(
         object_type="compliance_evidence_binding",
         object_id=binding.id,
         before_json=before,
-        after_json=evidence_binding_snapshot(binding),
+        after_json={
+            "binding": evidence_binding_snapshot(binding),
+            "qualification_refresh": qualification_refresh,
+        },
         reason=payload.reason.strip(),
     )
     db.commit()

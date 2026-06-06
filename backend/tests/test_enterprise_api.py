@@ -234,13 +234,14 @@ def test_qualification_evaluation_matches_confirmed_license() -> None:
 
 def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
     client = TestClient(app)
+    certificate_no = f"91430600BIND{uuid4().hex[:8].upper()}"
     create_response = client.post(
         "/api/v1/enterprise/materials",
         json={
             "material_type": "license",
             "name": f"绑定测试营业执照 {uuid4().hex[:8]}",
             "issuing_authority": "岳阳市市场监督管理局",
-            "certificate_no": "91430600BIND000001",
+            "certificate_no": certificate_no,
             "valid_until": "2030-12-31",
             "data_level": "internal",
             "verification_status": "confirmed",
@@ -252,7 +253,7 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
 
     search_response = client.get(
         "/api/v1/enterprise/materials/search",
-        params={"query": "投标人须提供有效营业执照", "limit": 10},
+        params={"query": f"投标人须提供有效营业执照 {certificate_no}", "limit": 10},
     )
     assert search_response.status_code == 200
     search_results = search_response.json()
@@ -311,6 +312,286 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
             )
         ).all()
         assert logs
+
+
+def test_equivalent_enterprise_materials_are_deduped_for_search_and_binding() -> None:
+    client = TestClient(app)
+    unique = uuid4().hex[:8].upper()
+    certificate_no = f"D243DUP{unique}"
+    payload = {
+        "material_type": "qualification",
+        "name": "市政公用工程施工总承包二级资质",
+        "issuing_authority": "湖南省住房和城乡建设厅",
+        "certificate_no": certificate_no,
+        "valid_until": "2030-12-31",
+        "data_level": "internal",
+        "verification_status": "confirmed",
+        "structured_fields": {"qualification_category": "市政公用工程施工总承包", "grade": "二级"},
+        "evidence_text": "证书载明资质类别为市政公用工程施工总承包二级。",
+    }
+    first_response = client.post("/api/v1/enterprise/materials", json=payload)
+    second_response = client.post("/api/v1/enterprise/materials", json=payload)
+    assert first_response.status_code == 201
+    assert second_response.status_code == 201
+    first_material = first_response.json()
+    second_material = second_response.json()
+
+    search_response = client.get(
+        "/api/v1/enterprise/materials/search",
+        params={"query": certificate_no, "material_type": "qualification", "limit": 10},
+    )
+    assert search_response.status_code == 200
+    duplicate_hits = [
+        item for item in search_response.json() if item["certificate_no"] == certificate_no
+    ]
+    assert len(duplicate_hits) == 1
+
+    projects = client.get("/api/v1/projects").json()
+    project = next(item for item in projects if item["name"] == "智慧园区弱电工程投标")
+    sections = client.get(f"/api/v1/projects/{project['id']}/sections").json()
+    section = sections[0]
+    unique_requirement = f"投标人须具备工程设计综合资质。{unique}"
+    with SessionLocal() as db:
+        row = db.execute(
+            select(Document, DocumentChunk)
+            .join(DocumentChunk, DocumentChunk.document_version_id == Document.current_version_id)
+            .where(
+                Document.project_id == UUID(project["id"]),
+                Document.section_id == UUID(section["id"]),
+                Document.current_version_id.is_not(None),
+                Document.status != "deleted",
+            )
+            .order_by(Document.updated_at.desc(), DocumentChunk.chunk_index.asc())
+            .limit(1)
+        ).one()
+        document, chunk = row
+        compliance_item = ComplianceItem(
+            tenant_id=document.tenant_id,
+            project_id=document.project_id,
+            section_id=document.section_id,
+            source_document_id=document.id,
+            source_version_id=document.current_version_id,
+            source_chunk_id=chunk.id,
+            source_page_no=chunk.page_no,
+            item_type="qualification",
+            requirement_text=unique_requirement,
+            normalized_requirement=unique_requirement,
+            response_suggestion="绑定企业资质证据后人工确认。",
+            evidence_text=unique_requirement,
+            explanation_json={"source_quote": unique_requirement},
+            status="needs_material",
+            risk_level="high",
+            is_mandatory=True,
+            is_batch_confirm_allowed=False,
+            created_by=document.created_by,
+        )
+        related_compliance_item = ComplianceItem(
+            tenant_id=document.tenant_id,
+            project_id=document.project_id,
+            section_id=document.section_id,
+            source_document_id=document.id,
+            source_version_id=document.current_version_id,
+            source_chunk_id=chunk.id,
+            source_page_no=chunk.page_no,
+            item_type="mandatory_response",
+            requirement_text=f"投标文件须附企业资质证明。{unique}",
+            normalized_requirement=f"企业资质证明 {unique}",
+            response_suggestion="引用同一份企业资质并人工确认。",
+            evidence_text=f"投标文件须附企业资质证明。{unique}",
+            explanation_json={"source_quote": f"投标文件须附企业资质证明。{unique}"},
+            status="confirmed",
+            risk_level="medium",
+            is_mandatory=True,
+            is_batch_confirm_allowed=False,
+            created_by=document.created_by,
+        )
+        db.add_all([compliance_item, related_compliance_item])
+        db.commit()
+        item_id = compliance_item.id
+        related_item_id = related_compliance_item.id
+
+    bind_url = (
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+        f"/compliance-items/{item_id}/evidence-bindings"
+    )
+    initial_run_response = client.post(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/qualification-evaluations/run"
+    )
+    assert initial_run_response.status_code == 200
+    initial_evaluation = next(
+        item for item in initial_run_response.json() if item["compliance_item_id"] == str(item_id)
+    )
+    assert initial_evaluation["evaluation_status"] == "needs_material"
+
+    initial_decision_response = client.post(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/qualification-decision/generate"
+    )
+    assert initial_decision_response.status_code == 200
+    initial_decision = initial_decision_response.json()
+    confirm_initial_decision = client.post(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}/"
+            f"qualification-decision/{initial_decision['id']}/confirm"
+        ),
+        json={"reason": "绑定资料前确认当前资格判断"},
+    )
+    assert confirm_initial_decision.status_code == 200
+
+    bind_response = client.post(
+        bind_url,
+        json={
+            "enterprise_material_id": first_material["id"],
+            "reason": "绑定第一条等价企业资质",
+            "confidence_score": "0.9000",
+        },
+    )
+    assert bind_response.status_code == 201
+    duplicate_bind_response = client.post(
+        bind_url,
+        json={
+            "enterprise_material_id": second_material["id"],
+            "reason": "重复绑定等价企业资质",
+            "confidence_score": "0.9000",
+        },
+    )
+    assert duplicate_bind_response.status_code == 409
+
+    evaluations_after_bind = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/qualification-evaluations"
+    )
+    assert evaluations_after_bind.status_code == 200
+    evaluation = next(
+        item for item in evaluations_after_bind.json() if item["compliance_item_id"] == str(item_id)
+    )
+    assert evaluation["evaluation_status"] == "pending_confirm"
+    assert evaluation["is_blocking"] is False
+    assert evaluation["matched_material_name"] == first_material["name"]
+    assert evaluation["confirmed_at"] is None
+
+    stale_decision_response = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/qualification-decision"
+    )
+    assert stale_decision_response.status_code == 200
+    assert stale_decision_response.json() is None
+
+    with SessionLocal() as db:
+        original = db.get(ComplianceEvidenceBinding, UUID(bind_response.json()["id"]))
+        assert original is not None
+        historical_duplicate = ComplianceEvidenceBinding(
+            tenant_id=original.tenant_id,
+            project_id=original.project_id,
+            section_id=original.section_id,
+            compliance_item_id=original.compliance_item_id,
+            enterprise_material_id=UUID(second_material["id"]),
+            evidence_text=original.evidence_text,
+            material_snapshot=original.material_snapshot,
+            confidence_score=original.confidence_score,
+            bind_reason="历史重复绑定等价企业资质",
+            status="active",
+            created_by=original.created_by,
+        )
+        cross_item_binding = ComplianceEvidenceBinding(
+            tenant_id=original.tenant_id,
+            project_id=original.project_id,
+            section_id=original.section_id,
+            compliance_item_id=related_item_id,
+            enterprise_material_id=original.enterprise_material_id,
+            evidence_text=original.evidence_text,
+            material_snapshot=original.material_snapshot,
+            confidence_score=original.confidence_score,
+            bind_reason="同一企业资质关联另一条款",
+            status="active",
+            created_by=original.created_by,
+        )
+        db.add_all([historical_duplicate, cross_item_binding])
+        db.commit()
+        historical_binding_id = historical_duplicate.id
+        cross_item_binding_id = cross_item_binding.id
+
+    list_response = client.get(bind_url)
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 1
+
+    context_pack_preview_response = client.post(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}/"
+            "business-draft/context-pack/preview"
+        ),
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "section_types": ["qualification_performance_summary"],
+        },
+    )
+    assert context_pack_preview_response.status_code == 200
+    context_pack_preview = context_pack_preview_response.json()
+    equivalent_evidence = [
+        item
+        for item in context_pack_preview["context_json"]["bound_evidence"]
+        if item["certificate_no"] == certificate_no
+    ]
+    assert len(equivalent_evidence) == 1
+    assert set(equivalent_evidence[0]["compliance_item_ids"]) == {
+        str(item_id),
+        str(related_item_id),
+    }
+    assert len(equivalent_evidence[0]["binding_ids"]) == 2
+    matrix_item = next(
+        item
+        for item in context_pack_preview["context_json"]["matrix_items"]
+        if item["compliance_item_id"] == str(item_id)
+    )
+    assert matrix_item["bound_evidence_count"] == 1
+
+    refreshed_decision_response = client.post(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/qualification-decision/generate"
+    )
+    assert refreshed_decision_response.status_code == 200
+    refreshed_decision = refreshed_decision_response.json()
+    confirm_refreshed_decision = client.post(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}/"
+            f"qualification-decision/{refreshed_decision['id']}/confirm"
+        ),
+        json={"reason": "绑定资料后确认刷新后的资格判断"},
+    )
+    assert confirm_refreshed_decision.status_code == 200
+
+    unbind_response = client.request(
+        "DELETE",
+        f"{bind_url}/{bind_response.json()['id']}",
+        json={"reason": "验证解除绑定后自动重跑资格预评估"},
+    )
+    assert unbind_response.status_code == 200
+    unbind_historical_response = client.request(
+        "DELETE",
+        f"{bind_url}/{historical_binding_id}",
+        json={"reason": "清理历史等价重复绑定并验证资格状态收敛"},
+    )
+    assert unbind_historical_response.status_code == 200
+    evaluations_after_unbind = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/qualification-evaluations"
+    )
+    assert evaluations_after_unbind.status_code == 200
+    evaluation_after_unbind = next(
+        item
+        for item in evaluations_after_unbind.json()
+        if item["compliance_item_id"] == str(item_id)
+    )
+    assert evaluation_after_unbind["evaluation_status"] == "needs_material"
+    decision_after_unbind = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/qualification-decision"
+    )
+    assert decision_after_unbind.status_code == 200
+    assert decision_after_unbind.json() is None
+
+    with SessionLocal() as db:
+        cross_item_binding = db.get(ComplianceEvidenceBinding, cross_item_binding_id)
+        related_compliance_item = db.get(ComplianceItem, related_item_id)
+        assert cross_item_binding is not None
+        assert related_compliance_item is not None
+        db.delete(cross_item_binding)
+        db.delete(related_compliance_item)
+        db.commit()
 
 
 def test_compliance_evidence_requirement_can_be_waived() -> None:

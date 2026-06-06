@@ -107,6 +107,7 @@ def test_business_draft_decision_fact_check_export_and_approval(
 
     client = TestClient(app)
     project_id, section_id = get_seed_project_and_section(client)
+    certificate_no = f"91430600MVP1{uuid4().hex[:8].upper()}"
 
     material_response = client.post(
         "/api/v1/enterprise/materials",
@@ -114,11 +115,11 @@ def test_business_draft_decision_fact_check_export_and_approval(
             "material_type": "license",
             "name": f"MVP1 有效营业执照 {uuid4().hex[:6]}",
             "issuing_authority": "岳阳市市场监督管理局",
-            "certificate_no": "91430600MVP10001",
+            "certificate_no": certificate_no,
             "valid_until": "2030-12-31",
             "data_level": "internal",
             "verification_status": "confirmed",
-            "evidence_text": "营业执照载明企业主体资格有效，统一社会信用代码 91430600MVP10001。",
+            "evidence_text": f"营业执照载明企业主体资格有效，统一社会信用代码 {certificate_no}。",
         },
     )
     assert material_response.status_code == 201

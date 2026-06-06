@@ -24,6 +24,7 @@ from app.schemas.enterprise import (
     EnterpriseProfileUpsertRequest,
 )
 from app.services.document_utils import MAX_FILE_BYTES
+from app.services.material_identity import enterprise_material_identity_key
 from app.services.material_retrieval import rebuild_material_chunks, search_material_hits
 from app.services.storage import put_object_bytes
 
@@ -260,8 +261,18 @@ def search_enterprise_materials(
         material_type=material_type,
         verification_status=verification_status,
         allowed_data_levels=allowed_data_levels,
-        limit=limit,
+        limit=min(200, max(limit, limit * 4)),
     )
+    deduped_hits = []
+    seen_material_keys: set[str] = set()
+    for hit in hits:
+        material_key = enterprise_material_identity_key(hit.material)
+        if material_key in seen_material_keys:
+            continue
+        seen_material_keys.add(material_key)
+        deduped_hits.append(hit)
+        if len(deduped_hits) >= limit:
+            break
     return [
         EnterpriseMaterialSearchResult(
             **EnterpriseMaterialRead.model_validate(hit.material).model_dump(),
@@ -273,7 +284,7 @@ def search_enterprise_materials(
             matched_terms=hit.matched_terms or [],
             material_status_hint=hit.material_status_hint,
         )
-        for hit in hits
+        for hit in deduped_hits
     ]
 
 

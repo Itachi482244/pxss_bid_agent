@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     AuditLog,
     BidSection,
+    ComplianceEvidenceBinding,
     ComplianceItem,
     EnterpriseMaterial,
     Project,
@@ -477,6 +478,36 @@ def evaluate_qualification_item(
     )
 
 
+def _manual_bound_evidence_outcome(
+    item: ComplianceItem,
+    outcome: EvaluationOutcome,
+    binding: ComplianceEvidenceBinding | None,
+) -> EvaluationOutcome:
+    if binding is None or outcome.evaluation_status != "needs_material":
+        return outcome
+    snapshot = binding.material_snapshot or {}
+    material_name = str(snapshot.get("name") or binding.evidence_text or "已绑定企业资料")
+    extracted = {
+        **outcome.extracted_requirement,
+        "manual_bound_evidence": True,
+        "manual_binding_id": str(binding.id),
+    }
+    return EvaluationOutcome(
+        requirement_type=outcome.requirement_type,
+        extracted_requirement=extracted,
+        evaluation_status="pending_confirm",
+        risk_level="medium" if item.is_mandatory else "low",
+        is_blocking=False,
+        matched_material_id=binding.enterprise_material_id,
+        matched_material_name=material_name,
+        matched_rule_code=f"{outcome.matched_rule_code}.manual_binding",
+        rule_version=outcome.rule_version,
+        reason="已人工绑定企业资料证据，但自动规则尚不能判定完全满足资格要求，需人工确认适配性。",
+        evidence_text=binding.evidence_text,
+        missing_materials=None,
+    )
+
+
 def evaluation_snapshot(evaluation: QualificationEvaluation) -> dict[str, Any]:
     return {
         "id": str(evaluation.id),
@@ -529,10 +560,26 @@ def run_qualification_evaluation(
         ).all()
     )
     deadline = _deadline_for(project, section)
+    active_bindings = list(
+        db.scalars(
+            select(ComplianceEvidenceBinding)
+            .where(
+                ComplianceEvidenceBinding.tenant_id == tenant_id,
+                ComplianceEvidenceBinding.project_id == project_id,
+                ComplianceEvidenceBinding.section_id == section_id,
+                ComplianceEvidenceBinding.status == "active",
+            )
+            .order_by(ComplianceEvidenceBinding.created_at.desc())
+        ).all()
+    )
+    latest_binding_by_item: dict[uuid.UUID, ComplianceEvidenceBinding] = {}
+    for binding in active_bindings:
+        latest_binding_by_item.setdefault(binding.compliance_item_id, binding)
     results: list[QualificationEvaluation] = []
     counts = {"satisfied": 0, "not_satisfied": 0, "needs_material": 0, "pending_confirm": 0, "not_applicable": 0}
     for item in items:
         outcome = evaluate_qualification_item(item, materials, deadline, rules)
+        outcome = _manual_bound_evidence_outcome(item, outcome, latest_binding_by_item.get(item.id))
         evaluation = db.scalar(
             select(QualificationEvaluation).where(
                 QualificationEvaluation.tenant_id == tenant_id,
@@ -579,6 +626,9 @@ def run_qualification_evaluation(
             evaluation.reason = outcome.reason
             evaluation.evidence_text = outcome.evidence_text
             evaluation.missing_materials = outcome.missing_materials
+            evaluation.confirmed_by = None
+            evaluation.confirmed_at = None
+            evaluation.confirm_reason = None
         counts[outcome.evaluation_status] += 1
         results.append(evaluation)
     db.flush()

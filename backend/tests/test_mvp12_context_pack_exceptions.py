@@ -1,12 +1,10 @@
-"""MVP1.2 ContextPack exception-path and async-generation regression tests.
+"""MVP1.2 ContextPack exception-path regression tests.
 
 Covers the convergence rules from the MVP1.2 plan section 8 that the happy-path
-``test_mvp12_context_pack_api`` does not exercise, plus the new async draft
-generation task (``business_draft_generate``):
+``test_mvp12_context_pack_api`` does not exercise:
 
 - 缺证据 / 强制项未确认 -> readiness block.
-- readiness block -> formal generation refused, internal draft allowed.
-- 异步生成任务的成功/失败状态机与失败记录（不保存为有效草稿）。
+- 限额设计等承诺性条款不误判为企业资料缺证据。
 """
 
 from __future__ import annotations
@@ -20,12 +18,10 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.db.session import SessionLocal
-from app.main import app
 from app.models import (
     BidSection,
     ComplianceItem,
@@ -39,6 +35,8 @@ from app.models import (
     User,
 )
 from app.services.context_pack import build_context_pack_preview
+from app.services.business_draft import BusinessDraftError
+from app.services.context_pack import _assert_context_pack_can_be_confirmed
 from app.services.evidence_policy import (
     enterprise_evidence_not_required,
     requires_enterprise_evidence,
@@ -61,8 +59,8 @@ def _seed_blocking_project(recommendation: str = "go") -> tuple[str, str]:
     Items are ``qualification``/high and left ``pending_confirm`` with no
     evidence binding, which deterministically triggers both
     ``evidence.missing_required`` and ``matrix.guard_items_unconfirmed``. A
-    confirmed qualification decision with ``recommendation`` is attached so the
-    ContextPack itself can be confirmed (the gate only blocks on the decision).
+    confirmed qualification decision is attached so the test proves that
+    non-qualification readiness blockers still prevent confirmation.
     """
     now = datetime.now(UTC)
     suffix = uuid4().hex[:8]
@@ -226,6 +224,26 @@ def test_readiness_flags_missing_evidence_and_unconfirmed_guard_items() -> None:
     assert "evidence.missing_required" in codes
     assert "matrix.guard_items_unconfirmed" in codes
     assert preview["readiness_status"] == "block"
+    with pytest.raises(BusinessDraftError, match="仍存在阻断项"):
+        _assert_context_pack_can_be_confirmed(preview)
+
+
+def test_confirmed_no_go_is_allowed_as_context_pack_risk_snapshot() -> None:
+    preview = {
+        "readiness_json": {
+            "status": "block",
+            "checks": [
+                {
+                    "code": "qualification.no_go_confirmed",
+                    "status": "block",
+                    "summary": "已确认的参标建议为 No-Go。",
+                    "action": "仅允许保存风险快照。",
+                }
+            ],
+        }
+    }
+
+    _assert_context_pack_can_be_confirmed(preview)
 
 
 def test_commitment_only_limit_design_does_not_require_enterprise_evidence() -> None:
@@ -261,91 +279,3 @@ def test_commitment_only_limit_design_does_not_require_enterprise_evidence() -> 
     assert requires_enterprise_evidence(limit_design) is False
     assert requires_enterprise_evidence(qualification) is True
     assert requires_enterprise_evidence(performance_bond) is True
-
-
-def test_async_generate_blocks_then_allows_internal_draft() -> None:
-    settings.run_tasks_inline = True
-    client = TestClient(app)
-    project_id, section_id = _seed_blocking_project(recommendation="go")
-    base = f"/api/v1/projects/{project_id}/sections/{section_id}/business-draft"
-    payload = {
-        "profile_id": "engineering_construction_business_v1",
-        "section_types": ["bid_letter", "qualification_performance_summary"],
-    }
-
-    create_response = client.post(f"{base}/context-pack", json=payload)
-    assert create_response.status_code == 200
-    context_pack = create_response.json()
-    assert context_pack["status"] == "confirmed"
-    assert context_pack["readiness_status"] == "block"
-    cp_id = context_pack["id"]
-
-    # readiness=block + allow_blocked_internal_draft=False -> async task must fail,
-    # and no formal draft is persisted.
-    blocked = client.post(
-        f"{base}/context-pack/{cp_id}/generate-async",
-        json={"allow_blocked_internal_draft": False},
-    )
-    assert blocked.status_code == 202
-    blocked_task = blocked.json()
-    assert blocked_task["task_type"] == "business_draft_generate"
-    assert blocked_task["status"] == "failed"
-    assert blocked_task["error_code"] == "BUSINESS_DRAFT_GENERATION_BLOCKED"
-
-    poll = client.get(f"/api/v1/tasks/{blocked_task['id']}")
-    assert poll.status_code == 200
-    assert poll.json()["status"] == "failed"
-
-    chapters_after_block = client.get(f"{base}/chapters").json()
-    assert chapters_after_block == []
-
-    # allow_blocked_internal_draft=True -> task succeeds as internal draft.
-    allowed = client.post(
-        f"{base}/context-pack/{cp_id}/generate-async",
-        json={"allow_blocked_internal_draft": True},
-    )
-    assert allowed.status_code == 202
-    allowed_task = allowed.json()
-    assert allowed_task["status"] == "succeeded"
-    assert allowed_task["output_json"]["chapter_count"] > 0
-    assert allowed_task["output_json"]["context_pack_id"] == cp_id
-
-    blocks = client.get(f"{base}/blocks").json()
-    assert any(block["links_json"]["context_pack_id"] == cp_id for block in blocks)
-
-    chapters_after_success = client.get(f"{base}/chapters").json()
-    assert chapters_after_success
-    assert all(
-        chapter["generated_from_json"]["internal_draft"] is True
-        for chapter in chapters_after_success
-        if chapter["generated_from_json"].get("source") == "mvp1.2_context_pack"
-    )
-
-
-def test_async_generate_no_go_requires_internal_draft() -> None:
-    settings.run_tasks_inline = True
-    client = TestClient(app)
-    project_id, section_id = _seed_blocking_project(recommendation="no_go")
-    base = f"/api/v1/projects/{project_id}/sections/{section_id}/business-draft"
-    payload = {
-        "profile_id": "engineering_construction_business_v1",
-        "section_types": ["bid_letter", "qualification_performance_summary"],
-    }
-
-    create_response = client.post(f"{base}/context-pack", json=payload)
-    assert create_response.status_code == 200
-    cp_id = create_response.json()["id"]
-
-    blocked = client.post(
-        f"{base}/context-pack/{cp_id}/generate-async",
-        json={"allow_blocked_internal_draft": False},
-    )
-    assert blocked.status_code == 202
-    assert blocked.json()["status"] == "failed"
-
-    allowed = client.post(
-        f"{base}/context-pack/{cp_id}/generate-async",
-        json={"allow_blocked_internal_draft": True},
-    )
-    assert allowed.status_code == 202
-    assert allowed.json()["status"] == "succeeded"

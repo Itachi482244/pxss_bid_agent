@@ -1,325 +1,243 @@
 # 投标 Agent ContextPack 分阶段生成方案
 
-> 更新时间：2026-06-04
-> 适用版本：MVP1.2
-> 目标：说明商务/资格草稿生成时，如何分阶段构建 ContextPack，并让 LLM 在受控目录和章节上下文中生成结构化标书内容。
+> 更新时间：2026-06-06
+> 适用版本：MVP1.2 负责 ContextPack 预览/生成/确认；MVP1.3 负责基于 ContextPack 的目录和章节草稿生成。
+> 目标：说明如何分阶段构建受控上下文，让后续 LLM 生成在可追溯、可校验、可阻断的输入之上运行。
 
-## 1. 结论
+## 1. 总体判断
 
-MVP1.2 不应一次性把所有项目、矩阵、证据和企业资料塞给 LLM 生成整本商务/资格标书。
+ContextPack 应该分阶段构建，而不是一次性把所有项目、矩阵、证据和企业资料塞给 LLM。
 
-推荐采用分阶段链路：
+推荐链路：
 
 ```text
-TemplateProfile
+Project + BidSection + Matrix + Evidence + QualificationDecision
   -> GlobalContextPack
     -> OutlinePlan
       -> SectionContextPack
         -> DraftBlock
-          -> CoverageReview
+          -> Review / FactCheck / Export
 ```
 
-其中：
+版本边界：
 
-1. `TemplateProfile` 定义生成边界和章节骨架。
-2. `GlobalContextPack` 汇总全局项目、矩阵、证据和风险摘要。
-3. `OutlinePlan` 是受控目录计划，不是 LLM 自由发挥的目录。
-4. `SectionContextPack` 按章节裁剪上下文。
-5. `DraftBlock` 是结构化生成稿的最小审阅单位。
-6. `CoverageReview` 做全文覆盖、事实一致性和风险检查。
+1. MVP1.2 做到 `GlobalContextPack`、`OutlinePlan` 和 `SectionContextPack` 可预览、可确认、可审计。
+2. MVP1.3 从已确认的 `SectionContextPack` 开始生成 `DraftBlock`，再做覆盖检查、事实校验、审阅和导出。
+3. MVP1.4 的 RAG/Embedding/Rerank 只增强候选证据来源，不直接绕过人工绑定。
 
-## 2. 设计目标
+## 2. 为什么要分阶段
 
-1. 控制上下文长度，避免大上下文导致遗漏、混写和不可复盘。
-2. 让每个章节有明确输入、输出、证据和风险边界。
-3. 支持章节级重试、章节级审阅和章节级导出。
-4. 保证每个生成段落都能回链合规条目、招标原文和企业证据。
-5. 为 MVP1.3 的 RAG 预留 `candidate_evidence` 扩展位。
+分阶段 ContextPack 的价值：
 
-## 3. 非目标
+1. 降低上下文噪音：目录生成只需要粗粒度信息，章节生成才需要细粒度证据。
+2. 让异常更收敛：资格未确认、缺证据、缺字段、No-Go 都能在生成前被发现。
+3. 便于人工确认：用户可以先确认“模型将使用什么”，再进入“模型如何表达”。
+4. 便于审计复盘：每次生成都能追溯到固定版本的 ContextPack。
+5. 便于后续接 RAG：候选证据只进入候选区，人工确认后才进入正式 `bound_evidence`。
 
-MVP1.2 不做以下事情：
+## 3. 不做的事
 
-1. 不接真实 RAG、Embedding 或 Rerank。
-2. 不让 LLM 自由决定整本标书结构。
-3. 不直接生成不可追踪的完整 Word。
-4. 不生成技术标核心章节。
-5. 不做净化产品选型、图纸、OCR、多 Agent 或报价。
+MVP1.2 不做：
 
-## 4. 模板定位
+1. 不生成商务/资格正文草稿。
+2. 不生成结构化 `DraftBlock`。
+3. 不做覆盖检查、事实校验和 Word 导出。
+4. 不接真实 RAG、Embedding 或 Rerank。
+5. 不让模型自动补齐证据或自动判断企业资质真实性。
+
+MVP1.3 才开始做正文草稿生成；MVP1.4 才开始做 RAG 证据推荐。
+
+## 4. TemplateProfile 的角色
 
 ContextPack 需要模板约束，但不应被某一份 Word 模板绑死。
 
-模板分三层：
+`TemplateProfile` 的作用是：
 
-| 层级 | 名称 | 作用 |
-| --- | --- | --- |
-| 生成规则模板 | `TemplateProfile` | 定义章节、必填字段、证据要求、输出格式和禁止事项 |
-| 结构化生成稿 | `DraftSection` / `DraftBlock` | 保存模型生成结果和审阅状态 |
-| Word 导出模板 | `.docx` 模板 | 负责页眉页脚、目录、样式、表格和最终排版 |
+1. 定义商务/资格章节类型、默认顺序和适用场景。
+2. 定义每个章节需要哪些矩阵项、证据和项目字段。
+3. 定义输出约束，例如不得编造证书编号、人员、金额和日期。
+4. 为 MVP1.3 的 prompt 和 schema 提供稳定输入。
 
-优先级：
-
-1. 招标文件明确给出的投标文件格式优先。
-2. 项目选择的 `TemplateProfile` 次之。
-3. 系统默认商务/资格模板作为兜底。
-
-LLM 可以辅助修订目录标题、合并相近章节、补充章节说明，但不能绕过招标文件格式和默认模板骨架。
+`TemplateProfile` 在 MVP1.2 不负责生成正文，只负责让 `outline_plan_json` 和 `section_context_packs` 有结构。
 
 ## 5. 阶段一：GlobalContextPack
 
-`GlobalContextPack` 用于生成目录计划和全局约束，只放粗粒度信息。
+`GlobalContextPack` 是全局粗粒度上下文，用于确定生成范围和目录计划。
 
-建议字段：
+建议包含：
 
 ```json
 {
-  "schema_version": "1.0",
-  "project": {
+  "project_facts": {
     "project_name": "",
-    "bid_section_name": "",
-    "tenderer": "",
-    "deadline": "",
-    "budget": "",
-    "industry": ""
+    "purchaser": "",
+    "agency": "",
+    "budget_amount": "",
+    "bid_deadline_at": "",
+    "region_code": "",
+    "industry_code": ""
   },
   "source_document": {
     "document_id": "",
-    "version_id": "",
-    "version_status": "current"
+    "current_version_id": "",
+    "parser_name": "",
+    "parser_version": ""
   },
-  "template_profile": {
-    "template_id": "",
-    "template_version": "",
-    "default_sections": []
+  "qualification_decision": {
+    "recommendation": "go|conditional_go|no_go",
+    "status": "confirmed",
+    "summary": "",
+    "confirmed_by": "",
+    "confirmed_at": ""
   },
   "matrix_summary": {
     "total": 0,
     "confirmed": 0,
     "high_risk": 0,
-    "mandatory": 0,
-    "qualification": 0,
     "missing_evidence": 0
   },
-  "risk_summary": [],
-  "available_evidence_summary": [],
+  "bound_evidence": [],
   "missing_facts": [],
-  "generation_constraints": []
+  "readiness_json": {}
 }
 ```
 
-Global 阶段不放大量证据原文，不生成正文。
+MVP1.2 验收重点：
+
+1. 数据来源固定。
+2. 资格门禁明确。
+3. 缺项和阻断项明确。
+4. 已绑定证据去重。
+5. 预览与确认结果一致。
 
 ## 6. 阶段二：OutlinePlan
 
-`OutlinePlan` 是目录计划，也是后续每章生成的任务清单。
+`OutlinePlan` 是目录和章节计划。
 
-生成方式：
+来源优先级：
 
-1. 规则先解析招标文件格式要求。
-2. 系统加载默认 `TemplateProfile`。
-3. 系统把矩阵摘要、章节类型和必填字段交给 LLM。
-4. LLM 只允许在约束内建议目录和章节映射。
-5. 系统校验目录计划。
-6. 用户预览并确认目录计划。
+1. TemplateProfile 默认章节。
+2. 招标文件中明确要求的响应文件组成。
+3. 合规矩阵中出现的资格、商务、格式和承诺类条目。
+4. 用户通过 API 或 UI 明确选择的 `section_types`。
 
-章节计划建议字段：
+示例：
 
 ```json
 {
-  "outline_plan_id": "uuid",
-  "source": "tender_format + template_profile + llm_suggestion",
   "sections": [
     {
-      "section_id": "qualification_response",
-      "title": "资格响应文件",
-      "section_type": "qualification",
-      "required": true,
-      "source_basis": "招标文件格式要求",
-      "order_index": 10,
-      "compliance_item_ids": [],
-      "required_fields": [],
-      "evidence_required": true,
-      "output_format": "structured_blocks",
-      "review_policy": "manual_required"
+      "section_type": "bid_letter",
+      "title": "投标函",
+      "required_matrix_item_ids": [],
+      "required_evidence_types": [],
+      "missing_fact_fields": []
+    },
+    {
+      "section_type": "qualification_performance_summary",
+      "title": "资格及业绩响应",
+      "required_matrix_item_ids": [],
+      "required_evidence_types": ["qualification", "personnel", "performance"],
+      "missing_fact_fields": []
     }
   ]
 }
 ```
 
-OutlinePlan 校验规则：
-
-1. 招标文件要求的章节不得缺失。
-2. 强制项和资格项必须至少映射到一个章节。
-3. 没有证据的章节必须标记 `evidence_gap`。
-4. 高风险章节必须标记 `manual_required`。
-5. 目录计划必须可预览、可编辑、可重新生成。
+MVP1.2 只确认目录计划，不让模型写正文。
 
 ## 7. 阶段三：SectionContextPack
 
-`SectionContextPack` 是生成某一章的精确输入。
+`SectionContextPack` 是章节级精确输入。
 
-每个章节单独构建上下文：
+每个 SectionContextPack 应包含：
+
+1. 章节类型、标题和排序。
+2. 相关矩阵项。
+3. 相关已绑定证据。
+4. 相关缺事实。
+5. 章节输出约束。
+6. 章节风险提示。
+
+示例：
 
 ```json
 {
-  "section_context_pack_id": "uuid",
-  "outline_plan_id": "uuid",
-  "section": {
-    "section_id": "qualification_response",
-    "title": "资格响应文件",
-    "section_type": "qualification"
-  },
-  "project_facts": {},
+  "section_type": "qualification_performance_summary",
+  "title": "资格及业绩响应",
   "matrix_items": [],
   "bound_evidence": [],
-  "manual_notes": [],
-  "risk_acceptances": [],
   "missing_facts": [],
-  "candidate_evidence": [],
-  "output_schema": {},
-  "forbidden_claims": []
+  "constraints": [
+    "不得编造证书编号",
+    "不得声称未绑定的人员或业绩已经满足要求"
+  ]
 }
 ```
 
-裁剪规则：
+MVP1.2 验收重点：
 
-1. 只放本章需要覆盖的矩阵项。
-2. 只放本章可引用的已绑定证据。
-3. 本章缺失的字段进入 `missing_facts`。
-4. 本章不能承诺的内容进入 `forbidden_claims`。
-5. MVP1.3 的候选证据只能进入 `candidate_evidence`，人工确认后才进入 `bound_evidence`。
+1. 每个计划章节都有章节上下文。
+2. 章节上下文只包含与章节相关的矩阵项和证据。
+3. 缺证据和缺事实保留在章节上下文内。
+4. 章节上下文可被 MVP1.3 直接消费。
 
-## 8. 阶段四：DraftBlock
+## 8. 阶段四：DraftBlock（MVP1.3）
 
-LLM 输出结构化 `DraftBlock`，不直接输出整份 Word。
+MVP1.3 才生成结构化 `DraftBlock`。
 
-建议字段：
+DraftBlock 输出要求：
 
-```json
-{
-  "block_id": "uuid",
-  "section_id": "qualification_response",
-  "block_type": "paragraph",
-  "content": "",
-  "covers_compliance_item_ids": [],
-  "uses_evidence_ids": [],
-  "source_chunk_ids": [],
-  "fact_claims": [],
-  "missing_fact_placeholders": [],
-  "risk_flags": [],
-  "review_status": "pending"
-}
-```
+1. 不直接输出整份 Word。
+2. 每个 block 带 `compliance_item_ids` 和 `evidence_binding_ids`。
+3. 无证据内容标记 `needs_evidence`。
+4. 无法验证事实标记 `needs_fact`。
+5. 人工审阅后才能进入正式导出。
 
-生成约束：
+## 9. 异常处理
 
-1. 每个 block 必须声明覆盖哪些合规项。
-2. 每个事实性陈述必须引用证据或进入待确认。
-3. 不能使用 SectionContextPack 之外的事实。
-4. 缺证据时生成占位或待补说明，不包装成已确认事实。
-5. 输出必须通过 schema 校验，否则进入重试或人工处理。
+| 场景 | MVP1.2 处理 | MVP1.3 处理 |
+| --- | --- | --- |
+| 未生成资格预评估 | 允许预览，阻止确认 ContextPack | 不允许生成 |
+| 参标建议未确认 | 阻止确认 ContextPack | 不允许生成 |
+| Conditional Go | ContextPack warn | 允许生成，提交前复核 |
+| No-Go | ContextPack block | 只允许风险接受后的内部草稿 |
+| 缺企业资料证据 | ContextPack block，回到证据绑定 | 不允许正式草稿 |
+| 缺项目字段 | 写入 `missing_facts` | 生成占位或待确认 |
+| 章节上下文过长 | 记录需要再拆分 | 章节内按条目组拆分生成 |
+| 模型输出失败 | 不涉及 | 重试或不保存有效草稿 |
 
-## 9. 阶段五：CoverageReview
+## 10. 前端信息架构
 
-章节生成完成后，系统做全文级检查。
+MVP1.2 页面重点：
 
-检查项：
+1. ContextPack 状态：未生成、已预览、已确认、阻断。
+2. 资格门禁：未评估、未确认、Conditional Go、No-Go。
+3. 准备度检查：缺证据、缺字段、矩阵未确认、版本风险。
+4. 章节计划：将生成哪些章节，但不展示正文。
+5. 操作按钮：预览、确认 ContextPack、去处理阻断项。
 
-1. 强制项覆盖率。
-2. 资格项覆盖率。
-3. 高风险项处理状态。
-4. 已绑定证据引用率。
-5. 项目名称、日期、单位名称、证书编号、人员、业绩跨章节一致性。
-6. 重复段落和冲突表述。
-7. 待确认占位数量。
-8. Word 导出前风险快照。
+MVP1.3 页面重点：
 
-输出示例：
+1. 基于 ContextPack 生成目录和章节草稿。
+2. 草稿 block 审阅和双向定位。
+3. 覆盖检查、事实校验和 Word 导出。
 
-```json
-{
-  "coverage_review_id": "uuid",
-  "status": "block",
-  "summary": {
-    "mandatory_coverage": "96%",
-    "qualification_coverage": "88%",
-    "missing_fact_count": 6,
-    "fact_conflict_count": 1
-  },
-  "issues": []
-}
-```
+## 11. 验收标准
 
-## 10. UI 建议
+MVP1.2 验收：
 
-MVP1.2 建议提供四个页面或面板：
-
-1. 生成准备页：展示准备度检查、缺项、风险和推荐处理动作。
-2. 目录计划页：展示 OutlinePlan，允许用户确认、调整、重新生成。
-3. 章节生成页：按章节展示状态、生成、重试和校验结果。
-4. 草稿审阅页：左侧结构化正文，右侧合规条目、证据和问题队列。
-
-核心交互原则：
-
-1. 用户先确认目录，再逐章生成。
-2. 每章可独立重试，不影响其他章节。
-3. 所有 block 可定位到矩阵项和证据。
-4. 未解决 blocker 时不能导出正式版本。
-
-## 11. 接口建议
-
-```text
-POST /projects/{project_id}/draft/global-context-pack/preview
-POST /projects/{project_id}/draft/outline-plan
-PATCH /draft-outline-plans/{outline_plan_id}
-POST /draft-outline-plans/{outline_plan_id}/confirm
-POST /draft-outline-plans/{outline_plan_id}/sections/{section_id}/context-pack
-POST /section-context-packs/{section_context_pack_id}/generate
-GET /drafts/{draft_id}/review
-POST /drafts/{draft_id}/coverage-review
-POST /drafts/{draft_id}/export-word
-```
-
-## 12. 数据对象建议
-
-1. `template_profiles`
-2. `draft_global_context_packs`
-3. `draft_outline_plans`
-4. `draft_section_context_packs`
-5. `draft_sections`
-6. `draft_blocks`
-7. `draft_block_links`
-8. `draft_coverage_reviews`
-9. `draft_review_actions`
-
-## 13. 异常收敛
-
-| 场景 | 处理方式 |
-| --- | --- |
-| 招标文件无明确格式 | 使用默认商务/资格 TemplateProfile |
-| 未生成资格预评估结论 | 允许预览 ContextPack，但不允许确认 ContextPack |
-| 参标建议未人工确认 | 阻塞 ContextPack 确认和草稿生成，回到资格预评估确认 |
-| 参标建议为 Conditional Go | ContextPack 标记 warn，章节上下文保留缺材料/待复核事项 |
-| 参标建议为 No-Go | ContextPack 标记 block，只有填写风险接受说明后才能生成内部草稿 |
-| 目录计划缺少强制项 | 阻塞确认，提示补充章节映射 |
-| 章节上下文无证据 | 生成占位或待补说明，不生成确定性段落 |
-| SectionContextPack 超长 | 章节内再按条目组拆分生成 |
-| 模型输出不符合 schema | 重试一次，仍失败则进入人工处理 |
-| 事实冲突 | 标记 block，不允许审阅通过 |
-| 章节生成失败 | 章节级失败，不影响其他章节 |
-| DraftBlock 未人工通过 | 提交前核验标记 block，正式导出前必须逐 block 审阅通过 |
-| Word 导出前仍有 blocker | 只允许导出内部草稿，并记录风险接受说明 |
-
-## 14. 验收标准
-
-1. 系统能从项目、矩阵、证据和模板生成 GlobalContextPack。
-2. 系统能生成并校验 OutlinePlan。
-3. 用户能预览和确认目录计划。
+1. 系统能从项目、矩阵、证据和资格结论生成 GlobalContextPack。
+2. 系统能展示 readiness pass/warn/block 和处理动作。
+3. 系统能生成 OutlinePlan。
 4. 系统能按章节生成 SectionContextPack。
-5. LLM 能按 SectionContextPack 输出结构化 DraftBlock。
-6. 每个 DraftBlock 都能回链合规项和证据。
-7. 章节可独立重试、独立审阅。
-8. 全文 CoverageReview 能发现未覆盖强制项、缺证据和事实冲突。
-9. Word 导出只基于审阅通过的结构化稿。
-10. 全流程写入审计日志，能复盘“哪一段文字基于哪个上下文生成”。
+5. 系统能确认 ContextPack，并 supersede 旧版本。
+6. 未确认资格结论时不能确认 ContextPack。
+7. 缺证据和缺事实不会被写成确定性事实。
+
+MVP1.3 验收：
+
+1. 系统能按 SectionContextPack 输出结构化 DraftBlock。
+2. 每个 DraftBlock 都能回链合规项和证据。
+3. 覆盖检查和事实校验能发现未收敛内容。
+4. 审阅通过后才能导出 Word。

@@ -7,10 +7,12 @@ from uuid import UUID, uuid4
 
 from alembic import command
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.db.session import SessionLocal
+from app.main import app
 from app.models import (
     BidSection,
     ComplianceEvidenceBinding,
@@ -240,6 +242,7 @@ def test_seed_mingzhu_mock_enterprise_data_creates_materials_and_binds_items() -
                 section_types=["bid_letter", "bid_commitment"],
             )
         except BusinessDraftError as exc:
+            db.rollback()
             assert "资格预评估" in str(exc)
         else:
             raise AssertionError("ContextPack confirmation should require qualification decision")
@@ -293,6 +296,49 @@ def test_seed_mingzhu_mock_enterprise_data_creates_materials_and_binds_items() -
         assert "明珠公寓模拟-履约担保及低价风险差额担保承诺" in bound_names
         assert "明珠公寓模拟-施工组织及质量安全文明施工方案" in bound_names
 
+        items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.project_id == UUID(project_id),
+                ComplianceItem.section_id == UUID(section_id),
+            )
+        ).all()
+        assert items
+        for item in items:
+            item.status = "confirmed"
+        db.commit()
+
+    client = TestClient(app)
+    decision_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/qualification-decision/generate"
+    )
+    assert decision_response.status_code == 200
+    decision = decision_response.json()
+    confirm_response = client.post(
+        (
+            f"/api/v1/projects/{project_id}/sections/{section_id}/"
+            f"qualification-decision/{decision['id']}/confirm"
+        ),
+        json={"reason": "明珠公寓模拟资料已绑定，确认进入 ContextPack"},
+    )
+    assert confirm_response.status_code == 200
+    assert confirm_response.json()["status"] == "confirmed"
+
+    context_pack_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/business-draft/context-pack",
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "section_types": ["bid_letter", "bid_commitment", "qualification_performance_summary"],
+        },
+    )
+    assert context_pack_response.status_code == 200
+    context_pack = context_pack_response.json()
+    assert context_pack["status"] == "confirmed"
+    assert context_pack["section_context_packs"]
+    assert context_pack["context_json"]["qualification_decision"]["status"] == "confirmed"
+    assert context_pack["context_json"]["matrix_summary"]["missing_evidence"] == 0
+    assert len(context_pack["context_json"]["bound_evidence"]) == 6
+
+    with SessionLocal() as db:
         project = db.get(Project, UUID(project_id))
         section = db.get(BidSection, UUID(section_id))
         assert project is not None

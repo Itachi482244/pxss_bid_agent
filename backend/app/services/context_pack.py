@@ -35,6 +35,7 @@ from app.services.evidence_policy import (
     enterprise_evidence_not_required_reason,
     requires_enterprise_evidence,
 )
+from app.services.material_identity import material_snapshot_identity_key
 from app.services.template_profile import (
     get_template_profile,
     iter_profile_sections,
@@ -86,6 +87,28 @@ def _binding_snapshot(binding: ComplianceEvidenceBinding) -> dict[str, Any]:
         "evidence_text": binding.evidence_text,
         "confidence_score": str(binding.confidence_score) if binding.confidence_score is not None else None,
     }
+
+
+def _deduplicated_binding_snapshots(
+    bindings_by_item: dict[uuid.UUID, list[ComplianceEvidenceBinding]],
+) -> list[dict[str, Any]]:
+    snapshots_by_material: dict[str, dict[str, Any]] = {}
+    for bindings in bindings_by_item.values():
+        for binding in bindings:
+            material_key = material_snapshot_identity_key(binding.material_snapshot)
+            existing = snapshots_by_material.get(material_key)
+            if existing is None:
+                existing = _binding_snapshot(binding)
+                existing["binding_ids"] = []
+                existing["compliance_item_ids"] = []
+                snapshots_by_material[material_key] = existing
+            binding_id = str(binding.id)
+            compliance_item_id = str(binding.compliance_item_id)
+            if binding_id not in existing["binding_ids"]:
+                existing["binding_ids"].append(binding_id)
+            if compliance_item_id not in existing["compliance_item_ids"]:
+                existing["compliance_item_ids"].append(compliance_item_id)
+    return list(snapshots_by_material.values())
 
 
 def _item_snapshot(
@@ -142,15 +165,23 @@ def _active_bindings(
     section_id: uuid.UUID,
 ) -> dict[uuid.UUID, list[ComplianceEvidenceBinding]]:
     bindings = db.scalars(
-        select(ComplianceEvidenceBinding).where(
+        select(ComplianceEvidenceBinding)
+        .where(
             ComplianceEvidenceBinding.tenant_id == tenant_id,
             ComplianceEvidenceBinding.project_id == project_id,
             ComplianceEvidenceBinding.section_id == section_id,
             ComplianceEvidenceBinding.status == "active",
         )
+        .order_by(ComplianceEvidenceBinding.created_at.desc())
     ).all()
     by_item: dict[uuid.UUID, list[ComplianceEvidenceBinding]] = {}
+    seen_keys_by_item: dict[uuid.UUID, set[str]] = {}
     for binding in bindings:
+        material_key = material_snapshot_identity_key(binding.material_snapshot)
+        seen_keys = seen_keys_by_item.setdefault(binding.compliance_item_id, set())
+        if material_key in seen_keys:
+            continue
+        seen_keys.add(material_key)
         by_item.setdefault(binding.compliance_item_id, []).append(binding)
     return by_item
 
@@ -627,11 +658,7 @@ def build_context_pack_preview(
         },
         "matrix_summary": _matrix_summary(items, bindings_by_item),
         "matrix_items": matrix_items,
-        "bound_evidence": [
-            _binding_snapshot(binding)
-            for bindings in bindings_by_item.values()
-            for binding in bindings
-        ],
+        "bound_evidence": _deduplicated_binding_snapshots(bindings_by_item),
         "manual_notes": [
             {
                 "compliance_item_id": str(item.id),
@@ -675,11 +702,25 @@ def _qualification_gate_codes(readiness_json: dict[str, Any]) -> set[str]:
 
 
 def _assert_context_pack_can_be_confirmed(preview: dict[str, Any]) -> None:
-    qualification_codes = _qualification_gate_codes(preview["readiness_json"])
+    readiness_json = preview["readiness_json"]
+    qualification_codes = _qualification_gate_codes(readiness_json)
     if "qualification.decision_missing" in qualification_codes:
         raise BusinessDraftError("请先运行资格预评估，生成并人工确认参标建议后再确认 ContextPack")
     if "qualification.decision_not_confirmed" in qualification_codes:
         raise BusinessDraftError("参标建议尚未人工确认，请先完成资格预评估确认")
+
+    blocking_checks = [
+        check
+        for check in readiness_json.get("checks") or []
+        if check.get("status") == "block"
+        and check.get("code") != "qualification.no_go_confirmed"
+    ]
+    if blocking_checks:
+        details = "；".join(
+            f"{check.get('summary', '存在未处理阻断项')} {check.get('action', '')}".strip()
+            for check in blocking_checks[:3]
+        )
+        raise BusinessDraftError(f"ContextPack 仍存在阻断项，暂不能确认：{details}")
 
 
 def _section_context_from_outline(
@@ -878,7 +919,7 @@ def _build_section_draft_content(section_pack: DraftSectionContextPack) -> tuple
     required_fields = section.get("required_fields") or []
     lines = [
         str(section.get("title") or section_pack.title),
-        "说明：本章由 MVP1.2 ContextPack 生成，正式投标前必须人工审阅。",
+        "说明：本章由已确认 ContextPack 生成，属于 MVP1.3 草稿能力；正式投标前必须人工审阅。",
         "",
     ]
     if section.get("generation_mode") in {"fixed_form", "structured_table", "conditional_form"}:
@@ -1115,7 +1156,7 @@ def generate_draft_from_context_pack(
             status="pending_review",
             version_no=1,
             generated_from_json={
-                "source": "mvp1.2_context_pack",
+                "source": "mvp1.3_context_pack_draft",
                 "context_pack_id": str(context_pack.id),
                 "section_context_pack_id": str(section_pack.id),
                 "profile_id": context_pack.profile_id,
@@ -1187,7 +1228,7 @@ def generate_draft_from_context_pack(
                 "block_count": len(blocks),
                 "coverage_status": coverage_review.status,
             },
-            reason="基于 MVP1.2 ContextPack 生成结构化商务/资格草稿",
+            reason="基于已确认 ContextPack 生成结构化商务/资格草稿",
             severity="warning" if coverage_review.status != "pass" else "info",
         )
     )
@@ -1341,7 +1382,7 @@ def execute_business_draft_generation_task(
     db: Session,
     task_id: uuid.UUID | str,
 ) -> dict[str, str | int]:
-    """Run an async MVP1.2 ContextPack draft generation task.
+    """Run an async ContextPack draft generation task for the MVP1.3 draft workflow.
 
     Mirrors :func:`execute_compliance_matrix_generation_task`: drives the
     ``async_tasks`` row through running -> succeeded/failed, persists a summary
