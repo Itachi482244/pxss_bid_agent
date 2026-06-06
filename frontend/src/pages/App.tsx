@@ -299,7 +299,7 @@ const preflightWorkflowTargets: Record<string, WorkflowStepKey> = {
   approvals: "approval",
   draft_exists: "chapter"
 };
-const MVP13_DRAFT_WORKFLOW_AVAILABLE = false;
+const MVP13_DRAFT_WORKFLOW_AVAILABLE = true;
 const mvp13PreflightCodes = new Set(["draft_facts", "approvals", "draft_exists"]);
 
 function isWorkflowStepKey(value: string | null | undefined): value is WorkflowStepKey {
@@ -2094,9 +2094,9 @@ export function App() {
       !contextPackHardBlockers.length
   );
   const mvp13DraftWorkflowAvailable = MVP13_DRAFT_WORKFLOW_AVAILABLE;
-  const contextPackDraftGenerationAvailable = false;
+  const contextPackDraftGenerationAvailable = MVP13_DRAFT_WORKFLOW_AVAILABLE;
   const contextPackDraftGenerationTip =
-    "MVP1.3 将基于已确认 ContextPack 生成商务/资格草稿；当前 MVP1.2 只确认 ContextPack。";
+    "基于已确认 ContextPack 生成结构化商务/资格草稿；需先确认参标建议且 ContextPack 无硬阻塞项。";
   const canGenerateContextPackDraft =
     contextPackDraftGenerationAvailable && Boolean(activeContextPack && qualificationDecisionConfirmed);
   const businessDraftGenerationActive = isAsyncTaskActive(

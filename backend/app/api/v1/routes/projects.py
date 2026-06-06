@@ -115,6 +115,7 @@ from app.services.business_draft import (
     BusinessDraftError,
     export_business_draft_word,
     generate_business_draft_chapters,
+    recompose_chapter_text_from_blocks,
     run_fact_checks,
 )
 from app.services.context_pack import (
@@ -2972,8 +2973,10 @@ def update_business_draft_block(
             chapter = db.get(BusinessDraftChapter, block.chapter_id)
             project = db.get(Project, project_id)
             if chapter is not None:
-                chapter.content_text = payload.content_text
+                db.flush()
+                chapter.content_text = recompose_chapter_text_from_blocks(db, chapter)
                 chapter.updated_by = ctx.user_id
+                chapter.edit_reason = payload.reason.strip()
                 if project is not None:
                     run_fact_checks(db, chapter=chapter, project=project, actor_user_id=ctx.user_id)
     add_matrix_audit_log(

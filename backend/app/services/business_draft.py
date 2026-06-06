@@ -251,6 +251,81 @@ def _evidence_corpus(db: Session, chapter: BusinessDraftChapter) -> str:
     return "\n".join(values)
 
 
+_PERSON_ROLE_PATTERN = re.compile(
+    r"(?:项目经理|项目负责人|技术负责人|项目总工|总监理工程师|注册建造师|建造师|造价工程师|项目总监)"
+    r"(?:拟派|拟任|为|由|是|：|:|，|,|\s)+"
+    r"([\u4e00-\u9fa5]{2,4})"
+)
+_ID_CARD_PATTERN = re.compile(r"(?<![0-9])[0-9]{17}[0-9Xx](?![0-9])")
+_BUILDER_CERT_PATTERN = re.compile(
+    r"(?:建造师|证书|执业)\s*(?:编号|证号)[：:，,为是\s]*([A-Za-z0-9]{6,32})"
+)
+_PERFORMANCE_AMOUNT_PATTERN = re.compile(
+    r"(?:合同金额|中标金额|合同额|工程造价|合同价)[：:，,\s]*(\d+(?:\.\d+)?\s*(?:万元|亿元|元))"
+)
+_PERFORMANCE_CONTRACT_PATTERN = re.compile(
+    r"(?:业绩|类似工程|类似项目|合同名称|工程名称)[：:，,\s]*《([^》]{2,60})》"
+)
+_PERSON_NAME_STOPWORDS = {"我方", "详见", "见附", "拟派", "拟任", "暂定", "待定", "无", "略"}
+
+
+def _personnel_fact_candidates(text: str) -> list[tuple[str, str]]:
+    """Detect personnel facts (project manager / certified builder names + ids).
+
+    MVP1.3 #7 requires personnel facts to be fact-checked. Names are only taken
+    when they follow an explicit role keyword + separator so we do not flag
+    arbitrary two-character phrases, and obvious filler words are dropped.
+    """
+    out: list[tuple[str, str]] = []
+    for name in _PERSON_ROLE_PATTERN.findall(text):
+        if name and name not in _PERSON_NAME_STOPWORDS:
+            out.append(("person_name", name))
+    for id_no in _ID_CARD_PATTERN.findall(text):
+        out.append(("person_name", id_no))
+    for cert_no in _BUILDER_CERT_PATTERN.findall(text):
+        out.append(("certificate_no", cert_no))
+    return out
+
+
+def _performance_fact_candidates(text: str) -> list[tuple[str, str]]:
+    """Detect performance facts (contract amounts and similar-project names).
+
+    MVP1.3 #7 requires 业绩 (track-record) facts to be fact-checked so they are
+    not fabricated. Contract amounts map to ``amount`` and contract/project names
+    to ``other`` so they verify against bound evidence like any other fact.
+    """
+    out: list[tuple[str, str]] = []
+    for amount in _PERFORMANCE_AMOUNT_PATTERN.findall(text):
+        out.append(("amount", amount.strip()))
+    for contract in _PERFORMANCE_CONTRACT_PATTERN.findall(text):
+        out.append(("other", contract.strip()))
+    return out
+
+
+def recompose_chapter_text_from_blocks(db: Session, chapter: BusinessDraftChapter) -> str:
+    """Rebuild a chapter's ``content_text`` from its current draft blocks.
+
+    With MVP1.3 per-clause blocks a single block no longer represents the whole
+    chapter, so editing one block must not overwrite the entire chapter body.
+    We concatenate the chapter's blocks in sort order; the caller persists the
+    result and re-runs fact checks on the recomposed text.
+    """
+    from app.models import DraftBlock
+
+    blocks = db.scalars(
+        select(DraftBlock)
+        .where(
+            DraftBlock.tenant_id == chapter.tenant_id,
+            DraftBlock.chapter_id == chapter.id,
+        )
+        .order_by(DraftBlock.sort_order.asc(), DraftBlock.created_at.asc())
+    ).all()
+    segments = [block.content_text.strip() for block in blocks if block.content_text.strip()]
+    if not segments:
+        return chapter.content_text
+    return "\n\n".join(segments)
+
+
 def run_fact_checks(
     db: Session,
     *,
@@ -276,6 +351,8 @@ def run_fact_checks(
         candidates.append(("number", value))
     for value in sorted(set(re.findall(r"\d{4}[-年]\d{1,2}[-月]\d{1,2}日?", chapter.content_text))):
         candidates.append(("date", value))
+    candidates.extend(_personnel_fact_candidates(chapter.content_text))
+    candidates.extend(_performance_fact_candidates(chapter.content_text))
 
     seen: set[tuple[str, str]] = set()
     for fact_type, fact_text in candidates:

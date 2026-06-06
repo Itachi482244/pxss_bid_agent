@@ -976,6 +976,44 @@ def _build_section_draft_content(section_pack: DraftSectionContextPack) -> tuple
     return "\n".join(lines).strip(), refs
 
 
+def _section_level_links(section_pack: DraftSectionContextPack) -> dict[str, Any]:
+    """Structural identifiers shared by heading / field / placeholder blocks.
+
+    Structural blocks intentionally carry an empty ``compliance_item_ids`` so the
+    coverage review counts an expected matrix item as *covered* only when it owns
+    a dedicated per-clause block, never because it appeared in an aggregate list.
+    """
+    return {
+        "context_pack_id": str(section_pack.context_pack_id),
+        "section_context_pack_id": str(section_pack.id),
+        "section_type": section_pack.section_type,
+        "compliance_item_ids": [],
+        "evidence_binding_ids": [],
+        "enterprise_material_ids": [],
+        "source_chunk_ids": [],
+    }
+
+
+def _item_block_content(item: dict[str, Any]) -> str:
+    evidence = item.get("bound_evidence") or []
+    suggestion = (
+        item.get("response_suggestion")
+        or "我方将按该条款要求响应，具体事实以已绑定证据和人工确认结果为准。"
+    )
+    if item.get("enterprise_evidence_required") and not evidence:
+        suggestion = f"{suggestion} [请人工补充证据]"
+    lines = [
+        f"招标要求：{item.get('requirement_text')}",
+        f"响应草稿：{suggestion}",
+    ]
+    if evidence:
+        material_names = [str(ref.get("material_name") or "企业资料") for ref in evidence]
+        lines.append(f"已绑定证据：{'；'.join(material_names)}。")
+    else:
+        lines.append("已绑定证据：无。")
+    return "\n".join(lines)
+
+
 def _add_draft_blocks(
     db: Session,
     *,
@@ -985,75 +1023,129 @@ def _add_draft_blocks(
     chapter: BusinessDraftChapter,
     section_pack: DraftSectionContextPack,
 ) -> list[DraftBlock]:
+    """Emit per-clause structured blocks with per-block backlinks (MVP1.3 #4/#5).
+
+    One ``heading`` block per chapter, one field-fill ``table`` (or external
+    ``placeholder``) block when the section is form-like, and then one
+    ``paragraph`` block per matrix item. Every clause block links back only to
+    its own matrix item, source chunk and bound evidence so the review view can
+    locate a single clause and the coverage review can reason per item.
+    """
     context_json = section_pack.context_json
+    section = context_json.get("section") or {}
+    generation_mode = section.get("generation_mode") or section_pack.generation_mode
     matrix_items = context_json.get("matrix_items") or []
     missing_facts = context_json.get("missing_facts") or []
-    evidence_refs = [
-        evidence
-        for item in matrix_items
-        for evidence in item.get("bound_evidence") or []
-    ]
-    links = {
-        "context_pack_id": str(section_pack.context_pack_id),
-        "section_context_pack_id": str(section_pack.id),
-        "section_type": section_pack.section_type,
-        "compliance_item_ids": [item.get("compliance_item_id") for item in matrix_items],
-        "evidence_binding_ids": [evidence.get("binding_id") for evidence in evidence_refs],
-        "enterprise_material_ids": [evidence.get("enterprise_material_id") for evidence in evidence_refs],
-        "source_chunk_ids": [
-            item.get("source_chunk_id")
-            for item in matrix_items
-            if item.get("source_chunk_id")
-        ],
-    }
-    review_status = "covered"
-    if any(item.get("compliance_item_id") for item in missing_facts):
-        review_status = "needs_evidence"
-    elif missing_facts:
-        review_status = "needs_fact"
+    required_fields = section.get("required_fields") or []
+    project_facts = context_json.get("project_facts") or {}
+    field_missing = [fact for fact in missing_facts if fact.get("field")]
 
-    blocks = [
-        DraftBlock(
+    blocks: list[DraftBlock] = []
+    sort_order = 0
+
+    def add_block(**kwargs: Any) -> None:
+        nonlocal sort_order
+        sort_order += 1
+        block = DraftBlock(
             tenant_id=tenant_id,
             project_id=project_id,
             section_id=section_id,
             chapter_id=chapter.id,
             section_context_pack_id=section_pack.id,
-            block_type="heading",
-            content_text=chapter.title,
-            sort_order=1,
-            links_json=links,
+            sort_order=sort_order,
+            **kwargs,
+        )
+        db.add(block)
+        blocks.append(block)
+
+    add_block(
+        block_type="heading",
+        content_text=chapter.title,
+        links_json=_section_level_links(section_pack),
+        fact_claims_json=[],
+        missing_fact_placeholders_json=[],
+        risk_flags_json=[],
+        review_status="covered",
+    )
+
+    if generation_mode in {"fixed_form", "structured_table", "conditional_form"} and required_fields:
+        field_lines = [
+            f"- {field_name}：{project_facts.get(field_name) or f'[请人工补充：{field_name}]'}"
+            for field_name in required_fields
+        ]
+        add_block(
+            block_type="table",
+            content_text="\n".join(["字段填充草稿："] + field_lines),
+            links_json=_section_level_links(section_pack),
+            fact_claims_json=[],
+            missing_fact_placeholders_json=field_missing,
+            risk_flags_json=[],
+            review_status="needs_fact" if field_missing else "covered",
+        )
+    elif generation_mode == "external_attachment":
+        add_block(
+            block_type="placeholder",
+            content_text="[请人工绑定或确认外部报价/附件文件] 系统不自动编造清单、报价和附件内容。",
+            links_json=_section_level_links(section_pack),
             fact_claims_json=[],
             missing_fact_placeholders_json=[],
             risk_flags_json=[],
-            review_status="covered",
-        ),
-        DraftBlock(
-            tenant_id=tenant_id,
-            project_id=project_id,
-            section_id=section_id,
-            chapter_id=chapter.id,
-            section_context_pack_id=section_pack.id,
-            block_type="paragraph",
-            content_text=chapter.content_text,
-            sort_order=2,
-            links_json=links,
-            fact_claims_json=[],
-            missing_fact_placeholders_json=missing_facts,
-            risk_flags_json=[
+            review_status="needs_evidence",
+        )
+
+    for item in matrix_items:
+        item_id = item.get("compliance_item_id")
+        evidence = item.get("bound_evidence") or []
+        evidence_required = bool(item.get("enterprise_evidence_required"))
+        item_links = {
+            "context_pack_id": str(section_pack.context_pack_id),
+            "section_context_pack_id": str(section_pack.id),
+            "section_type": section_pack.section_type,
+            "compliance_item_ids": [item_id] if item_id else [],
+            "evidence_binding_ids": [
+                ref.get("binding_id") for ref in evidence if ref.get("binding_id")
+            ],
+            "enterprise_material_ids": [
+                ref.get("enterprise_material_id")
+                for ref in evidence
+                if ref.get("enterprise_material_id")
+            ],
+            "source_chunk_ids": [item.get("source_chunk_id")] if item.get("source_chunk_id") else [],
+        }
+        item_missing = [
+            fact for fact in missing_facts if fact.get("compliance_item_id") == item_id
+        ]
+        risk_flags = (
+            [
                 {
-                    "compliance_item_id": item.get("compliance_item_id"),
+                    "compliance_item_id": item_id,
                     "risk_level": item.get("risk_level"),
                     "status": item.get("status"),
                 }
-                for item in matrix_items
-                if item.get("risk_level") == "high" or item.get("status") != "confirmed"
+            ]
+            if item.get("risk_level") == "high" or item.get("status") != "confirmed"
+            else []
+        )
+        if evidence_required and not evidence:
+            review_status = "needs_evidence"
+        else:
+            review_status = "covered"
+        add_block(
+            block_type="paragraph",
+            content_text=_item_block_content(item),
+            links_json=item_links,
+            fact_claims_json=[
+                {
+                    "claim_type": "response_suggestion",
+                    "compliance_item_id": item_id,
+                    "text": item.get("response_suggestion"),
+                }
             ],
+            missing_fact_placeholders_json=item_missing,
+            risk_flags_json=risk_flags,
             review_status=review_status,
-        ),
-    ]
-    for block in blocks:
-        db.add(block)
+        )
+
     return blocks
 
 
