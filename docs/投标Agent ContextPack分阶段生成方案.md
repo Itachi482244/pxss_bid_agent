@@ -23,7 +23,7 @@ Project + BidSection + Matrix + Evidence + QualificationDecision
 
 1. MVP1.2 做到 `GlobalContextPack`、`OutlinePlan` 和 `SectionContextPack` 可预览、可确认、可审计。
 2. MVP1.3 从已确认的 `SectionContextPack` 开始生成 `DraftBlock`，再做覆盖检查、事实校验、审阅和导出。
-3. MVP1.4 的 RAG/Embedding/Rerank 只增强候选证据来源，不直接绕过人工绑定。
+3. MVP1.5 的 RAG/Embedding/Rerank 只增强候选证据来源，不直接绕过人工绑定。
 
 ## 2. 为什么要分阶段
 
@@ -45,7 +45,7 @@ MVP1.2 不做：
 4. 不接真实 RAG、Embedding 或 Rerank。
 5. 不让模型自动补齐证据或自动判断企业资质真实性。
 
-MVP1.3 才开始做正文草稿生成；MVP1.4 才开始做 RAG 证据推荐。
+MVP1.3 才开始做正文草稿生成；MVP1.5 才开始做 RAG 证据推荐。
 
 ## 4. TemplateProfile 的角色
 

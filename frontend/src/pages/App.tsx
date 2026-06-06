@@ -1,5 +1,6 @@
 import {
   AuditOutlined,
+  BarChartOutlined,
   BellOutlined,
   CheckCircleOutlined,
   BranchesOutlined,
@@ -38,12 +39,15 @@ import {
   Input,
   Layout,
   Modal,
+  notification,
   Pagination,
   Popover,
   Progress,
+  Segmented,
   Select,
   Space,
   Spin,
+  Statistic,
   Switch,
   Table,
   Tabs,
@@ -180,6 +184,7 @@ import type {
 } from "../api/bid";
 import { ContextPackPreviewDrawer } from "../components/ContextPackPreviewDrawer";
 import { OutlineEditorModal, type OutlineSeedChapter } from "../components/OutlineEditorModal";
+import { plainTerm } from "../i18n/glossary";
 import {
   DirectiveEditorModal,
   type DirectiveScopeOption
@@ -507,6 +512,61 @@ const projectStatusLabels: Record<string, string> = {
   archived: "已归档"
 };
 
+type ProjectGroup = "needs_me" | "in_progress" | "done";
+
+const projectGroupLabels: Record<ProjectGroup, string> = {
+  needs_me: "待我处理",
+  in_progress: "进行中",
+  done: "已完成"
+};
+
+const projectGroupOrder: ProjectGroup[] = ["needs_me", "in_progress", "done"];
+
+// 项目分组（互斥取一）：终态归"已完成"，需要人工动作归"待我处理"，其余归"进行中"。
+function classifyProjectGroup(project: ProjectSummary): ProjectGroup {
+  if (project.status === "exported" || project.status === "archived") return "done";
+  if (
+    project.status === "pending_confirm" ||
+    project.status === "need_materials" ||
+    project.pending_confirm_count > 0
+  ) {
+    return "needs_me";
+  }
+  return "in_progress";
+}
+
+type ProjectNextStep = { text: string; tab?: string; actionable: boolean };
+
+// MVP1.4 决策：不改后端，"下一步"从 ProjectSummary 既有字段前端推导。
+function deriveProjectNextStep(project: ProjectSummary): ProjectNextStep {
+  switch (project.status) {
+    case "pending_files":
+      return { text: "上传招标文件", tab: "documents", actionable: true };
+    case "parsing":
+      return { text: "解析中，请稍候", actionable: false };
+    case "exported":
+      return { text: "已导出，可归档", actionable: false };
+    case "archived":
+      return { text: "已归档", actionable: false };
+    default:
+      break;
+  }
+  if (project.status === "pending_confirm" || project.pending_confirm_count > 0) {
+    return { text: `确认合规清单项（${project.pending_confirm_count}）`, tab: "matrix", actionable: true };
+  }
+  if (project.status === "need_materials") {
+    return { text: "补充缺失证据", tab: "evidence", actionable: true };
+  }
+  if (project.status === "confirmed") {
+    if (project.high_risk_count > 0) return { text: "复核高风险项", tab: "matrix", actionable: true };
+    return { text: "生成 / 审阅草稿", tab: "chapter", actionable: true };
+  }
+  if (project.status === "draft") {
+    return { text: "完善项目信息", tab: "matrix", actionable: true };
+  }
+  return { text: "查看项目", tab: "matrix", actionable: true };
+}
+
 const asyncTaskStatusLabels: Record<string, string> = {
   pending: "排队中",
   running: "处理中",
@@ -629,7 +689,7 @@ const draftBlockStatusLabels: Record<string, string> = {
   covered: "已覆盖",
   needs_evidence: "缺证据",
   needs_fact: "待补事实",
-  needs_confirm: "待确认强制措辞",
+  needs_confirm: plainTerm("needs_confirm"),
   approved: "已通过",
   rejected: "已退回"
 };
@@ -643,6 +703,29 @@ const draftBlockStatusColors: Record<string, string> = {
   approved: "green",
   rejected: "red"
 };
+
+// P1：草稿块状态过滤（标签为白话；value 仍映射后端 review_status，不改语义）
+type DraftBlockFilter = "all" | "needs_confirm" | "needs_evidence" | "pending";
+
+const draftBlockFilterLabels: Record<DraftBlockFilter, string> = {
+  all: "全部",
+  needs_confirm: plainTerm("needs_confirm"),
+  needs_evidence: "待补证",
+  pending: "待覆盖"
+};
+
+// "待覆盖"=尚未人工通过且非上述两类的块（待审阅/缺事实/已覆盖待确认等）
+function matchesDraftBlockFilter(block: DraftBlock, filter: DraftBlockFilter): boolean {
+  if (filter === "all") return true;
+  if (filter === "needs_confirm") return block.review_status === "needs_confirm";
+  if (filter === "needs_evidence") return block.review_status === "needs_evidence";
+  // pending / 待覆盖：尚未通过，且不属于待确认/待补证
+  return (
+    block.review_status !== "approved" &&
+    block.review_status !== "needs_confirm" &&
+    block.review_status !== "needs_evidence"
+  );
+}
 
 const approvalTaskTypeLabels: Record<string, string> = {
   qualification_decision: "资格确认",
@@ -806,6 +889,23 @@ function asyncTaskProgress(task: AsyncTask | null, taskId: string | null) {
   if (task.status === "pending") return Math.max(progress, 8);
   if (isAsyncTaskActive(task, taskId)) return Math.min(progress || 8, 99);
   return progress;
+}
+
+// P1：异步任务"预计剩余时间"——按已用时与进度线性外推；进度过低时不臆测，返回阶段说明语义。
+function asyncTaskEtaText(task: AsyncTask | null, taskId: string | null) {
+  if (!taskId || !task) return "";
+  if (isAsyncTaskTerminalStatus(task.status)) return "";
+  const startedAt = dayjs(task.created_at);
+  if (!startedAt.isValid()) return "";
+  const elapsedMs = dayjs().diff(startedAt);
+  const progress = Math.max(0, Math.min(100, Math.round(task.progress || 0)));
+  if (progress < 5 || elapsedMs < 3000) return "正在排队/启动";
+  const totalMs = (elapsedMs / progress) * 100;
+  const remainMs = Math.max(0, totalMs - elapsedMs);
+  const remainSec = Math.round(remainMs / 1000);
+  if (remainSec <= 0) return "即将完成";
+  if (remainSec < 60) return `预计还需约 ${remainSec} 秒`;
+  return `预计还需约 ${Math.ceil(remainSec / 60)} 分钟`;
 }
 
 function formatDateTime(value: string | null) {
@@ -1054,8 +1154,8 @@ function auditActionText(log: AuditLog) {
     "qualification.decision_generated": "生成参标建议",
     "qualification.decision_confirmed": "确认参标建议",
     "business_draft.generated": "生成商务标草稿",
-    "business_draft.context_pack_created": "生成 ContextPack",
-    "business_draft.context_pack_generated": "按 ContextPack 生成草稿",
+    "business_draft.context_pack_created": "生成投标素材包",
+    "business_draft.context_pack_generated": "按投标素材包生成草稿",
     "business_draft.block_updated": "更新草稿 block",
     "business_draft.chapter_updated": "修改商务标草稿",
     "business_draft.fact_checked": "执行事实校验",
@@ -1120,7 +1220,7 @@ function scrollElementIntoContainer(target: HTMLElement, container: HTMLElement)
 export function App() {
   const [assistantCollapsed, setAssistantCollapsed] = useState(true);
   const [projectNavCollapsed, setProjectNavCollapsed] = useState(true);
-  const [viewMode, setViewMode] = useState<"home" | "workspace" | "enterprise" | "settings">("home");
+  const [viewMode, setViewMode] = useState<"home" | "workspace" | "enterprise" | "settings" | "dashboard">("home");
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const [selectedSectionId, setSelectedSectionId] = useState<string>();
   const [selectedTreeKey, setSelectedTreeKey] = useState("");
@@ -1208,6 +1308,9 @@ export function App() {
 
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProjectRowKeys, setSelectedProjectRowKeys] = useState<Key[]>([]);
+  const [homeProjectGroup, setHomeProjectGroup] = useState<ProjectGroup>("needs_me");
+  const [homeProjectSearch, setHomeProjectSearch] = useState("");
+  const [homeProjectPage, setHomeProjectPage] = useState(1);
   const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
   const [sections, setSections] = useState<SectionSummary[]>([]);
   const [documents, setDocuments] = useState<ProjectDocument[]>([]);
@@ -1228,6 +1331,12 @@ export function App() {
   const [editedDirectives, setEditedDirectives] = useState<AuthorDirectiveInput[] | null>(null);
   const [draftBlocks, setDraftBlocks] = useState<DraftBlock[]>([]);
   const [activeDraftBlockId, setActiveDraftBlockId] = useState("");
+  // P1：草稿块审阅效率——状态过滤、已查看标记（受保护批量确认依据）、降噪展开
+  const [draftBlockFilter, setDraftBlockFilter] = useState<DraftBlockFilter>("all");
+  const [viewedDraftBlockIds, setViewedDraftBlockIds] = useState<Set<string>>(new Set());
+  const [expandedDraftBlockIds, setExpandedDraftBlockIds] = useState<Set<string>>(new Set());
+  const [mandatoryReviewOpen, setMandatoryReviewOpen] = useState(false);
+  const [mandatoryReviewIndex, setMandatoryReviewIndex] = useState(0);
   const [coverageReview, setCoverageReview] = useState<DraftCoverageReview | null>(null);
   const [selectedDraftChapterId, setSelectedDraftChapterId] = useState("");
   const [draftEditorValue, setDraftEditorValue] = useState("");
@@ -1760,6 +1869,26 @@ export function App() {
         .sort((a, b) => a.sort_order - b.sort_order),
     [draftBlocks, selectedDraftChapterId]
   );
+  // P1：按状态过滤后的可见块 + 各过滤项计数（用于过滤条角标）
+  const visibleChapterBlocks = useMemo(
+    () => selectedChapterBlocks.filter((block) => matchesDraftBlockFilter(block, draftBlockFilter)),
+    [selectedChapterBlocks, draftBlockFilter]
+  );
+  const draftBlockFilterCounts = useMemo(() => {
+    const counts: Record<DraftBlockFilter, number> = { all: 0, needs_confirm: 0, needs_evidence: 0, pending: 0 };
+    for (const block of selectedChapterBlocks) {
+      counts.all += 1;
+      if (matchesDraftBlockFilter(block, "needs_confirm")) counts.needs_confirm += 1;
+      if (matchesDraftBlockFilter(block, "needs_evidence")) counts.needs_evidence += 1;
+      if (matchesDraftBlockFilter(block, "pending")) counts.pending += 1;
+    }
+    return counts;
+  }, [selectedChapterBlocks]);
+  // P1：本章"必须原样写入的内容"（needs_confirm）逐条查看流的队列
+  const chapterMandatoryBlocks = useMemo(
+    () => selectedChapterBlocks.filter((block) => block.review_status === "needs_confirm"),
+    [selectedChapterBlocks]
+  );
   const selectedDraftDiff = useMemo(() => {
     if (!selectedDraftChapterId) return null;
     const blockIds = new Set(selectedChapterBlocks.map((block) => block.id));
@@ -2077,18 +2206,18 @@ export function App() {
       : qualificationDecisionIsNoGo
         ? {
             status: "block",
-            message: "已确认 No-Go；ContextPack 只能作为风险快照。",
+            message: "已确认不建议参标；投标素材包只能作为风险快照。",
             action: "查看资格结论"
           }
         : qualificationDecision?.recommendation === "conditional_go"
           ? {
               status: "warn",
-              message: "有条件 Go，确认 ContextPack 前请复核待补事项。",
+              message: "有条件 Go，确认投标素材包前请复核待补事项。",
               action: "查看资格结论"
             }
           : {
               status: "pass",
-              message: "资格结论已确认，可确认 ContextPack。",
+              message: "资格结论已确认，可确认投标素材包。",
               action: "查看资格结论"
             };
   const contextPackHardBlockers = contextPackPreviewChecks.filter(
@@ -2099,7 +2228,7 @@ export function App() {
   const contextPackConfirmDisabledReason = !qualificationDecisionConfirmed
     ? contextPackQualificationGate.message
     : !contextPackPreview
-      ? "请先预览并核对完整 ContextPack。"
+      ? "请先预览并核对完整投标素材包。"
       : contextPackHardBlockers.length
         ? "仍有硬阻断项，请按预览中的处理入口完成后重新预览。"
         : "";
@@ -2113,7 +2242,7 @@ export function App() {
   const mvp13DraftWorkflowAvailable = MVP13_DRAFT_WORKFLOW_AVAILABLE;
   const contextPackDraftGenerationAvailable = MVP13_DRAFT_WORKFLOW_AVAILABLE;
   const contextPackDraftGenerationTip =
-    "基于已确认 ContextPack 生成结构化商务/资格草稿；需先确认参标建议且 ContextPack 无硬阻塞项。";
+    "基于已确认投标素材包生成结构化商务/资格草稿；需先确认参标建议且投标素材包无硬阻塞项。";
   const canGenerateContextPackDraft =
     contextPackDraftGenerationAvailable && Boolean(activeContextPack && qualificationDecisionConfirmed);
   const businessDraftGenerationActive = isAsyncTaskActive(
@@ -2473,7 +2602,7 @@ export function App() {
       {
         key: "qualification",
         title: "资格预评估",
-        description: "基于矩阵和企业画像生成 Go/No-Go 建议。",
+        description: "基于合规清单和企业画像生成参标建议。",
         status: hasDecision
           ? qualificationDecisionNeedsConfirmation
             ? "todo"
@@ -2507,21 +2636,21 @@ export function App() {
 	      },
       {
         key: "chapter",
-        title: "ContextPack",
-        description: "生成和确认商务/资格草稿上下文包，作为 MVP1.3 草稿生成输入。",
+        title: "投标素材包",
+        description: "生成和确认商务/资格草稿的投标素材包，作为草稿生成输入。",
         status: contextPackStatus,
         statusText: activeContextPack
           ? preflightLabel(activeContextPack.readiness_status)
           : contextPackPreview
             ? "已预览"
             : "未生成",
-        actionText: activeContextPack ? "查看 ContextPack" : "生成/确认 ContextPack",
+        actionText: activeContextPack ? "查看投标素材包" : "生成/确认投标素材包",
 	        reason: activeContextPack
-	          ? "ContextPack 已生成；MVP1.2 到这里收口，草稿生成、事实校验和导出顺延到 MVP1.3。"
+	          ? "投标素材包已生成；MVP1.2 到这里收口，草稿生成、事实校验和导出顺延到 MVP1.3。"
             : qualificationDecisionConfirmed && qualificationDecisionIsNoGo
-              ? "参标建议为 No-Go；如仍需构建上下文包，需要先记录风险接受说明。"
+              ? "参标建议为不建议参标；如仍需构建投标素材包，需要先记录风险接受说明。"
 		          : qualificationDecisionConfirmed
-		            ? "参标建议已确认，可以预览并确认 ContextPack。"
+		            ? "参标建议已确认，可以预览并确认投标素材包。"
 		            : qualificationDecisionNeedsConfirmation
 	                ? "参标建议还未人工确认，请先回到资格预评估确认结论。"
 	                : "需要先完成资格预评估。",
@@ -2537,11 +2666,11 @@ export function App() {
       {
         key: "approval",
         title: "草稿导出（MVP1.3）",
-        description: "基于已确认 ContextPack 生成草稿、校验事实并导出 Word。",
+        description: "基于已确认投标素材包生成草稿、校验事实并导出 Word。",
         status: "not_started",
         statusText: "MVP1.3",
         actionText: "MVP1.3 预留",
-	        reason: "草稿生成、事实校验、审批导出统一放到 MVP1.3；MVP1.2 只确认 ContextPack。",
+	        reason: "草稿生成、事实校验、审批导出统一放到 MVP1.3；MVP1.2 只确认投标素材包。",
 	        disabled: !canOpenApproval,
 	        disabledReason: canOpenApproval ? null : "草稿生成、事实校验和导出将在 MVP1.3 开放。"
       }
@@ -2698,7 +2827,7 @@ export function App() {
         technicalRows.some((row) => !isMatrixItemResolved(row)) ? "technical" : "qualification",
         ["technical", "qualification"]
       ),
-      group("draft", "上下文包", "chapter", ["chapter"])
+      group("draft", "投标素材包", "chapter", ["chapter"])
     ];
   }, [importProcessingOpenTask, knownMatrixCount, technicalRows, workflowSteps]);
 
@@ -2734,6 +2863,70 @@ export function App() {
       }));
     return [...matrixTodos, ...fileTodos].slice(0, 5);
   }, [currentProject?.bid_deadline_at, currentProject?.name, currentSection?.bid_deadline_at, matrixRows, sections]);
+
+  const HOME_PROJECT_PAGE_SIZE = 8;
+
+  const projectGroupCounts = useMemo(() => {
+    const counts: Record<ProjectGroup, number> = { needs_me: 0, in_progress: 0, done: 0 };
+    projects.forEach((project) => {
+      counts[classifyProjectGroup(project)] += 1;
+    });
+    return counts;
+  }, [projects]);
+
+  const filteredHomeProjects = useMemo(() => {
+    const keyword = homeProjectSearch.trim().toLowerCase();
+    return projects.filter((project) => {
+      if (classifyProjectGroup(project) !== homeProjectGroup) return false;
+      if (!keyword) return true;
+      const haystack = [project.name, project.purchaser, project.agency]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(keyword);
+    });
+  }, [projects, homeProjectGroup, homeProjectSearch]);
+
+  useEffect(() => {
+    setHomeProjectPage(1);
+  }, [homeProjectGroup, homeProjectSearch]);
+
+  // P1-6：管理层宏观看板——纯前端聚合现有项目数据（不改后端）；缺数据源指标明确标注"暂无数据"。
+  const dashboardStats = useMemo(() => {
+    const statusDistribution = new Map<string, number>();
+    let pendingConfirmTotal = 0;
+    let highRiskTotal = 0;
+    let dueSoonCount = 0;
+    let budgetTotal = 0;
+    const groupCounts: Record<ProjectGroup, number> = { needs_me: 0, in_progress: 0, done: 0 };
+    for (const project of projects) {
+      statusDistribution.set(project.status, (statusDistribution.get(project.status) ?? 0) + 1);
+      groupCounts[classifyProjectGroup(project)] += 1;
+      pendingConfirmTotal += project.pending_confirm_count ?? 0;
+      highRiskTotal += project.high_risk_count ?? 0;
+      if (
+        project.bid_deadline_at &&
+        classifyProjectGroup(project) !== "done" &&
+        dayjs(project.bid_deadline_at).diff(dayjs(), "day") <= 14 &&
+        dayjs(project.bid_deadline_at).diff(dayjs(), "day") >= 0
+      ) {
+        dueSoonCount += 1;
+      }
+      const budget = Number(project.budget_amount ?? 0);
+      if (Number.isFinite(budget)) budgetTotal += budget;
+    }
+    const activeCount = groupCounts.needs_me + groupCounts.in_progress;
+    return {
+      total: projects.length,
+      activeCount,
+      groupCounts,
+      statusDistribution: Array.from(statusDistribution.entries()).sort((a, b) => b[1] - a[1]),
+      pendingConfirmTotal,
+      highRiskTotal,
+      dueSoonCount,
+      budgetTotal
+    };
+  }, [projects]);
 
   const assistantMessages = useMemo(() => {
     const highRisk = unresolvedHighRiskRows[0];
@@ -3109,15 +3302,22 @@ export function App() {
         appendLog(
           `商务草稿生成完成：${summaryNumber(task.output_json, "chapter_count")} 章，${summaryNumber(task.output_json, "block_count")} 个 block`
         );
-        Modal.success({
-          title: "草稿已生成",
-          content: "已刷新商务标章节和结构化 block，请继续审阅待补证据和待补事实。",
-          okText: "知道了"
+        notification.success({
+          message: "草稿已生成",
+          description: `已生成 ${summaryNumber(task.output_json, "chapter_count")} 章、${summaryNumber(task.output_json, "block_count")} 个段落，请继续审阅待补证据与待补事实。`,
+          placement: "topRight",
+          duration: 6
         });
       } else {
         const message = task.error_message || "商务草稿生成任务失败";
         setApiError(message);
         appendLog(`商务草稿生成失败：${truncateText(message, 48)}`);
+        notification.error({
+          message: "草稿生成失败",
+          description: truncateText(message, 80),
+          placement: "topRight",
+          duration: 8
+        });
       }
 
       clearTimer = window.setTimeout(() => {
@@ -3898,10 +4098,10 @@ export function App() {
       setContextPackPreview(preview);
       setContextPackPreviewOpen(true);
       appendLog(
-        `预览 ContextPack：${outline.sections?.length ?? 0} 个章节计划${editedOutline ? "（已编辑目录）" : ""}${editedDirectives && editedDirectives.length ? `（${editedDirectives.length} 条指令）` : ""}`
+        `预览投标素材包：${outline.sections?.length ?? 0} 个章节计划${editedOutline ? "（已编辑目录）" : ""}${editedDirectives && editedDirectives.length ? `（${editedDirectives.length} 条指令）` : ""}`
       );
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : "ContextPack 预览失败");
+      setApiError(error instanceof Error ? error.message : "投标素材包预览失败");
     } finally {
       setLoadingContextPack(false);
     }
@@ -4022,7 +4222,7 @@ export function App() {
         setEditedDirectives(null);
         setCoverageReview(null);
         appendLog(
-          `指令已更新（轻量重建）：${directives.length} 条，复用事实快照，请重新生成草稿以应用新指令`
+          `指令已更新（快速重新生成）：${directives.length} 条，沿用已核实的事实，请重新生成草稿以应用新指令`
         );
         await reloadAuditLogs();
       } catch (error) {
@@ -4034,7 +4234,7 @@ export function App() {
     }
     // No confirmed pack yet: stage directives for the next preview/confirm.
     setEditedDirectives(directives.length ? directives : null);
-    appendLog(`已暂存生成指令：${directives.length} 条，将随预览/确认 ContextPack 应用`);
+    appendLog(`已暂存生成指令：${directives.length} 条，将随预览/确认投标素材包应用`);
   };
 
   const handleResetDirectives = () => {
@@ -4067,10 +4267,10 @@ export function App() {
       setEditedOutline(null);
       setEditedDirectives(null);
       setCoverageReview(null);
-      appendLog(`确认 ContextPack：${contextPack.section_context_packs.length} 个章节上下文`);
+      appendLog(`确认投标素材包：${contextPack.section_context_packs.length} 个章节上下文`);
       await reloadAuditLogs();
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : "ContextPack 生成失败");
+      setApiError(error instanceof Error ? error.message : "投标素材包生成失败");
     } finally {
       setLoadingContextPack(false);
     }
@@ -4080,10 +4280,10 @@ export function App() {
     if (!activeContextPack || !selectedProjectId || !selectedSectionId) return;
     const isBlocked = activeContextPack.readiness_status === "block" || qualificationDecisionIsNoGo;
     Modal.confirm({
-      title: isBlocked ? "生成内部草稿" : "按 ContextPack 生成草稿",
+      title: isBlocked ? "生成内部草稿" : "按投标素材包生成草稿",
       content: isBlocked
-        ? "当前 ContextPack 或资格结论仍存在阻塞项。本次只生成带待补占位的内部草稿，不代表可提交版本。"
-        : "将按已确认的 ContextPack 生成结构化章节和可追溯 block，生成后会执行覆盖检查。",
+        ? "当前投标素材包或资格结论仍存在阻塞项。本次只生成带待补占位的内部草稿，不代表可提交版本。"
+        : "将按已确认的投标素材包生成结构化章节和可追溯 block，生成后会执行覆盖检查。",
       okText: isBlocked ? "生成内部草稿" : "生成草稿",
       cancelText: "取消",
       onOk: async () => {
@@ -4103,7 +4303,7 @@ export function App() {
           setWorkspaceNode("chapter");
           appendLog(`商务草稿生成任务已启动：${task.id.slice(0, 8)}`);
         } catch (error) {
-          setApiError(error instanceof Error ? error.message : "ContextPack 草稿生成失败");
+          setApiError(error instanceof Error ? error.message : "投标素材包草稿生成失败");
           setLoadingBusinessDraft(false);
           throw error;
         }
@@ -4140,7 +4340,7 @@ export function App() {
         activeContextPack.id
       );
       setCoverageReview(review);
-      appendLog(`执行 ContextPack 覆盖检查：${review.status}`);
+      appendLog(`执行投标素材包覆盖检查：${review.status}`);
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "覆盖检查失败");
     } finally {
@@ -4175,6 +4375,100 @@ export function App() {
       setSavingBusinessDraft(false);
     }
   };
+
+  // P1：标记某草稿块为"已查看"——受保护批量确认的前置依据
+  const markDraftBlockViewed = useCallback((blockId: string) => {
+    setViewedDraftBlockIds((prev) => {
+      if (prev.has(blockId)) return prev;
+      const next = new Set(prev);
+      next.add(blockId);
+      return next;
+    });
+  }, []);
+
+  const toggleDraftBlockExpanded = useCallback((blockId: string) => {
+    setExpandedDraftBlockIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(blockId)) next.delete(blockId);
+      else next.add(blockId);
+      return next;
+    });
+  }, []);
+
+  // P1：受保护批量确认——仅"已查看"的待确认指定内容可确认；未查看项阻止并提示
+  const handleBatchConfirmMandatory = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    const targets = chapterMandatoryBlocks;
+    if (!targets.length) {
+      Modal.info({ title: "无待确认的指定内容", content: "本章当前没有需要确认的指定内容。" });
+      return;
+    }
+    const unviewed = targets.filter((block) => !viewedDraftBlockIds.has(block.id));
+    if (unviewed.length > 0) {
+      Modal.warning({
+        title: "存在未查看项，无法批量确认",
+        content: `还有 ${unviewed.length} 处指定内容尚未逐条查看。请先点击「逐条查看」浏览全部内容后再批量确认。`
+      });
+      appendLog(`拦截批量确认：${unviewed.length} 处指定内容未查看`);
+      return;
+    }
+    Modal.confirm({
+      title: `批量确认 ${targets.length} 处指定内容`,
+      content: "这些内容会原样写入标书。确认即表示你已逐条核对其措辞与事实无误。",
+      okText: "全部确认",
+      cancelText: "取消",
+      onOk: async () => {
+        setSavingBusinessDraft(true);
+        setApiError("");
+        try {
+          for (const block of targets) {
+            const updated = await updateBusinessDraftBlock(selectedProjectId, selectedSectionId, block.id, {
+              review_status: "approved",
+              content_text: null,
+              reason: "批量确认已逐条查看的指定内容"
+            });
+            setDraftBlocks((blocks) => blocks.map((item) => (item.id === updated.id ? updated : item)));
+          }
+          appendLog(`批量确认 ${targets.length} 处指定内容`);
+          await reloadAuditLogs();
+          notification.success({
+            message: "指定内容已确认",
+            description: `已确认 ${targets.length} 处必须原样写入的内容。`,
+            placement: "topRight"
+          });
+        } catch (error) {
+          setApiError(error instanceof Error ? error.message : "批量确认指定内容失败");
+        } finally {
+          setSavingBusinessDraft(false);
+        }
+      }
+    });
+  }, [
+    appendLog,
+    chapterMandatoryBlocks,
+    reloadAuditLogs,
+    selectedProjectId,
+    selectedSectionId,
+    viewedDraftBlockIds
+  ]);
+
+  // P1：逐条查看聚焦流入口——从第一个未查看的指定内容开始
+  const openMandatoryReview = useCallback(() => {
+    if (!chapterMandatoryBlocks.length) {
+      Modal.info({ title: "无待确认的指定内容", content: "本章当前没有需要逐条查看的指定内容。" });
+      return;
+    }
+    const firstUnviewed = chapterMandatoryBlocks.findIndex((block) => !viewedDraftBlockIds.has(block.id));
+    setMandatoryReviewIndex(firstUnviewed >= 0 ? firstUnviewed : 0);
+    setMandatoryReviewOpen(true);
+  }, [chapterMandatoryBlocks, viewedDraftBlockIds]);
+
+  // P1：逐条查看流打开/翻页时，把当前展示的指定内容标记为"已查看"
+  useEffect(() => {
+    if (!mandatoryReviewOpen) return;
+    const block = chapterMandatoryBlocks[mandatoryReviewIndex];
+    if (block) markDraftBlockViewed(block.id);
+  }, [mandatoryReviewOpen, mandatoryReviewIndex, chapterMandatoryBlocks, markDraftBlockViewed]);
 
   const openEditDraftBlock = (block: DraftBlock) => {
     let contentText = block.content_text;
@@ -4450,7 +4744,7 @@ export function App() {
       appendLog(`生成参标建议：${decisionLabels[decision.recommendation] ?? decision.recommendation}`);
       await Promise.all([reloadApprovalTasks(), reloadAuditLogs(), reloadQualificationEvaluations()]);
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : "Go/No-Go 参标建议生成失败");
+      setApiError(error instanceof Error ? error.message : "参标建议生成失败");
     } finally {
       setGeneratingDecision(false);
     }
@@ -4460,7 +4754,7 @@ export function App() {
     if (!qualificationDecision) return;
     let reason = "";
     Modal.confirm({
-      title: "参标建议为 No-Go，仍继续？",
+      title: "参标建议为不建议参标，仍继续？",
       content: (
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
           <Alert
@@ -4486,7 +4780,7 @@ export function App() {
           Modal.warning({ title: "需要填写风险接受说明" });
           return Promise.reject();
         }
-        appendLog(`No-Go 风险接受：${truncateText(reason.trim(), 36)}`);
+        appendLog(`不建议参标·风险接受：${truncateText(reason.trim(), 36)}`);
         onContinue();
         return undefined;
       }
@@ -4589,7 +4883,7 @@ export function App() {
 
   const handleConfirmQualificationDecision = () => {
     if (!selectedProjectId || !selectedSectionId || !qualificationDecision) return;
-    let reason = "人工确认 Go/No-Go 参标建议";
+    let reason = "人工确认参标建议";
     Modal.confirm({
       title: "确认参标建议",
       content: (
@@ -4621,7 +4915,7 @@ export function App() {
         setQualificationDecision(decision);
         setContextPackPreview(null);
         setContextPackPreviewOpen(false);
-        appendLog("确认 Go/No-Go 参标建议");
+        appendLog("确认参标建议");
         await Promise.all([reloadApprovalTasks(), reloadAuditLogs()]);
       }
     });
@@ -4634,7 +4928,7 @@ export function App() {
       content: (
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
           <Text>{truncateText(evaluation.requirement_text, 64)}</Text>
-          <Text type="secondary">确认动作会写入审计日志，后续 Go/No-Go 建议会优先读取人工确认状态。</Text>
+          <Text type="secondary">确认动作会写入审计日志，后续参标建议会优先读取人工确认状态。</Text>
           <TextArea
             defaultValue={reason}
             autoSize={{ minRows: 2, maxRows: 4 }}
@@ -5774,6 +6068,13 @@ export function App() {
               企业资料库
             </Button>
             <Button
+              icon={<BarChartOutlined />}
+              type={viewMode === "dashboard" ? "primary" : "default"}
+              onClick={() => setViewMode("dashboard")}
+            >
+              管理看板
+            </Button>
+            <Button
               icon={<SettingOutlined />}
               type={viewMode === "settings" ? "primary" : "default"}
               onClick={() => setViewMode("settings")}
@@ -5826,7 +6127,7 @@ export function App() {
                 <Text type="secondary">系统设置</Text>
                 <Title level={2}>模型设置</Title>
                 <Text type="secondary">
-                  MVP1.1 先接入 Chat/LLM 配置；Embedding 与 Rerank 会在 MVP1.4 接入检索链路。
+                  MVP1.1 先接入 Chat/LLM 配置；Embedding 与 Rerank 会在 MVP1.5 接入检索链路。
                 </Text>
               </div>
               <Space wrap>
@@ -6091,7 +6392,7 @@ export function App() {
                     tokenSeparators={[",", "，", " "]}
                   />
                   <TextArea
-                    placeholder="禁投规则，每行一条；命中项目上下文时会进入 Go/No-Go 阻断"
+                    placeholder="禁投规则，每行一条；命中项目上下文时会进入参标阻断（不建议参标）"
                     value={profileDraft.forbiddenRulesText}
                     autoSize={{ minRows: 3, maxRows: 5 }}
                     onChange={(event) =>
@@ -6187,6 +6488,102 @@ export function App() {
                     }
                   ]}
                 />
+              </div>
+            </section>
+          </Content>
+        ) : viewMode === "dashboard" ? (
+          <Content className="home-page">
+            <section className="home-heading">
+              <div>
+                <Text type="secondary">管理视图</Text>
+                <Title level={2}>经营宏观看板</Title>
+                <Text type="secondary">面向负责人/管理层的整体经营信息，与一线操作视图分层。数据来自当前全部项目实时聚合。</Text>
+              </div>
+              <Space wrap>
+                <Button onClick={() => void reloadProjects()} loading={loadingProjects}>
+                  刷新
+                </Button>
+                <Button type="primary" onClick={() => setViewMode("home")}>
+                  返回工作总览
+                </Button>
+              </Space>
+            </section>
+
+            <section className="home-metrics">
+              <div className="home-metric">
+                <Text type="secondary">项目总数</Text>
+                <strong>{dashboardStats.total}</strong>
+                <span>在投 {dashboardStats.activeCount} · 已完成 {dashboardStats.groupCounts.done}</span>
+              </div>
+              <div className="home-metric urgent">
+                <Text type="secondary">待办积压</Text>
+                <strong>{dashboardStats.pendingConfirmTotal}</strong>
+                <span>待确认合规项 · 高风险 {dashboardStats.highRiskTotal} 项</span>
+              </div>
+              <div className="home-metric">
+                <Text type="secondary">14 天内截止</Text>
+                <strong>{dashboardStats.dueSoonCount}</strong>
+                <span>需优先推进的在投项目</span>
+              </div>
+              <div className="home-metric">
+                <Text type="secondary">预算合计</Text>
+                <strong>{dashboardStats.budgetTotal > 0 ? `${(dashboardStats.budgetTotal / 10000).toFixed(1)} 万` : "暂无数据"}</strong>
+                <span>按项目预算金额汇总</span>
+              </div>
+            </section>
+
+            <section className="home-grid">
+              <div className="home-panel wide">
+                <div className="panel-title-row">
+                  <div>
+                    <Text strong>项目状态分布</Text>
+                    <p>在投/待办/已完成与细分状态构成</p>
+                  </div>
+                </div>
+                <Space size={32} wrap style={{ marginBottom: 16 }}>
+                  <Statistic title={projectGroupLabels.needs_me} value={dashboardStats.groupCounts.needs_me} />
+                  <Statistic title={projectGroupLabels.in_progress} value={dashboardStats.groupCounts.in_progress} />
+                  <Statistic title={projectGroupLabels.done} value={dashboardStats.groupCounts.done} />
+                </Space>
+                {dashboardStats.statusDistribution.length > 0 ? (
+                  <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                    {dashboardStats.statusDistribution.map(([status, count]) => {
+                      const pct = dashboardStats.total > 0 ? Math.round((count / dashboardStats.total) * 100) : 0;
+                      return (
+                        <div key={`dash-status-${status}`}>
+                          <Space style={{ justifyContent: "space-between", width: "100%" }}>
+                            <Text>{projectStatusLabels[status] ?? status}</Text>
+                            <Text type="secondary">{count} 个 · {pct}%</Text>
+                          </Space>
+                          <Progress percent={pct} size="small" showInfo={false} />
+                        </div>
+                      );
+                    })}
+                  </Space>
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无项目" />
+                )}
+              </div>
+
+              <div className="home-panel">
+                <div className="panel-title-row">
+                  <div>
+                    <Text strong>结果指标</Text>
+                    <p>需后续录入结果数据后启用</p>
+                  </div>
+                </div>
+                <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                  <div>
+                    <Text type="secondary">参标建议分布（建议参标 / 不建议参标）</Text>
+                    <div><Tag>暂无数据</Tag></div>
+                    <Text type="secondary" style={{ fontSize: 12 }}>资格预评估结论暂未纳入项目汇总，后续接入后启用。</Text>
+                  </div>
+                  <div>
+                    <Text type="secondary">中标率 / 中标趋势</Text>
+                    <div><Tag>暂无数据</Tag></div>
+                    <Text type="secondary" style={{ fontSize: 12 }}>缺少中标结果录入入口，按需新增后显示。</Text>
+                  </div>
+                </Space>
               </div>
             </section>
           </Content>
@@ -6302,10 +6699,17 @@ export function App() {
               <div className="home-panel wide">
                 <div className="panel-title-row">
                   <div>
-                    <Text strong>近期项目</Text>
-                    <p>从项目进入标段工作台</p>
+                    <Text strong>项目</Text>
+                    <p>按状态分组定位项目，从行内“下一步”直达处理</p>
                   </div>
                   <Space wrap>
+                    <Input.Search
+                      allowClear
+                      placeholder="搜索项目名称 / 采购人"
+                      value={homeProjectSearch}
+                      onChange={(event) => setHomeProjectSearch(event.target.value)}
+                      style={{ width: 220 }}
+                    />
                     <Button
                       danger
                       icon={<DeleteOutlined />}
@@ -6317,17 +6721,43 @@ export function App() {
                     </Button>
                   </Space>
                 </div>
+                <Segmented<ProjectGroup>
+                  value={homeProjectGroup}
+                  onChange={(value) => setHomeProjectGroup(value as ProjectGroup)}
+                  options={projectGroupOrder.map((group) => ({
+                    value: group,
+                    label: `${projectGroupLabels[group]}（${projectGroupCounts[group]}）`
+                  }))}
+                  style={{ marginBottom: 12 }}
+                />
                 <Table<ProjectSummary>
                   size="middle"
                   loading={loadingProjects}
-                  pagination={false}
-                  dataSource={projects}
+                  pagination={{
+                    current: homeProjectPage,
+                    pageSize: HOME_PROJECT_PAGE_SIZE,
+                    onChange: setHomeProjectPage,
+                    showSizeChanger: false,
+                    hideOnSinglePage: true
+                  }}
+                  dataSource={filteredHomeProjects}
                   rowKey="id"
                   rowSelection={{
                     selectedRowKeys: selectedProjectRowKeys,
                     onChange: setSelectedProjectRowKeys
                   }}
-                  locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无项目" /> }}
+                  locale={{
+                    emptyText: (
+                      <Empty
+                        image={Empty.PRESENTED_IMAGE_SIMPLE}
+                        description={
+                          homeProjectSearch.trim()
+                            ? "没有匹配的项目"
+                            : `${projectGroupLabels[homeProjectGroup]}暂无项目`
+                        }
+                      />
+                    )
+                  }}
                   columns={[
                     {
                       title: "项目名称",
@@ -6358,13 +6788,33 @@ export function App() {
                     {
                       title: "状态",
                       dataIndex: "status",
-                      width: 110,
+                      width: 100,
                       render: (value) => <Tag color={statusColor(value)}>{projectStatusLabels[value] ?? value}</Tag>
+                    },
+                    {
+                      title: "下一步",
+                      dataIndex: "next_step",
+                      width: 200,
+                      render: (_: unknown, record) => {
+                        const next = deriveProjectNextStep(record);
+                        if (!next.actionable || !next.tab) {
+                          return <Text type="secondary">{next.text}</Text>;
+                        }
+                        return (
+                          <Button
+                            type="link"
+                            style={{ padding: 0, height: "auto" }}
+                            onClick={() => openProjectWorkspace(record.id, next.tab as string)}
+                          >
+                            {next.text} →
+                          </Button>
+                        );
+                      }
                     },
                     {
                       title: "风险",
                       dataIndex: "high_risk_count",
-                      width: 90,
+                      width: 80,
                       render: (value, record) => {
                         const risk = value > 0 ? "高" : record.pending_confirm_count > 0 ? "中" : "低";
                         return <Tag color={riskColor(risk)}>{risk}</Tag>;
@@ -6752,7 +7202,7 @@ export function App() {
                       <Text type="secondary">{unresolvedHighRiskRows.length ? `${unresolvedHighRiskRows.length} 条待处理` : "暂无待处理"}</Text>
                     </div>
                     <div className="metric-item approval-metric">
-                      <Text type="secondary">{mvp13DraftWorkflowAvailable ? "待审批" : "上下文包"}</Text>
+                      <Text type="secondary">{mvp13DraftWorkflowAvailable ? "待审批" : "投标素材包"}</Text>
                       <strong>
                         {mvp13DraftWorkflowAvailable
                           ? approvalTasks.filter((task) => task.status === "pending").length
@@ -6761,7 +7211,7 @@ export function App() {
                             : 0}
                       </strong>
                       <Button size="small" onClick={() => activateWorkflowStep(mvp13DraftWorkflowAvailable ? "tasks" : "chapter")}>
-                        {mvp13DraftWorkflowAvailable ? "进入任务中心" : "查看 ContextPack"}
+                        {mvp13DraftWorkflowAvailable ? "进入任务中心" : "查看投标素材包"}
                       </Button>
                     </div>
                   </section>
@@ -7531,7 +7981,7 @@ export function App() {
                                 <Alert
                                   type="error"
                                   showIcon
-                                  message="当前结论为 No-Go"
+                                  message="当前结论为不建议参标"
                                   description="如仍需生成商务草稿，请先在草稿入口填写风险接受说明；建议优先回到矩阵和证据项处理阻断。"
                                 />
                               )}
@@ -7540,7 +7990,7 @@ export function App() {
                             <Alert
                               type="info"
                               showIcon
-                              message="尚未生成 Go/No-Go 参标建议"
+                              message="尚未生成参标建议"
                               description="先运行资格预评估，再生成参标建议；系统会同时创建资格确认审批任务。"
                             />
                           )}
@@ -7599,7 +8049,7 @@ export function App() {
                             <>
                               <div>
                                 <Text strong>下一步：生成参标建议</Text>
-                                <p>评估表已有结果，继续汇总为 Go/No-Go 建议，并创建资格确认审批任务。</p>
+                                <p>评估表已有结果，继续汇总为参标建议，并创建资格确认审批任务。</p>
                               </div>
                               <Button
                                 type="primary"
@@ -8583,7 +9033,7 @@ export function App() {
                               description={
                                 mvp13DraftWorkflowAvailable
                                   ? "尚未生成草稿"
-                                  : "MVP1.2 仅确认 ContextPack；章节草稿将在 MVP1.3 生成"
+                                  : "MVP1.2 仅确认投标素材包；章节草稿将在 MVP1.3 生成"
                               }
                             />
                           )}
@@ -8592,7 +9042,7 @@ export function App() {
                           <div className="context-pack-strip">
                             <div className="context-pack-main">
                               <Space wrap>
-                                <Text strong>ContextPack</Text>
+                                <Text strong>投标素材包</Text>
                                 <Tag color={preflightColor(contextPackSource?.readiness_status ?? "warn")}>
                                   {contextPackSource ? preflightLabel(contextPackSource.readiness_status) : "未生成"}
                                 </Tag>
@@ -8641,7 +9091,7 @@ export function App() {
                                         <Tag color={preflightColor(String(check.status ?? "warn"))}>
                                           {String(check.summary ?? check.code ?? "待处理")}
                                         </Tag>
-                                        <Text type="secondary">{String(check.action ?? "按提示处理后重新确认 ContextPack。")}</Text>
+                                        <Text type="secondary">{String(check.action ?? "按提示处理后重新确认投标素材包。")}</Text>
                                         <Button size="small" onClick={() => handleContextPackCheckAction(check)}>
                                           {contextPackCheckActionText(check)}
                                         </Button>
@@ -8657,6 +9107,16 @@ export function App() {
                                     <Tag color={businessDraftGenerationActive ? "blue" : businessDraftGenerationTask?.status === "succeeded" ? "green" : "red"}>
                                       {businessDraftGenerationStatusText}
                                     </Tag>
+                                    {businessDraftGenerationActive && (
+                                      <Text type="secondary">
+                                        {[
+                                          taskProgressMessage(businessDraftGenerationTask, "正在生成章节草稿…", "已生成"),
+                                          asyncTaskEtaText(businessDraftGenerationTask, businessDraftGenerationTaskId)
+                                        ]
+                                          .filter(Boolean)
+                                          .join(" · ")}
+                                      </Text>
+                                    )}
                                     {businessDraftGenerationTask?.error_message && (
                                       <Text type="danger">{businessDraftGenerationTask.error_message}</Text>
                                     )}
@@ -8680,8 +9140,8 @@ export function App() {
                               <Tooltip
                                 title={
                                   activeContextPack
-                                    ? "编辑生成指令将触发轻量重建（复用事实快照）"
-                                    : "生成指令只影响表达与侧重，随预览/确认 ContextPack 应用"
+                                    ? "编辑生成指令将触发快速重新生成（沿用已核实的事实）"
+                                    : "生成指令只影响表达与侧重，随预览/确认投标素材包应用"
                                 }
                               >
                                 <Button
@@ -8706,7 +9166,7 @@ export function App() {
                                     disabled={!canConfirmContextPack}
                                     onClick={handleCreateContextPack}
                                   >
-                                    确认 ContextPack
+                                    确认投标素材包
                                   </Button>
                                 </span>
                               </Tooltip>
@@ -8716,7 +9176,7 @@ export function App() {
                                     ? ""
                                     : activeContextPack
                                       ? contextPackDraftGenerationTip
-                                      : "先确认 ContextPack。"
+                                      : "先确认投标素材包。"
                                 }
                               >
                                 <span>
@@ -8838,7 +9298,7 @@ export function App() {
                                 <Text type="secondary">
                                   {mvp13DraftWorkflowAvailable
                                     ? "保存会重新校验证书编号、金额、日期等事实，并替换无法验证内容。"
-                                    : "当前 MVP1.2 只确认 ContextPack；历史草稿内容仅供查看。"}
+                                    : "当前 MVP1.2 只确认投标素材包；历史草稿内容仅供查看。"}
                                 </Text>
                               </div>
                               {selectedDraftDiff && (
@@ -8874,15 +9334,50 @@ export function App() {
                               {selectedChapterBlocks.length > 0 && (
                                 <div className="draft-block-list">
                                   <div className="draft-block-title">
-                                    <Text strong>结构化 block 审阅</Text>
+                                    <Text strong>结构化草稿审阅</Text>
                                     <Tag>{selectedChapterBlocks.length}</Tag>
+                                    {chapterMandatoryBlocks.length > 0 && (
+                                      <Space wrap>
+                                        <Button size="small" onClick={openMandatoryReview}>
+                                          逐条查看指定内容（待看{" "}
+                                          {chapterMandatoryBlocks.filter((b) => !viewedDraftBlockIds.has(b.id)).length}）
+                                        </Button>
+                                        <Button
+                                          size="small"
+                                          type="primary"
+                                          loading={savingBusinessDraft}
+                                          disabled={!mvp13DraftWorkflowAvailable}
+                                          onClick={handleBatchConfirmMandatory}
+                                        >
+                                          批量确认指定内容
+                                        </Button>
+                                      </Space>
+                                    )}
                                   </div>
-                                  {selectedChapterBlocks.map((block) => {
+                                  <Segmented<DraftBlockFilter>
+                                    size="small"
+                                    value={draftBlockFilter}
+                                    onChange={(value) => setDraftBlockFilter(value as DraftBlockFilter)}
+                                    options={(Object.keys(draftBlockFilterLabels) as DraftBlockFilter[]).map((key) => ({
+                                      value: key,
+                                      label: `${draftBlockFilterLabels[key]}（${draftBlockFilterCounts[key]}）`
+                                    }))}
+                                  />
+                                  {visibleChapterBlocks.length === 0 ? (
+                                    <Empty
+                                      image={Empty.PRESENTED_IMAGE_SIMPLE}
+                                      description={`「${draftBlockFilterLabels[draftBlockFilter]}」筛选下暂无草稿块`}
+                                    />
+                                  ) : (
+                                    visibleChapterBlocks.map((block) => {
                                     const complianceItemIds = draftBlockLinkIds(block, "compliance_item_ids");
                                     const evidenceBindingIds = draftBlockLinkIds(block, "evidence_binding_ids");
                                     const linkedRows = complianceItemIds
                                       .map((itemId) => matrixRowsById.get(itemId))
                                       .filter((row): row is MatrixRow => Boolean(row));
+                                    const isMandatory = block.review_status === "needs_confirm";
+                                    const expanded = expandedDraftBlockIds.has(block.id);
+                                    const viewed = viewedDraftBlockIds.has(block.id);
                                     return (
                                       <div
                                         className={`draft-block-item ${activeDraftBlockId === block.id ? "active" : ""}`}
@@ -8894,15 +9389,27 @@ export function App() {
                                             <Tag color={draftBlockStatusColors[block.review_status] ?? "default"}>
                                               {draftBlockStatusLabels[block.review_status] ?? block.review_status}
                                             </Tag>
-                                            <Tag color="blue">
-                                              条款 {complianceItemIds.length}
-                                            </Tag>
-                                            <Tag color="green">
-                                              证据 {evidenceBindingIds.length}
-                                            </Tag>
+                                            {isMandatory && (
+                                              <Tag color={viewed ? "green" : "default"}>
+                                                {viewed ? "已查看" : "未查看"}
+                                              </Tag>
+                                            )}
+                                            <Button
+                                              size="small"
+                                              type="link"
+                                              style={{ paddingLeft: 0 }}
+                                              onClick={() => {
+                                                toggleDraftBlockExpanded(block.id);
+                                                if (isMandatory) markDraftBlockViewed(block.id);
+                                              }}
+                                            >
+                                              {expanded
+                                                ? "收起溯源"
+                                                : `溯源（条款 ${complianceItemIds.length} · 证据 ${evidenceBindingIds.length}）`}
+                                            </Button>
                                           </Space>
                                           <p>{block.content_text}</p>
-                                          {linkedRows.length > 0 && (
+                                          {expanded && linkedRows.length > 0 && (
                                             <div className="draft-block-trace">
                                               {linkedRows.slice(0, 4).map((row, index) => (
                                                 <Tooltip title={row.requirement} key={`${block.id}-${row.key}`}>
@@ -8970,7 +9477,8 @@ export function App() {
                                         </Space>
                                       </div>
                                     );
-                                  })}
+                                  })
+                                  )}
                                 </div>
                               )}
                               <div className="fact-check-list">
@@ -8992,7 +9500,7 @@ export function App() {
                               description={
                                 mvp13DraftWorkflowAvailable
                                   ? "生成后可在这里编辑商务标章节草稿"
-                                  : "MVP1.3 将基于已确认 ContextPack 生成章节草稿"
+                                  : "MVP1.3 将基于已确认投标素材包生成章节草稿"
                               }
                             />
                           )}
@@ -9765,6 +10273,127 @@ export function App() {
         onCancel={() => setDirectiveEditorOpen(false)}
         onApply={handleApplyDirectives}
       />
+      {(() => {
+        const total = chapterMandatoryBlocks.length;
+        const current = chapterMandatoryBlocks[mandatoryReviewIndex] ?? null;
+        const currentRows = current
+          ? draftBlockLinkIds(current, "compliance_item_ids")
+              .map((itemId) => matrixRowsById.get(itemId))
+              .filter((row): row is MatrixRow => Boolean(row))
+          : [];
+        const remaining = chapterMandatoryBlocks.filter((b) => !viewedDraftBlockIds.has(b.id)).length;
+        return (
+          <Modal
+            title="逐条查看：必须原样写入的内容"
+            open={mandatoryReviewOpen && total > 0}
+            width={720}
+            onCancel={() => setMandatoryReviewOpen(false)}
+            footer={
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <Text type="secondary">
+                  第 {Math.min(mandatoryReviewIndex + 1, total)} / {total} 条 · 待看 {remaining}
+                </Text>
+                <Space wrap>
+                  <Button
+                    disabled={mandatoryReviewIndex <= 0}
+                    onClick={() => setMandatoryReviewIndex((i) => Math.max(0, i - 1))}
+                  >
+                    上一条
+                  </Button>
+                  {current && (
+                    <Button
+                      danger
+                      loading={savingBusinessDraft}
+                      disabled={!mvp13DraftWorkflowAvailable}
+                      onClick={() => {
+                        const target = current;
+                        let reason = "逐条审阅驳回指定内容";
+                        Modal.confirm({
+                          title: "驳回该指定内容",
+                          content: (
+                            <Space direction="vertical" style={{ width: "100%" }}>
+                              <Text type="secondary">驳回需填写原因，将回到待补证据状态。</Text>
+                              <Input.TextArea
+                                defaultValue={reason}
+                                autoSize={{ minRows: 2, maxRows: 4 }}
+                                aria-label="驳回原因"
+                                onChange={(event) => {
+                                  reason = event.target.value;
+                                }}
+                              />
+                            </Space>
+                          ),
+                          okText: "确认驳回",
+                          cancelText: "取消",
+                          onOk: async () => {
+                            if (!reason.trim()) {
+                              Modal.warning({ title: "需要填写驳回原因" });
+                              throw new Error("reject reason required");
+                            }
+                            await handleUpdateDraftBlockStatus(target, "needs_evidence", reason.trim());
+                          }
+                        });
+                      }}
+                    >
+                      驳回
+                    </Button>
+                  )}
+                  {current && (
+                    <Button
+                      type="primary"
+                      loading={savingBusinessDraft}
+                      disabled={!mvp13DraftWorkflowAvailable}
+                      onClick={async () => {
+                        await handleUpdateDraftBlockStatus(current, "approved", "逐条审阅确认指定内容");
+                        if (mandatoryReviewIndex < total - 1) {
+                          setMandatoryReviewIndex((i) => i + 1);
+                        }
+                      }}
+                    >
+                      确认本条
+                    </Button>
+                  )}
+                  <Button
+                    disabled={mandatoryReviewIndex >= total - 1}
+                    onClick={() => setMandatoryReviewIndex((i) => Math.min(total - 1, i + 1))}
+                  >
+                    下一条
+                  </Button>
+                </Space>
+              </div>
+            }
+          >
+            {current ? (
+              <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                <Alert
+                  type="warning"
+                  showIcon
+                  message="该内容将原样写入标书"
+                  description="请核对措辞与其中的事实是否准确；无法回链证据的事实会在导出前被拦截。"
+                />
+                <div className="draft-block-mandatory-text">
+                  <Text strong>指定内容</Text>
+                  <p style={{ whiteSpace: "pre-wrap" }}>{current.content_text}</p>
+                </div>
+                {currentRows.length > 0 && (
+                  <div>
+                    <Text strong>关联条款</Text>
+                    <Space direction="vertical" style={{ width: "100%" }}>
+                      {currentRows.slice(0, 6).map((row) => (
+                        <Text key={`mandatory-${current.id}-${row.key}`} type="secondary">
+                          · {truncateText(row.requirement, 60)}
+                        </Text>
+                      ))}
+                    </Space>
+                  </div>
+                )}
+              </Space>
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有待确认的指定内容" />
+            )}
+          </Modal>
+        );
+      })()}
       <Drawer
         title="查看/修正解析分块"
         open={revisionDrawerOpen}

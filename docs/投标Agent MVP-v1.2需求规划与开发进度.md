@@ -3,7 +3,7 @@
 > 更新时间：2026-06-06
 > 当前阶段：MVP1.2 已完成，ContextPack 生成/确认链路通过自动化和真实项目闭环验收
 > 版本定位：ContextPack First。只把商务/资格草稿生成前的上下文包做稳定、可预览、可审计、可确认。
-> 后续交接：基于 ContextPack 的章节草稿生成、覆盖检查、事实校验、审阅和 Word 导出进入 MVP1.3；RAG/Embedding/Rerank 进入 MVP1.4。
+> 后续交接：基于 ContextPack 的章节草稿生成、覆盖检查、事实校验、审阅和 Word 导出进入 MVP1.3；RAG/Embedding/Rerank 进入 MVP1.5。
 
 ## 1. 版本目标
 
@@ -37,7 +37,7 @@ MVP1.2 的交付物是一份已确认的 `DraftContextPack`，以及按章节拆
 7. 技术标核心章节生成。
 8. 净化产品选型、图纸/OCR、多 Agent、报价辅助、自动报名、自动签章和自动提交。
 
-其中第 1 到第 3 项进入 MVP1.3；第 4 到第 6 项进入 MVP1.4；其余能力进入长期规划。
+其中第 1 到第 3 项进入 MVP1.3；第 4 到第 6 项进入 MVP1.5；其余能力进入长期规划。
 
 ## 4. 前置依赖
 
@@ -180,7 +180,7 @@ MVP1.2 按以下标准验收：
 
 | 范围 | 状态 | 说明 |
 | --- | --- | --- |
-| 版本边界 | 已调整 | 1.2 只做 ContextPack 预览/确认；草稿生成进入 1.3；RAG 进入 1.4 |
+| 版本边界 | 已调整 | 1.2 只做 ContextPack 预览/确认；草稿生成进入 1.3；RAG 进入 1.5 |
 | 文档规划 | 已完成 | 本文档为规划与进度统一文档 |
 | 数据模型 | 已完成 | `draft_context_packs`、`draft_section_context_packs` 已落库 |
 | 后端 ContextPack API | 已完成 | 预览、列表、确认、硬门禁、章节拆分和版本替换均已验证 |
@@ -196,4 +196,4 @@ MVP1.3 从已确认 ContextPack 开始，不重新处理上游矩阵和证据绑
 1. MVP1.2 负责 `context_json`、`outline_plan_json` 和 `section_context_packs`。
 2. MVP1.3 负责基于这些输入生成目录、章节草稿、结构化 block、覆盖检查、事实校验、审阅和导出。
 3. MVP1.3 不应绕过 1.2 的资格门禁和 readiness 结论。
-4. MVP1.4 的 RAG 只能增强候选证据，不直接替代 1.2 的人工绑定和 ContextPack 确认。
+4. MVP1.5 的 RAG 只能增强候选证据，不直接替代 1.2 的人工绑定和 ContextPack 确认。

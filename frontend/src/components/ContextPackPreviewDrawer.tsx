@@ -73,7 +73,7 @@ export function ContextPackPreviewDrawer({
 
   return (
     <Drawer
-      title="ContextPack 完整预览"
+      title="投标素材包完整预览"
       open={open}
       width={980}
       loading={loading}
@@ -89,7 +89,7 @@ export function ContextPackPreviewDrawer({
       }
     >
       {!source ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未生成 ContextPack 预览" />
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未生成投标素材包预览" />
       ) : (
         <div className="context-pack-preview">
           <Alert
@@ -98,7 +98,7 @@ export function ContextPackPreviewDrawer({
             message={readinessLabel(readinessStatus)}
             description={
               readinessStatus === "block"
-                ? "必须先处理下列硬阻断；已确认 No-Go 仅作为风险快照保存。"
+                ? "必须先处理下列硬阻断；已确认不建议参标仅作为风险快照保存。"
                 : "当前快照可用于确认，待补事实会保留为明确缺项。"
             }
           />
@@ -252,7 +252,7 @@ export function ContextPackPreviewDrawer({
           </section>
 
           <section className="context-pack-preview-section">
-            <Title level={5}>章节 ContextPack 计划</Title>
+            <Title level={5}>章节投标素材包计划</Title>
             <Table
               size="small"
               rowKey={(row) => String(row.section_type)}
@@ -273,7 +273,7 @@ export function ContextPackPreviewDrawer({
           </section>
 
           <details className="context-pack-preview-raw">
-            <summary>原始 ContextPack 快照</summary>
+            <summary>原始投标素材包快照</summary>
             <pre>{JSON.stringify({ context, readiness, outline }, null, 2)}</pre>
           </details>
         </div>

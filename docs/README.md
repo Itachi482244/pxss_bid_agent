@@ -6,7 +6,9 @@
 
 - [投标Agent MVP-v1.2需求规划与开发进度.md](投标Agent%20MVP-v1.2需求规划与开发进度.md)：ContextPack 预览、生成、确认和准备度门禁。
 - [投标Agent MVP-v1.3需求规划与开发进度.md](投标Agent%20MVP-v1.3需求规划与开发进度.md)：基于已确认 ContextPack 的商务/资格草稿生成、审阅和导出闭环。
-- [投标Agent MVP-v1.4需求规划与开发进度.md](投标Agent%20MVP-v1.4需求规划与开发进度.md)：企业资料 RAG、Embedding/Rerank 和候选证据推荐。
+- [投标Agent MVP-v1.4需求规划与开发进度.md](投标Agent%20MVP-v1.4需求规划与开发进度.md)：易用性优化（首页治理、术语白话化、审阅提效、等待体验、管理看板）。
+- [投标Agent MVP-v1.5需求规划与开发进度.md](投标Agent%20MVP-v1.5需求规划与开发进度.md)：企业资料 RAG、Embedding/Rerank 和候选证据推荐。
+- [投标Agent 易用性优化方案.md](投标Agent%20易用性优化方案.md)：MVP1.4 易用性的评估与决策记录。
 - [投标Agent ContextPack分阶段生成方案.md](投标Agent%20ContextPack分阶段生成方案.md)：GlobalContextPack、OutlinePlan、SectionContextPack 与 DraftBlock 的版本边界。
 - [投标Agent 工程类商务标TemplateProfile初版.md](投标Agent%20工程类商务标TemplateProfile初版.md)：基于工程类投标样本整理的通用 TemplateProfile 和章节类型清单。
 
@@ -16,7 +18,8 @@
 - MVP1.1 P0 + P1 已完成主体开发，包含模型配置中心、PromptOps、合规矩阵 AI 增强、矩阵审阅、人工补漏、相似补票、Diff 高亮和重复项级联确认。
 - MVP1.2 专注 ContextPack 预览、生成、确认和准备度门禁。
 - MVP1.3 承接基于 ContextPack 的商务/资格草稿生成、审阅和导出闭环。
-- MVP1.4 承接企业资料真实 RAG、Embedding/Rerank 和候选证据推荐。
+- MVP1.4 承接易用性优化（不扩 AI 能力边界）。
+- MVP1.5 承接企业资料真实 RAG、Embedding/Rerank 和候选证据推荐。
 - 净化行业闭环、OCR、报价辅助、多 Agent、技术标核心章节和图纸/示意图进入长期规划，不排入具体 MVP 版本。
 
 ## 版本文档
@@ -33,6 +36,8 @@
 - [投标Agent MVP-v1.2需求规划与开发进度.md](投标Agent%20MVP-v1.2需求规划与开发进度.md)
 - [投标Agent MVP-v1.3需求规划与开发进度.md](投标Agent%20MVP-v1.3需求规划与开发进度.md)
 - [投标Agent MVP-v1.4需求规划与开发进度.md](投标Agent%20MVP-v1.4需求规划与开发进度.md)
+- [投标Agent MVP-v1.5需求规划与开发进度.md](投标Agent%20MVP-v1.5需求规划与开发进度.md)
+- [投标Agent 易用性优化方案.md](投标Agent%20易用性优化方案.md)
 
 ## 产品与能力规划
 

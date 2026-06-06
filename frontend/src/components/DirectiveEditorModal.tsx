@@ -33,13 +33,13 @@ type Props = {
 const directiveTypeLabels: Record<AuthorDirectiveType, string> = {
   style: "纯风格",
   emphasis: "内容侧重",
-  mandatory_text: "强制措辞"
+  mandatory_text: "必须原样写入的内容"
 };
 
 const directiveTypeHints: Record<AuthorDirectiveType, string> = {
   style: "只调整语气、措辞风格，不新增事实。",
   emphasis: "提示模型在已有证据范围内侧重某些内容。",
-  mandatory_text: "原样写入草稿，标记为「待确认强制措辞」，仍需通过事实核查与逐条人工确认后方可导出。"
+  mandatory_text: "原样写入草稿，标记为「待确认的指定内容」，仍需通过事实核查与逐条人工确认后方可导出。"
 };
 
 let directiveSeq = 0;
@@ -125,7 +125,7 @@ export function DirectiveEditorModal({
       width={720}
       onCancel={onCancel}
       onOk={handleApply}
-      okText={rebuildMode ? `应用并轻量重建（${rows.length} 条）` : `应用（${rows.length} 条）`}
+      okText={rebuildMode ? `应用并快速重新生成（${rows.length} 条）` : `应用（${rows.length} 条）`}
       okButtonProps={{ disabled: Boolean(validationError), loading }}
       cancelText="取消"
     >
@@ -135,10 +135,10 @@ export function DirectiveEditorModal({
           message="指令层只影响表达与侧重，不能新增事实。"
           description={
             <Paragraph style={{ marginBottom: 0 }}>
-              事实层保持不可变。强制措辞会原样写入草稿，但仍受事实核查兜底（夹带的硬数据若无法回链证据将拦截导出），且默认「待确认强制措辞」，需逐条人工确认。
+              事实层保持不可变。“必须原样写入的内容”会原样写入草稿，但仍受事实核查兜底（夹带的硬数据若无法回链证据将拦截导出），且默认「待确认的指定内容」，需逐条人工确认。
               {rebuildMode
-                ? "应用后将触发轻量重建：复用现有事实快照，生成新版本 ContextPack，旧版本置为已废弃，需重新生成草稿以应用新指令。"
-                : "这些指令会随「确认 ContextPack」一起写入。"}
+                ? "应用后将触发快速重新生成：沿用现有已核实的事实，生成新版本投标素材包，旧版本置为已废弃，需重新生成草稿以应用新指令。"
+                : "这些指令会随「确认投标素材包」一起写入。"}
             </Paragraph>
           }
         />
@@ -201,7 +201,7 @@ export function DirectiveEditorModal({
         </Button>
         {mandatoryCount > 0 && (
           <Text type="warning">
-            含 {mandatoryCount} 条强制措辞，导出前需逐条人工确认并通过事实核查。
+            含 {mandatoryCount} 条必须原样写入的内容，导出前需逐条人工确认并通过事实核查。
           </Text>
         )}
         {validationError && <Text type="danger">{validationError}</Text>}
