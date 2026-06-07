@@ -97,6 +97,14 @@ MVP1.5 的目标是把“人工找证据”升级为“系统推荐候选证据�
 7. 拒绝和替换候选证据会记录原因。
 8. 固定评测样本能输出召回率、TopK 命中率、人工绑定率和误推荐类型。
 
+## 7.1 工程约定（来自《RAG 前置地基梳理》）
+
+1. **候选证据抽屉做成独立组件**：1.5 的候选证据 UI 必须新建独立组件（参照 `frontend/src/components/ContextPackPreviewDrawer.tsx`），不得继续堆进 `App.tsx`。
+2. **检索网关与向量真实化在 1.5 内一次到位**（地基阶段已决定不前置）：
+   - embedding/rerank 运行时网关复用 `llm_gateway` 的超时 / `model_invocation` 审计 / 失败降级机制；
+   - 维度配置化，`search_material_hits` 改走 pgvector DB 端向量距离，新增 ANN 索引（ivfflat/hnsw）迁移，`embedding_vector` 列真正参与检索。
+3. **纯逻辑单测**：新增前端纯函数（聚合/过滤/打分等）应补 `vitest` 单测（已建立 `frontend/src/pages/selectors.test.ts` 样板，`npm test` 运行）。
+
 ## 8. 开发进度
 
 当前为规划完成、未开始状态。

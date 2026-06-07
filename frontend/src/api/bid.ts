@@ -1087,7 +1087,11 @@ export async function listProjects(params?: {
   limit?: number;
   offset?: number;
 }) {
-  const response = await apiClient.get<ProjectSummary[]>("/projects", { params });
+  // 首页/看板对全部项目做客户端分组、搜索与分页，需一次性取全量；
+  // 后端默认 limit 仅 50，会导致删除可见项后被隐藏池回填，看起来“删了没用”。
+  const response = await apiClient.get<ProjectSummary[]>("/projects", {
+    params: { limit: 200, ...params }
+  });
   return response.data;
 }
 

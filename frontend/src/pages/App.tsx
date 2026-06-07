@@ -183,6 +183,15 @@ import type {
   OutlineChapterInput
 } from "../api/bid";
 import { ContextPackPreviewDrawer } from "../components/ContextPackPreviewDrawer";
+import {
+  classifyProjectGroup,
+  computeDashboardStats,
+  computeDraftBlockFilterCounts,
+  filterHomeProjects,
+  matchesDraftBlockFilter,
+  type DraftBlockFilter,
+  type ProjectGroup
+} from "./selectors";
 import { OutlineEditorModal, type OutlineSeedChapter } from "../components/OutlineEditorModal";
 import { plainTerm } from "../i18n/glossary";
 import {
@@ -512,8 +521,6 @@ const projectStatusLabels: Record<string, string> = {
   archived: "已归档"
 };
 
-type ProjectGroup = "needs_me" | "in_progress" | "done";
-
 const projectGroupLabels: Record<ProjectGroup, string> = {
   needs_me: "待我处理",
   in_progress: "进行中",
@@ -521,19 +528,6 @@ const projectGroupLabels: Record<ProjectGroup, string> = {
 };
 
 const projectGroupOrder: ProjectGroup[] = ["needs_me", "in_progress", "done"];
-
-// 项目分组（互斥取一）：终态归"已完成"，需要人工动作归"待我处理"，其余归"进行中"。
-function classifyProjectGroup(project: ProjectSummary): ProjectGroup {
-  if (project.status === "exported" || project.status === "archived") return "done";
-  if (
-    project.status === "pending_confirm" ||
-    project.status === "need_materials" ||
-    project.pending_confirm_count > 0
-  ) {
-    return "needs_me";
-  }
-  return "in_progress";
-}
 
 type ProjectNextStep = { text: string; tab?: string; actionable: boolean };
 
@@ -705,27 +699,12 @@ const draftBlockStatusColors: Record<string, string> = {
 };
 
 // P1：草稿块状态过滤（标签为白话；value 仍映射后端 review_status，不改语义）
-type DraftBlockFilter = "all" | "needs_confirm" | "needs_evidence" | "pending";
-
 const draftBlockFilterLabels: Record<DraftBlockFilter, string> = {
   all: "全部",
   needs_confirm: plainTerm("needs_confirm"),
   needs_evidence: "待补证",
   pending: "待覆盖"
 };
-
-// "待覆盖"=尚未人工通过且非上述两类的块（待审阅/缺事实/已覆盖待确认等）
-function matchesDraftBlockFilter(block: DraftBlock, filter: DraftBlockFilter): boolean {
-  if (filter === "all") return true;
-  if (filter === "needs_confirm") return block.review_status === "needs_confirm";
-  if (filter === "needs_evidence") return block.review_status === "needs_evidence";
-  // pending / 待覆盖：尚未通过，且不属于待确认/待补证
-  return (
-    block.review_status !== "approved" &&
-    block.review_status !== "needs_confirm" &&
-    block.review_status !== "needs_evidence"
-  );
-}
 
 const approvalTaskTypeLabels: Record<string, string> = {
   qualification_decision: "资格确认",
@@ -1874,16 +1853,10 @@ export function App() {
     () => selectedChapterBlocks.filter((block) => matchesDraftBlockFilter(block, draftBlockFilter)),
     [selectedChapterBlocks, draftBlockFilter]
   );
-  const draftBlockFilterCounts = useMemo(() => {
-    const counts: Record<DraftBlockFilter, number> = { all: 0, needs_confirm: 0, needs_evidence: 0, pending: 0 };
-    for (const block of selectedChapterBlocks) {
-      counts.all += 1;
-      if (matchesDraftBlockFilter(block, "needs_confirm")) counts.needs_confirm += 1;
-      if (matchesDraftBlockFilter(block, "needs_evidence")) counts.needs_evidence += 1;
-      if (matchesDraftBlockFilter(block, "pending")) counts.pending += 1;
-    }
-    return counts;
-  }, [selectedChapterBlocks]);
+  const draftBlockFilterCounts = useMemo(
+    () => computeDraftBlockFilterCounts(selectedChapterBlocks),
+    [selectedChapterBlocks]
+  );
   // P1：本章"必须原样写入的内容"（needs_confirm）逐条查看流的队列
   const chapterMandatoryBlocks = useMemo(
     () => selectedChapterBlocks.filter((block) => block.review_status === "needs_confirm"),
@@ -2874,59 +2847,17 @@ export function App() {
     return counts;
   }, [projects]);
 
-  const filteredHomeProjects = useMemo(() => {
-    const keyword = homeProjectSearch.trim().toLowerCase();
-    return projects.filter((project) => {
-      if (classifyProjectGroup(project) !== homeProjectGroup) return false;
-      if (!keyword) return true;
-      const haystack = [project.name, project.purchaser, project.agency]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(keyword);
-    });
-  }, [projects, homeProjectGroup, homeProjectSearch]);
+  const filteredHomeProjects = useMemo(
+    () => filterHomeProjects(projects, homeProjectGroup, homeProjectSearch),
+    [projects, homeProjectGroup, homeProjectSearch]
+  );
 
   useEffect(() => {
     setHomeProjectPage(1);
   }, [homeProjectGroup, homeProjectSearch]);
 
   // P1-6：管理层宏观看板——纯前端聚合现有项目数据（不改后端）；缺数据源指标明确标注"暂无数据"。
-  const dashboardStats = useMemo(() => {
-    const statusDistribution = new Map<string, number>();
-    let pendingConfirmTotal = 0;
-    let highRiskTotal = 0;
-    let dueSoonCount = 0;
-    let budgetTotal = 0;
-    const groupCounts: Record<ProjectGroup, number> = { needs_me: 0, in_progress: 0, done: 0 };
-    for (const project of projects) {
-      statusDistribution.set(project.status, (statusDistribution.get(project.status) ?? 0) + 1);
-      groupCounts[classifyProjectGroup(project)] += 1;
-      pendingConfirmTotal += project.pending_confirm_count ?? 0;
-      highRiskTotal += project.high_risk_count ?? 0;
-      if (
-        project.bid_deadline_at &&
-        classifyProjectGroup(project) !== "done" &&
-        dayjs(project.bid_deadline_at).diff(dayjs(), "day") <= 14 &&
-        dayjs(project.bid_deadline_at).diff(dayjs(), "day") >= 0
-      ) {
-        dueSoonCount += 1;
-      }
-      const budget = Number(project.budget_amount ?? 0);
-      if (Number.isFinite(budget)) budgetTotal += budget;
-    }
-    const activeCount = groupCounts.needs_me + groupCounts.in_progress;
-    return {
-      total: projects.length,
-      activeCount,
-      groupCounts,
-      statusDistribution: Array.from(statusDistribution.entries()).sort((a, b) => b[1] - a[1]),
-      pendingConfirmTotal,
-      highRiskTotal,
-      dueSoonCount,
-      budgetTotal
-    };
-  }, [projects]);
+  const dashboardStats = useMemo(() => computeDashboardStats(projects), [projects]);
 
   const assistantMessages = useMemo(() => {
     const highRisk = unresolvedHighRiskRows[0];
@@ -6056,7 +5987,7 @@ export function App() {
     <>
       <Layout className="app-shell">
         <Header className="topbar">
-          <Space size={18} className="topbar-left">
+          <div className="topbar-left">
             <button className="brand-mark" onClick={() => setViewMode("home")}>
               投标 Agent
             </button>
@@ -6099,13 +6030,13 @@ export function App() {
             <Tag className="todo-tag" icon={<WarningOutlined />} color="orange">
               {sections.filter((section) => section.status !== "confirmed").length || 0} 个标段有未完成项
             </Tag>
-          </Space>
-          <Space size={14}>
+          </div>
+          <div className="topbar-actions">
             <Badge count={homeTodoRows.length} size="small">
               <Button icon={<BellOutlined />} />
             </Badge>
             <Avatar size={32} icon={<TeamOutlined />} />
-          </Space>
+          </div>
         </Header>
 
         {apiError && (
@@ -6648,9 +6579,12 @@ export function App() {
                   </Button>
                 </div>
                 <Table<HomeTodoRow>
+                  className="home-data-table"
                   size="middle"
                   loading={loadingMatrix}
                   pagination={false}
+                  scroll={{ x: 760 }}
+                  tableLayout="fixed"
                   dataSource={homeTodoRows}
                   locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无待办" /> }}
                   columns={[
@@ -6658,13 +6592,26 @@ export function App() {
                       title: "任务",
                       dataIndex: "task",
                       render: (value, record) => (
-                        <Button type="link" onClick={() => locateMatrixRow(record.key)}>
+                        <Button
+                          type="link"
+                          className="table-link-text"
+                          onClick={() => locateMatrixRow(record.key)}
+                        >
                           {value}
                           {record.priority === "高" && <Tag color="red">高</Tag>}
                         </Button>
                       )
                     },
-                    { title: "项目", dataIndex: "project", width: 220 },
+                    {
+                      title: "项目",
+                      dataIndex: "project",
+                      width: 220,
+                      render: (value: string) => (
+                        <Tooltip title={value}>
+                          <span className="clamped-cell">{value}</span>
+                        </Tooltip>
+                      )
+                    },
                     { title: "责任人", dataIndex: "owner", width: 110 },
                     { title: "截止", dataIndex: "due", width: 130 }
                   ]}
@@ -6731,8 +6678,11 @@ export function App() {
                   style={{ marginBottom: 12 }}
                 />
                 <Table<ProjectSummary>
+                  className="home-data-table"
                   size="middle"
                   loading={loadingProjects}
+                  scroll={{ x: 980 }}
+                  tableLayout="fixed"
                   pagination={{
                     current: homeProjectPage,
                     pageSize: HOME_PROJECT_PAGE_SIZE,
@@ -6765,6 +6715,7 @@ export function App() {
                       render: (value, record) => (
                         <Button
                           type="link"
+                          className="table-link-text"
                           onClick={() => {
                             openProjectWorkspace(record.id, "matrix");
                           }}
@@ -6803,6 +6754,7 @@ export function App() {
                         return (
                           <Button
                             type="link"
+                            className="table-link-text"
                             style={{ padding: 0, height: "auto" }}
                             onClick={() => openProjectWorkspace(record.id, next.tab as string)}
                           >
