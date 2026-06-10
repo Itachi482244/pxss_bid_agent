@@ -1,12 +1,16 @@
 from functools import cached_property
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file="../.env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -44,6 +48,21 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=30.0, alias="LLM_TIMEOUT_SECONDS")
     model_config_encryption_key: str = Field(default="", alias="MODEL_CONFIG_ENCRYPTION_KEY")
     model_config_encryption_key_version: str = Field(default="v1", alias="MODEL_CONFIG_ENCRYPTION_KEY_VERSION")
+    # Aliyun OCR (读光 OCR / ocr-api20210707, RecognizeAdvanced 高精全文+表格)
+    aliyun_ocr_enabled: bool = Field(default=False, alias="ALIYUN_OCR_ENABLED")
+    aliyun_ocr_access_key_id: str = Field(default="", alias="ALIYUN_OCR_ACCESS_KEY_ID")
+    aliyun_ocr_access_key_secret: str = Field(default="", alias="ALIYUN_OCR_ACCESS_KEY_SECRET")
+    aliyun_ocr_endpoint: str = Field(
+        default="ocr-api.cn-hangzhou.aliyuncs.com",
+        alias="ALIYUN_OCR_ENDPOINT",
+    )
+    aliyun_ocr_timeout_seconds: float = Field(default=30.0, alias="ALIYUN_OCR_TIMEOUT_SECONDS")
+
+    source_page_image_format: str = Field(default="jpeg", alias="SOURCE_PAGE_IMAGE_FORMAT")
+    source_page_image_max_width: int = Field(default=1200, alias="SOURCE_PAGE_IMAGE_MAX_WIDTH")
+    source_page_image_jpeg_quality: int = Field(default=70, alias="SOURCE_PAGE_IMAGE_JPEG_QUALITY")
+    source_page_image_render_scale: float = Field(default=2.0, alias="SOURCE_PAGE_IMAGE_RENDER_SCALE")
+
     run_tasks_inline: bool = Field(default=True, alias="RUN_TASKS_INLINE")
     matrix_fork_join_enabled: bool = Field(default=True, alias="MATRIX_FORK_JOIN_ENABLED")
     matrix_fork_join_max_workers: int = Field(default=4, alias="MATRIX_FORK_JOIN_MAX_WORKERS")

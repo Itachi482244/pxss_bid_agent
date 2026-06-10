@@ -9,6 +9,7 @@ description = "Backend service for the PXSS bid agent."
 requires-python = ">=3.11"
 dependencies = [
   "alembic>=1.13.0",
+  "alibabacloud-ocr-api20210707>=3.1.2",
   "celery>=5.3.0",
   "cryptography>=42.0.0",
   "fastapi>=0.115.0",
