@@ -128,7 +128,7 @@ from app.services.context_pack import (
     update_context_pack_directives,
 )
 from app.services.compliance_generation import execute_compliance_matrix_generation_task
-from app.services.document_utils import MAX_FILE_BYTES
+from app.services.document_utils import TENDER_DOCUMENT_FILE_MAX_BYTES, readable_file_size
 from app.services.evidence_policy import (
     enterprise_evidence_not_required as policy_enterprise_evidence_not_required,
 )
@@ -139,6 +139,7 @@ from app.services.evidence_policy import requires_enterprise_evidence
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import FileAcquisitionError
 from app.services.material_identity import enterprise_material_identity_key, material_snapshot_identity_key
+from app.parsers.pdf import PdfTextEmptyError
 from app.services.project_import import (
     ImportDraft,
     build_upload_import_draft,
@@ -1719,17 +1720,29 @@ async def create_project_import_draft_from_upload(
     ctx: Annotated[RequestContext, Depends(get_request_context)],
     file: Annotated[UploadFile, File()],
 ) -> ProjectImportDraftRead:
-    payload = await file.read(MAX_FILE_BYTES + 1)
+    payload = await file.read(TENDER_DOCUMENT_FILE_MAX_BYTES + 1)
     if not payload:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
-    if len(payload) > MAX_FILE_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File is too large")
-    draft = build_upload_import_draft(
-        ctx=ctx,
-        filename=file.filename or "import-document.bin",
-        content_type=file.content_type,
-        data=payload,
-    )
+    if len(payload) > TENDER_DOCUMENT_FILE_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File is too large; max {readable_file_size(TENDER_DOCUMENT_FILE_MAX_BYTES)}",
+        )
+    try:
+        draft = build_upload_import_draft(
+            ctx=ctx,
+            filename=file.filename or "import-document.bin",
+            content_type=file.content_type,
+            data=payload,
+        )
+    except PdfTextEmptyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"{exc}；项目招标文件导入当前只支持可复制文本的 PDF/Word/HTML，"
+                "图片型或扫描件 PDF 请先走 OCR 资料抽取流程。"
+            ),
+        ) from exc
     return project_import_draft_read(draft)
 
 
@@ -1754,6 +1767,14 @@ def create_project_import_draft_from_public_url(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
+        ) from exc
+    except PdfTextEmptyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"{exc}；项目招标文件导入当前只支持可复制文本的 PDF/Word/HTML，"
+                "图片型或扫描件 PDF 请先走 OCR 资料抽取流程。"
+            ),
         ) from exc
     return project_import_draft_read(draft)
 

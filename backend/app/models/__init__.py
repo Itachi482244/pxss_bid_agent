@@ -31,6 +31,7 @@ from app.models.model_invocation import ModelInvocationLog
 from app.models.project import BidSection, Project, ProjectMember
 from app.models.qualification import QualificationEvaluation
 from app.models.retrieval import EnterpriseMaterialChunk
+from app.models.source_page_image import SourcePageImage
 from app.models.task import AsyncTask, FileAcquisitionTask, ParseTask
 
 __all__ = [
@@ -64,6 +65,7 @@ __all__ = [
     "ProjectMember",
     "QualificationDecision",
     "QualificationEvaluation",
+    "SourcePageImage",
     "Tenant",
     "User",
 ]

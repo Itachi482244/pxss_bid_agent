@@ -41,9 +41,10 @@ from app.schemas.document import (
     ParseTaskRequest,
 )
 from app.services.document_utils import (
-    MAX_FILE_BYTES,
+    TENDER_DOCUMENT_FILE_MAX_BYTES,
     file_extension,
     infer_parser_type,
+    readable_file_size,
     safe_filename,
 )
 from app.services.storage import put_object_bytes
@@ -237,11 +238,14 @@ async def upload_document(
 ) -> DocumentRead:
     get_section_or_404(db, ctx, project_id, section_id)
 
-    payload = await file.read(MAX_FILE_BYTES + 1)
+    payload = await file.read(TENDER_DOCUMENT_FILE_MAX_BYTES + 1)
     if not payload:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
-    if len(payload) > MAX_FILE_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File is too large")
+    if len(payload) > TENDER_DOCUMENT_FILE_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File is too large; max {readable_file_size(TENDER_DOCUMENT_FILE_MAX_BYTES)}",
+        )
 
     filename = safe_filename(file.filename)
     ext = file_extension(filename)

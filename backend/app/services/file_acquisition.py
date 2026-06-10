@@ -16,7 +16,7 @@ from app.core.config import settings
 from app.core.observability import observed_task
 from app.models import AsyncTask, AuditLog, Document, DocumentVersion, FileAcquisitionTask, ParseTask
 from app.services.document_utils import (
-    MAX_FILE_BYTES,
+    TENDER_DOCUMENT_FILE_MAX_BYTES,
     file_extension,
     infer_parser_type,
     safe_filename,
@@ -119,7 +119,7 @@ def fetch_public_file(url: str, *, max_redirects: int = 5) -> DownloadedFile:
                                 http_status=response.status_code,
                                 redirect_chain=redirect_chain,
                             ) from exc
-                        if declared_size > MAX_FILE_BYTES:
+                        if declared_size > TENDER_DOCUMENT_FILE_MAX_BYTES:
                             raise FileAcquisitionError(
                                 "远端文件超过大小限制",
                                 code="FILE_TOO_LARGE",
@@ -131,7 +131,7 @@ def fetch_public_file(url: str, *, max_redirects: int = 5) -> DownloadedFile:
                     total_size = 0
                     for chunk in response.iter_bytes():
                         total_size += len(chunk)
-                        if total_size > MAX_FILE_BYTES:
+                        if total_size > TENDER_DOCUMENT_FILE_MAX_BYTES:
                             raise FileAcquisitionError(
                                 "远端文件超过大小限制",
                                 code="FILE_TOO_LARGE",

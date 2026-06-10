@@ -431,7 +431,8 @@ def get_or_create_cleanroom_project(db: Session, tenant: Tenant, user: User) -> 
         if project.status == "archived" or project.archived_at is not None:
             project.status = "pending_confirm"
             project.archived_at = None
-            db.flush()
+        project.updated_at = datetime.now(UTC)
+        db.flush()
         return project
 
     project = Project(

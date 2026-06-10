@@ -1,6 +1,6 @@
 import dayjs, { type Dayjs } from "dayjs";
 
-import type { DraftBlock, ProjectSummary } from "../api/bid";
+import type { DraftBlock, EnterpriseMaterial, ProjectSummary } from "../api/bid";
 
 // 首页项目分组（互斥取一）。
 export type ProjectGroup = "needs_me" | "in_progress" | "done";
@@ -74,6 +74,48 @@ export interface DashboardStats {
   highRiskTotal: number;
   dueSoonCount: number;
   budgetTotal: number;
+}
+
+export interface MaterialExtractionMeta {
+  isHistoryExtracted: boolean;
+  sourceFileName: string | null;
+  sourceLocationText: string | null;
+  sourceImageCount: number;
+  confidence: number | null;
+  needsHumanConfirm: boolean;
+  extractionMethod: string | null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function asNumber(value: unknown): number | null {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+export function materialExtractionMeta(material: EnterpriseMaterial): MaterialExtractionMeta {
+  const fields = asRecord(material.structured_fields);
+  const source = String(fields.source ?? "");
+  const locations = Array.isArray(fields.source_locations) ? fields.source_locations : [];
+  const sourceImages = Array.isArray(fields.source_images) ? fields.source_images : [];
+  const firstLocation = asRecord(locations[0]);
+  const pageNo = firstLocation.page_no;
+  const blockIndex = firstLocation.block_index;
+  const locationParts = [
+    typeof pageNo === "number" || typeof pageNo === "string" ? `P${pageNo}` : null,
+    typeof blockIndex === "number" || typeof blockIndex === "string" ? `块 ${blockIndex}` : null
+  ].filter(Boolean);
+  return {
+    isHistoryExtracted: source === "history_file_extract",
+    sourceFileName: typeof fields.source_file_name === "string" ? fields.source_file_name : material.file_name,
+    sourceLocationText: locationParts.length ? locationParts.join(" · ") : null,
+    sourceImageCount: sourceImages.length,
+    confidence: asNumber(fields.extraction_confidence),
+    needsHumanConfirm: Boolean(fields.needs_human_confirm) || material.verification_status === "pending_confirm",
+    extractionMethod: typeof fields.extraction_method === "string" ? fields.extraction_method : null
+  };
 }
 
 // 管理层宏观看板：纯前端聚合现有项目数据（不依赖后端聚合）。

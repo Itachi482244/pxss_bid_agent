@@ -104,6 +104,18 @@ class EnterpriseMaterialSearchResult(EnterpriseMaterialRead):
     material_status_hint: str | None = None
 
 
+class EnterpriseMaterialHistoryExtractResult(BaseModel):
+    materials: list[EnterpriseMaterialRead]
+    source_file_name: str
+    source_file_size: int
+    source_sha256: str
+    parser_summary: dict[str, Any]
+    extraction_method: str
+    warning_messages: list[str] = Field(default_factory=list)
+    draft_count: int
+    text_block_count: int
+
+
 class EnterpriseMaterialChunkRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

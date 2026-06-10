@@ -9,6 +9,7 @@ from app.services.context_pack import execute_business_draft_generation_task
 from app.services.document_parse import execute_document_parse_task
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import execute_file_acquisition_task
+from app.services.history_material_extract import execute_history_material_extract_task
 from app.services.project_import import execute_import_processing_background
 
 celery_app = Celery(
@@ -57,6 +58,12 @@ def run_compliance_matrix_excel_export_task(task_id: str) -> dict[str, str | int
 def run_business_draft_generation_task(task_id: str) -> dict[str, str | int]:
     with SessionLocal() as db:
         return execute_business_draft_generation_task(db, task_id)
+
+
+@celery_app.task(name="tasks.history_material_extract")
+def run_history_material_extract_task(task_id: str) -> dict:
+    with SessionLocal() as db:
+        return execute_history_material_extract_task(db, task_id)
 
 
 @celery_app.task(name="tasks.import_processing")

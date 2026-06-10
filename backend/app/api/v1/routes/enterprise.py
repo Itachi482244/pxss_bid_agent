@@ -6,15 +6,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import select
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import RequestContext, get_request_context
 from app.core.config import settings
-from app.db.session import get_db
-from app.models import AuditLog, EnterpriseMaterial, EnterpriseMaterialChunk, EnterpriseProfile
+from app.db.session import SessionLocal, get_db
+from app.models import AsyncTask, AuditLog, EnterpriseMaterial, EnterpriseMaterialChunk, EnterpriseProfile
+from app.schemas.document import AsyncTaskRead
 from app.schemas.enterprise import (
+    EnterpriseMaterialHistoryExtractResult,
     EnterpriseMaterialChunkRead,
     EnterpriseMaterialCreateRequest,
     EnterpriseMaterialRead,
@@ -23,10 +25,17 @@ from app.schemas.enterprise import (
     EnterpriseProfileRead,
     EnterpriseProfileUpsertRequest,
 )
-from app.services.document_utils import MAX_FILE_BYTES
+from app.services.document_utils import HISTORY_MATERIAL_FILE_MAX_BYTES, MAX_FILE_BYTES, readable_file_size, safe_filename
+from app.services.history_material_extract import (
+    HistoryMaterialExtractError,
+    create_pending_materials_from_extraction,
+    execute_history_material_extract_task,
+    extract_history_material_drafts,
+)
 from app.services.material_identity import enterprise_material_identity_key
 from app.services.material_retrieval import rebuild_material_chunks, search_material_hits
 from app.services.storage import put_object_bytes
+from app.services.task_dispatch import TaskDispatchError, enqueue_celery_task
 
 router = APIRouter()
 
@@ -348,7 +357,8 @@ def create_enterprise_material(
     )
     db.add(material)
     db.flush()
-    rebuild_material_chunks(db, material)
+    if material.verification_status == "confirmed":
+        rebuild_material_chunks(db, material)
     add_enterprise_audit_log(
         db,
         ctx,
@@ -362,6 +372,203 @@ def create_enterprise_material(
     db.commit()
     db.refresh(material)
     return material
+
+
+def _history_extract_object_key(ctx: RequestContext, filename: str, sha256: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    return (
+        f"tenants/{ctx.tenant_id}/enterprise-material-history/"
+        f"{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{sha256[:12]}{suffix}"
+    )
+
+
+def _read_history_upload_file(file: UploadFile) -> bytes:
+    data = file.file.read(HISTORY_MATERIAL_FILE_MAX_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
+    if len(data) > HISTORY_MATERIAL_FILE_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large; max {readable_file_size(HISTORY_MATERIAL_FILE_MAX_BYTES)}",
+        )
+    return data
+
+
+def _execute_history_extract_background(task_id: uuid.UUID) -> None:
+    with SessionLocal() as db:
+        execute_history_material_extract_task(db, task_id)
+
+
+@router.post(
+    "/materials/history-extract-tasks",
+    response_model=AsyncTaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_enterprise_materials_history_extract_task(
+    background_tasks: BackgroundTasks,
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    db: Annotated[Session, Depends(get_db)],
+    file: UploadFile = File(...),
+    pdf_mode: str = Form("auto"),
+    data_level: str = Form("internal"),
+) -> AsyncTaskRead:
+    validate_material_values(data_level=data_level)
+    data = _read_history_upload_file(file)
+    filename = safe_filename(file.filename)
+    sha256 = hashlib.sha256(data).hexdigest()
+    object_key = _history_extract_object_key(ctx, filename, sha256)
+    put_object_bytes(
+        bucket=settings.minio_bucket,
+        object_key=object_key,
+        data=data,
+        content_type=file.content_type,
+    )
+    idempotency_key = "history-material-extract:" + hashlib.sha256(
+        f"{ctx.tenant_id}:{ctx.user_id}:{sha256}:{pdf_mode}:{data_level}:{uuid.uuid4().hex}".encode("utf-8")
+    ).hexdigest()
+    task = AsyncTask(
+        tenant_id=ctx.tenant_id,
+        project_id=None,
+        section_id=None,
+        task_type="history_material_extract",
+        status="pending",
+        idempotency_key=idempotency_key,
+        progress=0,
+        input_json={
+            "source_file_name": filename,
+            "source_file_size": len(data),
+            "source_sha256": sha256,
+            "content_type": file.content_type,
+            "bucket": settings.minio_bucket,
+            "object_key": object_key,
+            "pdf_mode": pdf_mode,
+            "data_level": data_level,
+        },
+        retry_count=0,
+        max_retries=1,
+        created_by=ctx.user_id,
+    )
+    db.add(task)
+    db.flush()
+    db.add(
+        AuditLog(
+            tenant_id=ctx.tenant_id,
+            project_id=None,
+            section_id=None,
+            actor_user_id=ctx.user_id,
+            actor_type="user",
+            action="enterprise.materials_history_extract_requested",
+            object_type="async_task",
+            object_id=task.id,
+            after_json=task.input_json,
+            reason="用户上传历史投标文件并请求异步抽取企业资料",
+            severity="info",
+        )
+    )
+    db.commit()
+    db.refresh(task)
+
+    if settings.run_tasks_inline:
+        background_tasks.add_task(_execute_history_extract_background, task.id)
+    else:
+        from app.worker import run_history_material_extract_task
+
+        try:
+            enqueue_celery_task(
+                db,
+                task,
+                lambda: run_history_material_extract_task.delay(str(task.id)),
+            )
+        except TaskDispatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"历史资料抽取任务派发失败：{exc}",
+            ) from exc
+        db.refresh(task)
+    return AsyncTaskRead.model_validate(task)
+
+
+@router.post(
+    "/materials/history-extract",
+    response_model=EnterpriseMaterialHistoryExtractResult,
+    status_code=status.HTTP_201_CREATED,
+    deprecated=True,
+)
+def extract_enterprise_materials_from_history_file(
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    db: Annotated[Session, Depends(get_db)],
+    file: UploadFile = File(...),
+    pdf_mode: str = Form("auto"),
+    data_level: str = Form("internal"),
+):
+    validate_material_values(data_level=data_level)
+    data = _read_history_upload_file(file)
+
+    filename = safe_filename(file.filename)
+    sha256 = hashlib.sha256(data).hexdigest()
+    object_key = _history_extract_object_key(ctx, filename, sha256)
+    try:
+        extraction = extract_history_material_drafts(
+            db,
+            tenant_id=ctx.tenant_id,
+            actor_user_id=ctx.user_id,
+            data=data,
+            filename=filename,
+            content_type=file.content_type,
+            pdf_mode=pdf_mode,
+        )
+    except HistoryMaterialExtractError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    put_object_bytes(
+        bucket=settings.minio_bucket,
+        object_key=object_key,
+        data=data,
+        content_type=file.content_type,
+    )
+    materials = create_pending_materials_from_extraction(
+        db,
+        tenant_id=ctx.tenant_id,
+        actor_user_id=ctx.user_id,
+        extraction=extraction,
+        bucket=settings.minio_bucket,
+        object_key=object_key,
+        source_data=data,
+        data_level=data_level,
+    )
+    db.flush()
+    add_enterprise_audit_log(
+        db,
+        ctx,
+        action="enterprise.materials_extracted_from_history",
+        object_type="enterprise_material_history_file",
+        object_id=None,
+        before_json=None,
+        after_json={
+            "source_file_name": extraction.source_file_name,
+            "source_sha256": extraction.source_sha256,
+            "parser_summary": extraction.parser_summary,
+            "extraction_method": extraction.extraction_method,
+            "draft_count": len(materials),
+            "text_block_count": len(extraction.text_blocks),
+            "warnings": extraction.warnings,
+        },
+        reason="上传历史投标文件并抽取企业资料草稿",
+    )
+    db.commit()
+    for material in materials:
+        db.refresh(material)
+    return EnterpriseMaterialHistoryExtractResult(
+        materials=[EnterpriseMaterialRead.model_validate(material) for material in materials],
+        source_file_name=extraction.source_file_name,
+        source_file_size=extraction.source_file_size,
+        source_sha256=extraction.source_sha256,
+        parser_summary=extraction.parser_summary,
+        extraction_method=extraction.extraction_method,
+        warning_messages=extraction.warnings,
+        draft_count=len(materials),
+        text_block_count=len(extraction.text_blocks),
+    )
 
 
 @router.patch("/materials/{material_id}", response_model=EnterpriseMaterialRead)
@@ -384,8 +591,19 @@ def update_enterprise_material(
         setattr(material, field, value)
     material.updated_by = ctx.user_id
     db.flush()
-    if {"name", "structured_fields", "evidence_text", "data_level", "verification_status"} & set(update_data):
+    should_rebuild_chunks = (
+        material.verification_status == "confirmed"
+        and {"name", "structured_fields", "evidence_text", "data_level", "verification_status"} & set(update_data)
+    )
+    if should_rebuild_chunks:
         rebuild_material_chunks(db, material)
+    elif "verification_status" in update_data and material.verification_status != "confirmed":
+        db.execute(
+            delete(EnterpriseMaterialChunk).where(
+                EnterpriseMaterialChunk.tenant_id == ctx.tenant_id,
+                EnterpriseMaterialChunk.enterprise_material_id == material.id,
+            )
+        )
     add_enterprise_audit_log(
         db,
         ctx,

@@ -622,6 +622,18 @@ export type EnterpriseMaterial = {
   updated_at: string;
 };
 
+export type EnterpriseMaterialHistoryExtractResult = {
+  materials: EnterpriseMaterial[];
+  source_file_name: string;
+  source_file_size: number;
+  source_sha256: string;
+  parser_summary: Record<string, unknown>;
+  extraction_method: string;
+  warning_messages: string[];
+  draft_count: number;
+  text_block_count: number;
+};
+
 export type EnterpriseMaterialSearchResult = EnterpriseMaterial & {
   snippet: string | null;
   confidence_score: number;
@@ -918,6 +930,10 @@ export type EnterpriseMaterialPayload = {
   evidence_text?: string | null;
 };
 
+export type EnterpriseMaterialUpdatePayload = Partial<EnterpriseMaterialPayload> & {
+  reason: string;
+};
+
 export type ChatModelConfig = {
   id: string | null;
   capability: string;
@@ -1035,6 +1051,29 @@ export async function createEnterpriseMaterial(payload: EnterpriseMaterialPayloa
   return response.data;
 }
 
+export async function updateEnterpriseMaterial(materialId: string, payload: EnterpriseMaterialUpdatePayload) {
+  const response = await apiClient.patch<EnterpriseMaterial>(`/enterprise/materials/${materialId}`, payload);
+  return response.data;
+}
+
+export async function createEnterpriseMaterialsHistoryExtractTask(payload: {
+  file: File;
+  dataLevel?: string;
+}) {
+  const form = new FormData();
+  form.append("file", payload.file);
+  form.append("data_level", payload.dataLevel ?? "internal");
+  const response = await apiClient.post<AsyncTask>(
+    "/enterprise/materials/history-extract-tasks",
+    form,
+    {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 1500000
+    }
+  );
+  return response.data;
+}
+
 export async function uploadEnterpriseMaterialFile(
   materialId: string,
   payload: {
@@ -1087,12 +1126,25 @@ export async function listProjects(params?: {
   limit?: number;
   offset?: number;
 }) {
-  // 首页/看板对全部项目做客户端分组、搜索与分页，需一次性取全量；
-  // 后端默认 limit 仅 50，会导致删除可见项后被隐藏池回填，看起来“删了没用”。
-  const response = await apiClient.get<ProjectSummary[]>("/projects", {
-    params: { limit: 200, ...params }
-  });
-  return response.data;
+  const pageSize = 200;
+  if (params?.limit !== undefined || params?.offset !== undefined) {
+    const response = await apiClient.get<ProjectSummary[]>("/projects", {
+      params: { limit: pageSize, ...params }
+    });
+    return response.data;
+  }
+
+  const projects: ProjectSummary[] = [];
+  let offset = 0;
+  while (true) {
+    const response = await apiClient.get<ProjectSummary[]>("/projects", {
+      params: { ...params, limit: pageSize, offset }
+    });
+    projects.push(...response.data);
+    if (response.data.length < pageSize) break;
+    offset += pageSize;
+  }
+  return projects;
 }
 
 export async function getProject(projectId: string) {

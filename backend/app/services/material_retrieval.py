@@ -68,7 +68,10 @@ def matched_search_terms(query: str, text: str) -> list[str]:
 
 
 def material_text(material: EnterpriseMaterial) -> str:
-    structured = json.dumps(material.structured_fields or {}, ensure_ascii=False)
+    searchable_fields = dict(material.structured_fields or {})
+    searchable_fields.pop("source_images", None)
+    searchable_fields.pop("primary_source_image", None)
+    structured = json.dumps(searchable_fields, ensure_ascii=False)
     values = [
         material.name,
         material.material_type,
@@ -187,6 +190,9 @@ def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[E
         )
     )
     chunks: list[EnterpriseMaterialChunk] = []
+    structured_fields = material.structured_fields or {}
+    source_images = structured_fields.get("source_images") if isinstance(structured_fields, dict) else None
+    primary_source_image = structured_fields.get("primary_source_image") if isinstance(structured_fields, dict) else None
     for index, content in enumerate(split_material_chunks(material)):
         embedding = pseudo_embedding(content)
         chunk = EnterpriseMaterialChunk(
@@ -199,6 +205,8 @@ def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[E
                 "material_name": material.name,
                 "material_type": material.material_type,
                 "verification_status": material.verification_status,
+                "source_images": source_images if isinstance(source_images, list) else [],
+                "primary_source_image": primary_source_image if isinstance(primary_source_image, dict) else None,
             },
             embedding_vector=vector_to_pg(embedding),
             embedding_json=embedding,
@@ -266,6 +274,8 @@ def search_material_hits(
         stmt = stmt.where(EnterpriseMaterial.material_type == material_type)
     if verification_status:
         stmt = stmt.where(EnterpriseMaterial.verification_status == verification_status)
+    else:
+        stmt = stmt.where(EnterpriseMaterial.verification_status == "confirmed")
     materials = db.scalars(stmt.order_by(EnterpriseMaterial.updated_at.desc()).limit(200)).all()
 
     terms = search_terms(query)
@@ -281,7 +291,12 @@ def search_material_hits(
             )
             .order_by(EnterpriseMaterialChunk.chunk_index.asc())
         ).all()
-        candidates = chunks or [_virtual_chunk(material)]
+        if chunks:
+            candidates = chunks
+        elif material.verification_status == "confirmed":
+            candidates = [_virtual_chunk(material)]
+        else:
+            continue
         best_hit: MaterialSearchHit | None = None
         for chunk in candidates:
             score = _score_chunk(

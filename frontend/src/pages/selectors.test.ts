@@ -1,12 +1,13 @@
 import dayjs from "dayjs";
 import { describe, expect, it } from "vitest";
 
-import type { DraftBlock, ProjectSummary } from "../api/bid";
+import type { DraftBlock, EnterpriseMaterial, ProjectSummary } from "../api/bid";
 import {
   classifyProjectGroup,
   computeDashboardStats,
   computeDraftBlockFilterCounts,
   filterHomeProjects,
+  materialExtractionMeta,
   matchesDraftBlockFilter
 } from "./selectors";
 
@@ -26,6 +27,35 @@ function makeProject(partial: Partial<ProjectSummary>): ProjectSummary {
 
 function makeBlock(reviewStatus: string): DraftBlock {
   return { review_status: reviewStatus } as DraftBlock;
+}
+
+function makeMaterial(partial: Partial<EnterpriseMaterial>): EnterpriseMaterial {
+  return {
+    id: "m1",
+    tenant_id: "t1",
+    material_type: "qualification",
+    name: "资质",
+    issuing_authority: null,
+    certificate_no: null,
+    holder_name: null,
+    project_name: null,
+    amount: null,
+    valid_from: null,
+    valid_until: null,
+    data_level: "internal",
+    verification_status: "pending_confirm",
+    structured_fields: null,
+    evidence_text: null,
+    file_name: null,
+    content_type: null,
+    file_size: null,
+    sha256: null,
+    created_by: "u1",
+    updated_by: "u1",
+    created_at: "2026-06-07T00:00:00Z",
+    updated_at: "2026-06-07T00:00:00Z",
+    ...partial
+  };
 }
 
 describe("classifyProjectGroup", () => {
@@ -144,5 +174,40 @@ describe("computeDashboardStats", () => {
       makeProject({ status: "exported", bid_deadline_at: now.add(3, "day").toISOString() })
     ];
     expect(computeDashboardStats(projects, now).dueSoonCount).toBe(1);
+  });
+});
+
+describe("materialExtractionMeta", () => {
+  it("提取历史文件来源、位置、置信度和复核标记", () => {
+    const meta = materialExtractionMeta(
+      makeMaterial({
+        structured_fields: {
+          source: "history_file_extract",
+          source_file_name: "历史投标资料.docx",
+          source_locations: [{ page_no: 3, block_index: 7 }],
+          source_images: [{ page_no: 3, object_key: "source-pages/page-0003.png" }],
+          extraction_confidence: 0.83,
+          extraction_method: "local_rules",
+          needs_human_confirm: true
+        }
+      })
+    );
+
+    expect(meta).toEqual({
+      isHistoryExtracted: true,
+      sourceFileName: "历史投标资料.docx",
+      sourceLocationText: "P3 · 块 7",
+      sourceImageCount: 1,
+      confidence: 0.83,
+      needsHumanConfirm: true,
+      extractionMethod: "local_rules"
+    });
+  });
+
+  it("普通手工资料保持温和默认值", () => {
+    const meta = materialExtractionMeta(makeMaterial({ verification_status: "confirmed", file_name: "资质.pdf" }));
+    expect(meta.isHistoryExtracted).toBe(false);
+    expect(meta.sourceFileName).toBe("资质.pdf");
+    expect(meta.needsHumanConfirm).toBe(false);
   });
 });

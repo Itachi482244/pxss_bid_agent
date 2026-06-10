@@ -78,6 +78,7 @@ import {
   updateBusinessDraftContextPackDirectives,
   type AuthorDirectiveInput,
   createComplianceItemFromSource,
+  createEnterpriseMaterialsHistoryExtractTask,
   createParseTask,
   createProjectImportDraftFromFile,
   createProjectImportDraftFromUrl,
@@ -130,6 +131,7 @@ import {
   unlinkDuplicateGroupItem,
   updateProject,
   updateSection,
+  updateEnterpriseMaterial,
   saveChatModelConfig,
   testChatModelConfig,
   upsertEnterpriseProfile,
@@ -158,6 +160,7 @@ import type {
   DraftBlock,
   DraftCoverageReview,
   EnterpriseMaterial,
+  EnterpriseMaterialHistoryExtractResult,
   EnterpriseMaterialSearchResult,
   EnterpriseProfile,
   ExportFile,
@@ -188,6 +191,7 @@ import {
   computeDashboardStats,
   computeDraftBlockFilterCounts,
   filterHomeProjects,
+  materialExtractionMeta,
   matchesDraftBlockFilter,
   type DraftBlockFilter,
   type ProjectGroup
@@ -296,6 +300,38 @@ const contextPackProjectFields = new Set([
   "industry_code"
 ]);
 type MatrixReviewFilter = "all" | "unconfirmed" | "high" | "mandatory" | "missing_evidence";
+
+function errorMessage(error: unknown, fallback: string) {
+  if (error && typeof error === "object") {
+    const candidate = error as {
+      message?: string;
+      code?: string;
+      response?: { status?: number; data?: { detail?: unknown } | unknown };
+    };
+    const responseData = candidate.response?.data;
+    const detail = responseData && typeof responseData === "object" && "detail" in responseData
+      ? (responseData as { detail?: unknown }).detail
+      : undefined;
+    if (typeof detail === "string" && detail.trim()) return detail;
+    if (Array.isArray(detail) && detail.length) {
+      return detail
+        .map((item) => {
+          if (item && typeof item === "object" && "msg" in item) return String((item as { msg?: unknown }).msg ?? "");
+          return String(item);
+        })
+        .filter(Boolean)
+        .join("；");
+    }
+    if (candidate.message === "Network Error" || candidate.code === "ERR_NETWORK") {
+      return "无法连接后端服务，请确认 FastAPI 已在 http://localhost:8000 启动。";
+    }
+    if (candidate.response?.status && candidate.response.status >= 500 && !detail) {
+      return "后端服务异常或未启动，请确认 FastAPI 已在 http://localhost:8000 启动并通过 /health 检查。";
+    }
+    if (candidate.message?.trim()) return candidate.message;
+  }
+  return fallback;
+}
 
 const workflowStepKeys = new Set<WorkflowStepKey>([
   "documents",
@@ -914,6 +950,28 @@ function taskOutputText(task: AsyncTask | null, key: string) {
   return typeof value === "string" && value.trim() ? value : "";
 }
 
+function outputRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function historyExtractResultFromTask(task: AsyncTask): EnterpriseMaterialHistoryExtractResult | null {
+  const output = task.output_json;
+  if (!output || !Array.isArray(output.materials)) return null;
+  return {
+    materials: output.materials as EnterpriseMaterial[],
+    source_file_name: typeof output.source_file_name === "string" ? output.source_file_name : "",
+    source_file_size: summaryNumber(output, "source_file_size"),
+    source_sha256: typeof output.source_sha256 === "string" ? output.source_sha256 : "",
+    parser_summary: outputRecord(output.parser_summary),
+    extraction_method: typeof output.extraction_method === "string" ? output.extraction_method : "",
+    warning_messages: Array.isArray(output.warning_messages)
+      ? output.warning_messages.filter((item): item is string => typeof item === "string")
+      : [],
+    draft_count: summaryNumber(output, "draft_count"),
+    text_block_count: summaryNumber(output, "text_block_count")
+  };
+}
+
 function asyncTaskStatusText(task: AsyncTask | null, taskId: string | null) {
   if (!taskId) return "";
   if (!task) return "排队中";
@@ -954,6 +1012,29 @@ function matrixTaskStageTitle(task: AsyncTask | null) {
   const sectionText = sectionPosition && sectionCount ? `第 ${sectionPosition}/${sectionCount} 段` : "";
   const retryText = retryIndex && retryCount ? `子段 ${retryIndex}/${retryCount}` : "";
   return [stageLabel, sectionText, retryText].filter(Boolean).join(" · ");
+}
+
+function historyExtractTaskStageTitle(task: AsyncTask | null) {
+  if (!task) return "历史资料抽取排队中";
+  if (task.status === "succeeded") return "历史资料已抽取";
+  if (task.status === "failed") return "历史资料抽取失败";
+  const output = task.output_json ?? null;
+  const stage = taskOutputText(task, "stage");
+  const completedPages = summaryNumber(output, "ocr_completed_pages");
+  const totalPages = summaryNumber(output, "ocr_total_pages");
+  const sourceName = taskOutputText(task, "source_file_name");
+  const stageLabel =
+    stage === "reading_file"
+      ? "读取历史文件"
+      : stage === "extracting_text"
+        ? "解析文本/准备 OCR"
+        : stage === "ocr"
+          ? "逐页 OCR 识别"
+          : stage === "writing_materials"
+            ? "写入待确认资料"
+            : "历史资料抽取中";
+  const pageText = completedPages && totalPages ? `第 ${completedPages}/${totalPages} 页` : "";
+  return [stageLabel, pageText, sourceName].filter(Boolean).join(" · ");
 }
 
 function taskProgressMessage(task: AsyncTask | null, activeFallback: string, doneFallback: string) {
@@ -1242,6 +1323,7 @@ export function App() {
   const locateReviewTimerRef = useRef<number | null>(null);
   const terminalTaskRefreshKeysRef = useRef<Set<string>>(new Set());
   const businessDraftTerminalTaskRef = useRef<Set<string>>(new Set());
+  const historyExtractTerminalTaskRef = useRef<Set<string>>(new Set());
   const [materialSearchQuery, setMaterialSearchQuery] = useState("");
   const [materialSearchResults, setMaterialSearchResults] = useState<EnterpriseMaterialSearchResult[]>([]);
   const [loadingMaterialSearch, setLoadingMaterialSearch] = useState(false);
@@ -1251,6 +1333,7 @@ export function App() {
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [projectCreateMode, setProjectCreateMode] = useState<ProjectCreateMode>("manual");
   const [projectImportDraft, setProjectImportDraft] = useState<ProjectImportDraft | null>(null);
+  const [projectImportError, setProjectImportError] = useState("");
   const [importUrl, setImportUrl] = useState("");
   const [importUrlSite, setImportUrlSite] = useState("");
   const [importingProjectDraft, setImportingProjectDraft] = useState(false);
@@ -1287,9 +1370,11 @@ export function App() {
 
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProjectRowKeys, setSelectedProjectRowKeys] = useState<Key[]>([]);
+  const [projectDeleteTargets, setProjectDeleteTargets] = useState<ProjectSummary[]>([]);
   const [homeProjectGroup, setHomeProjectGroup] = useState<ProjectGroup>("needs_me");
   const [homeProjectSearch, setHomeProjectSearch] = useState("");
   const [homeProjectPage, setHomeProjectPage] = useState(1);
+  const [homeProjectPageSize, setHomeProjectPageSize] = useState(8);
   const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(null);
   const [sections, setSections] = useState<SectionSummary[]>([]);
   const [documents, setDocuments] = useState<ProjectDocument[]>([]);
@@ -1355,6 +1440,11 @@ export function App() {
   const [enterpriseMaterials, setEnterpriseMaterials] = useState<EnterpriseMaterial[]>([]);
   const [loadingEnterprise, setLoadingEnterprise] = useState(false);
   const [savingEnterprise, setSavingEnterprise] = useState(false);
+  const [extractingHistoryMaterial, setExtractingHistoryMaterial] = useState(false);
+  const [historyExtractTaskId, setHistoryExtractTaskId] = useState<string | null>(null);
+  const [historyExtractTask, setHistoryExtractTask] = useState<AsyncTask | null>(null);
+  const [historyExtractResult, setHistoryExtractResult] = useState<EnterpriseMaterialHistoryExtractResult | null>(null);
+  const [confirmingMaterialId, setConfirmingMaterialId] = useState("");
   const [profileDraft, setProfileDraft] = useState({
     companyName: "",
     unifiedSocialCreditCode: "",
@@ -1408,7 +1498,7 @@ export function App() {
       applyProjectList(data);
       return data;
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : "项目列表加载失败");
+      setApiError(errorMessage(error, "项目列表加载失败"));
       return [];
     } finally {
       setLoadingProjects(false);
@@ -1423,7 +1513,7 @@ export function App() {
         if (active) applyProjectList(data);
       })
       .catch((error: unknown) => {
-        if (active) setApiError(error instanceof Error ? error.message : "项目列表加载失败");
+        if (active) setApiError(errorMessage(error, "项目列表加载失败"));
       })
       .finally(() => {
         if (active) setLoadingProjects(false);
@@ -1463,7 +1553,7 @@ export function App() {
         });
       }
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : "企业资料加载失败");
+      setApiError(errorMessage(error, "企业资料加载失败"));
     } finally {
       setLoadingEnterprise(false);
     }
@@ -1491,7 +1581,7 @@ export function App() {
       applyChatModelConfig(config);
       return config;
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : "模型配置加载失败");
+      setApiError(errorMessage(error, "模型配置加载失败"));
       return null;
     } finally {
       setLoadingModelConfig(false);
@@ -2230,6 +2320,9 @@ export function App() {
     businessDraftGenerationTask,
     businessDraftGenerationTaskId
   );
+  const historyExtractActive = isAsyncTaskActive(historyExtractTask, historyExtractTaskId);
+  const historyExtractProgress = asyncTaskProgress(historyExtractTask, historyExtractTaskId);
+  const historyExtractStatusText = asyncTaskStatusText(historyExtractTask, historyExtractTaskId);
   const blockingContextPackChecks = contextPackChecks.filter((check) => String(check.status ?? "warn") !== "pass");
   const rawParseTaskActive = isAsyncTaskActive(importProcessing?.parseTask ?? null, importProcessing?.parseTaskId ?? null);
   const rawMatrixTaskActive = isAsyncTaskActive(importProcessing?.matrixTask ?? null, importProcessing?.matrixTaskId ?? null);
@@ -2837,8 +2930,6 @@ export function App() {
     return [...matrixTodos, ...fileTodos].slice(0, 5);
   }, [currentProject?.bid_deadline_at, currentProject?.name, currentSection?.bid_deadline_at, matrixRows, sections]);
 
-  const HOME_PROJECT_PAGE_SIZE = 8;
-
   const projectGroupCounts = useMemo(() => {
     const counts: Record<ProjectGroup, number> = { needs_me: 0, in_progress: 0, done: 0 };
     projects.forEach((project) => {
@@ -3283,6 +3374,89 @@ export function App() {
     reloadBusinessDraftContext,
     reloadPreflightCheck
   ]);
+
+  useEffect(() => {
+    if (!historyExtractTaskId) return;
+    let active = true;
+    let clearTimer: number | null = null;
+
+    const pollHistoryExtractTask = async () => {
+      const task = await getTask(historyExtractTaskId);
+      if (!active) return;
+      setHistoryExtractTask(task);
+
+      if (!isAsyncTaskTerminalStatus(task.status)) return;
+      const terminalKey = `${task.id}:${task.status}`;
+      if (historyExtractTerminalTaskRef.current.has(terminalKey)) return;
+      historyExtractTerminalTaskRef.current.add(terminalKey);
+
+      if (task.status === "succeeded") {
+        const result = historyExtractResultFromTask(task);
+        if (!result) {
+          const message = "历史资料抽取完成，但结果结构异常";
+          setApiError(message);
+          appendLog(message);
+          notification.error({
+            message: "历史资料抽取结果异常",
+            description: message,
+            placement: "topRight",
+            duration: 8
+          });
+        } else {
+          setHistoryExtractResult(result);
+          setEnterpriseMaterials((items) => {
+            const existingIds = new Set(items.map((item) => item.id));
+            const newItems = result.materials.filter((item) => !existingIds.has(item.id));
+            return [...newItems, ...items];
+          });
+          setContextPackPreview(null);
+          setContextPackPreviewOpen(false);
+          await reloadAuditLogs();
+          appendLog(`历史资料抽取完成：${result.source_file_name}，生成 ${result.draft_count} 条待确认资料`);
+          notification.success({
+            message: "历史资料已抽取",
+            description:
+              result.draft_count > 0
+                ? `已生成 ${result.draft_count} 条待确认草稿，请逐条核对来源后确认。`
+                : "未识别到可入库资料，可换一份文件或手工新增。",
+            placement: "topRight",
+            duration: 6
+          });
+        }
+      } else {
+        const message = task.error_message || "历史资料抽取任务失败";
+        setApiError(message);
+        appendLog(`历史资料抽取失败：${truncateText(message, 48)}`);
+        notification.error({
+          message: "历史资料抽取失败",
+          description: truncateText(message, 80),
+          placement: "topRight",
+          duration: 8
+        });
+      }
+
+      clearTimer = window.setTimeout(() => {
+        if (!active) return;
+        setHistoryExtractTaskId(null);
+        setHistoryExtractTask(null);
+      }, 8000);
+    };
+
+    void pollHistoryExtractTask().catch((error: unknown) => {
+      setApiError(error instanceof Error ? error.message : "历史资料任务状态刷新失败");
+    });
+    const intervalId = window.setInterval(() => {
+      void pollHistoryExtractTask().catch((error: unknown) => {
+        setApiError(error instanceof Error ? error.message : "历史资料任务状态刷新失败");
+      });
+    }, 1500);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+      if (clearTimer) window.clearTimeout(clearTimer);
+    };
+  }, [appendLog, historyExtractTaskId, reloadAuditLogs]);
 
   const runMaterialSearch = useCallback(async (query: string) => {
     setMaterialSearchQuery(query);
@@ -5327,6 +5501,7 @@ export function App() {
       sectionName: "一标段"
     });
     setProjectImportDraft(null);
+    setProjectImportError("");
     setImportUrl("");
     setImportUrlSite("");
   };
@@ -5339,6 +5514,7 @@ export function App() {
 
   const applyImportDraft = (draft: ProjectImportDraft) => {
     setProjectImportDraft(draft);
+    setProjectImportError("");
     setNewProjectDraft({
       name: draft.project.name,
       purchaser: draft.project.purchaser ?? "",
@@ -5367,13 +5543,22 @@ export function App() {
 
   const handleImportDraftFile: UploadProps["beforeUpload"] = (file) => {
     setImportingProjectDraft(true);
+    setProjectImportError("");
+    setApiError("");
     createProjectImportDraftFromFile(file)
       .then((draft) => {
         applyImportDraft(draft);
         appendLog(`从文件识别项目信息：${draft.source.original_filename}`);
       })
       .catch((error: unknown) => {
-        setApiError(error instanceof Error ? error.message : "文件导入识别失败");
+        const message = errorMessage(error, "文件导入识别失败");
+        setProjectImportError(message);
+        setApiError(message);
+        notification.error({
+          message: "招标文件导入失败",
+          description: message,
+          placement: "topRight"
+        });
       })
       .finally(() => setImportingProjectDraft(false));
     return false;
@@ -5385,6 +5570,8 @@ export function App() {
       return;
     }
     setImportingProjectDraft(true);
+    setProjectImportError("");
+    setApiError("");
     try {
       const draft = await createProjectImportDraftFromUrl({
         source_url: importUrl.trim(),
@@ -5394,7 +5581,14 @@ export function App() {
       applyImportDraft(draft);
       appendLog("从网页或公告链接识别项目信息");
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : "网页导入识别失败");
+      const message = errorMessage(error, "网页导入识别失败");
+      setProjectImportError(message);
+      setApiError(message);
+      notification.error({
+        message: "网页导入失败",
+        description: message,
+        placement: "topRight"
+      });
     } finally {
       setImportingProjectDraft(false);
     }
@@ -5594,34 +5788,33 @@ export function App() {
     }
   };
 
+  const handleConfirmProjectDeletion = async () => {
+    const projectIds = projectDeleteTargets.map((project) => project.id);
+    if (!projectIds.length) return;
+    await executeProjectDeletion(projectIds);
+    setProjectDeleteTargets([]);
+  };
+
   const confirmDeleteProjects = (projectIds: string[]) => {
     const targetProjects = projects.filter((project) => projectIds.includes(project.id));
     if (!targetProjects.length) return;
-    Modal.confirm({
-      title: targetProjects.length === 1 ? "删除项目" : `批量删除 ${targetProjects.length} 个项目`,
-      content: (
-        <Space direction="vertical" size={8} style={{ width: "100%" }}>
-          <Text>
-            删除后项目会归档隐藏，默认项目列表不再显示；项目文件、矩阵、审批和审计记录会保留在系统中。
-          </Text>
-          <Text type="secondary">
-            {targetProjects
-              .slice(0, 5)
-              .map((project) => project.name)
-              .join("、")}
-            {targetProjects.length > 5 ? ` 等 ${targetProjects.length} 个项目` : ""}
-          </Text>
-        </Space>
-      ),
-      okText: "删除项目",
-      okButtonProps: { danger: true },
-      cancelText: "取消",
-      onOk: () => executeProjectDeletion(projectIds)
-    });
+    setProjectDeleteTargets(targetProjects);
   };
 
   const handleUploadDocument: UploadProps["customRequest"] = async (options) => {
-    if (!selectedProjectId || !selectedSectionId || !(options.file instanceof File)) return;
+    if (!(options.file instanceof File)) {
+      const message = "请选择要上传的 Word/PDF 文件。";
+      options.onError?.(new Error(message));
+      Modal.warning({ title: "文件无效", content: message });
+      return;
+    }
+    if (!selectedProjectId || !selectedSectionId) {
+      const message = "请先选择项目和标段，再上传招标文件。";
+      options.onError?.(new Error(message));
+      setApiError(message);
+      Modal.warning({ title: "无法上传招标文件", content: message });
+      return;
+    }
     setDocumentBusy(true);
     try {
       const document = await uploadDocument(selectedProjectId, selectedSectionId, {
@@ -5634,7 +5827,13 @@ export function App() {
       await refreshAfterMatrixMutation();
     } catch (error) {
       options.onError?.(error as Error);
-      setApiError(error instanceof Error ? error.message : "文件上传或解析失败");
+      const message = errorMessage(error, "文件上传或解析失败");
+      setApiError(message);
+      notification.error({
+        message: "文件上传或解析失败",
+        description: message,
+        placement: "topRight"
+      });
     } finally {
       setDocumentBusy(false);
     }
@@ -5915,6 +6114,54 @@ export function App() {
       setApiError(error instanceof Error ? error.message : "企业资料新增失败");
     } finally {
       setSavingEnterprise(false);
+    }
+  };
+
+  const handleHistoryMaterialUpload: UploadProps["customRequest"] = async (options) => {
+    if (!(options.file instanceof File)) return;
+    setExtractingHistoryMaterial(true);
+    setHistoryExtractResult(null);
+    setHistoryExtractTaskId(null);
+    setHistoryExtractTask(null);
+    try {
+      const task = await createEnterpriseMaterialsHistoryExtractTask({
+        file: options.file,
+        dataLevel: "internal"
+      });
+      setHistoryExtractTaskId(task.id);
+      setHistoryExtractTask(task);
+      options.onSuccess?.(task, options.file);
+      appendLog(`历史资料抽取任务已创建：${taskShortId(task.id)}`);
+      notification.info({
+        message: "历史资料开始抽取",
+        description: "系统会在后台逐页 OCR/整理资料，完成后自动刷新企业资料表。",
+        placement: "topRight",
+        duration: 5
+      });
+    } catch (error) {
+      options.onError?.(error as Error);
+      setApiError(error instanceof Error ? error.message : "历史资料抽取失败");
+    } finally {
+      setExtractingHistoryMaterial(false);
+    }
+  };
+
+  const handleConfirmExtractedMaterial = async (material: EnterpriseMaterial) => {
+    setConfirmingMaterialId(material.id);
+    try {
+      const updated = await updateEnterpriseMaterial(material.id, {
+        verification_status: "confirmed",
+        reason: "人工核对历史资料抽取结果并确认入库"
+      });
+      setEnterpriseMaterials((items) => items.map((item) => (item.id === updated.id ? updated : item)));
+      setContextPackPreview(null);
+      setContextPackPreviewOpen(false);
+      appendLog(`确认历史资料草稿：${updated.name}`);
+      notification.success({ message: "资料已确认", description: "已进入企业资料库，可参与后续检索和证据推荐。" });
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "企业资料确认失败");
+    } finally {
+      setConfirmingMaterialId("");
     }
   };
 
@@ -6245,7 +6492,7 @@ export function App() {
               <div>
                 <Text type="secondary">企业资料库</Text>
                 <Title level={2}>投标能力底座</Title>
-                <Text type="secondary">维护企业画像、资质证照、人员材料、业绩案例和商务模板，后续用于资格预评估和商务标书草稿。</Text>
+                <Text type="secondary">维护企业画像、资质证照、人员材料、业绩案例和商务模板；历史文件可先自动抽取为待确认草稿。</Text>
               </div>
               <Space wrap>
                 <Button onClick={reloadEnterprise} loading={loadingEnterprise}>
@@ -6340,12 +6587,76 @@ export function App() {
                 <div className="panel-title-row">
                   <div>
                     <Text strong>企业资料</Text>
-                    <p>第一版先手工结构化，后续接文件抽取和 RAG 检索</p>
+                    <p>历史 Word 直接解析文本，PDF 自动识别文本型/扫描件；抽取结果必须人工确认后才进入检索语料。</p>
                   </div>
                   <Space wrap>
                     <Tag color="blue">{enterpriseMaterials.length} 条资料</Tag>
                     <Tag color="green">{enterpriseMaterials.filter((item) => item.verification_status === "confirmed").length} 条已确认</Tag>
                   </Space>
+                </div>
+                <div className="history-extract-card">
+                  <div>
+                    <Text strong>从历史投标文件抽取</Text>
+                    <p>
+                      上传历史 Word、PDF 或图片，系统自动识别文本层/OCR，并整理为待确认企业资料草稿。
+                    </p>
+                    <Space wrap>
+                      <Upload
+                        showUploadList={false}
+                        disabled={extractingHistoryMaterial || historyExtractActive}
+                        accept=".docx,.pdf,.jpg,.jpeg,.png,.bmp,.tif,.tiff"
+                        customRequest={handleHistoryMaterialUpload}
+                      >
+                        <Button
+                          icon={<CloudUploadOutlined />}
+                          loading={extractingHistoryMaterial || historyExtractActive}
+                          disabled={extractingHistoryMaterial || historyExtractActive}
+                        >
+                          {historyExtractActive ? "正在抽取" : "上传历史投标文件"}
+                        </Button>
+                      </Upload>
+                    </Space>
+                    {historyExtractTaskId && (
+                      <div className="history-extract-task">
+                        <Space wrap size={8}>
+                          <Tag color={asyncTaskStatusColors[historyExtractTask?.status ?? "pending"]}>
+                            {historyExtractStatusText}
+                          </Tag>
+                          <Text type="secondary">{historyExtractTaskStageTitle(historyExtractTask)}</Text>
+                          {asyncTaskEtaText(historyExtractTask, historyExtractTaskId) && (
+                            <Text type="secondary">{asyncTaskEtaText(historyExtractTask, historyExtractTaskId)}</Text>
+                          )}
+                        </Space>
+                        <Progress
+                          percent={historyExtractProgress}
+                          size="small"
+                          status={
+                            historyExtractTask?.status === "failed"
+                              ? "exception"
+                              : historyExtractTask?.status === "succeeded"
+                                ? "success"
+                                : "active"
+                          }
+                        />
+                      </div>
+                    )}
+                  </div>
+                  <Alert
+                    type={historyExtractResult?.warning_messages.length ? "warning" : "info"}
+                    showIcon
+                    message={
+                      historyExtractResult
+                        ? `最近抽取：${historyExtractResult.draft_count} 条草稿 · ${historyExtractResult.text_block_count} 个文本块`
+                        : "抽取结果会先标记为待确认"
+                    }
+                    description={
+                      historyExtractResult
+                        ? `${historyExtractResult.source_file_name} · ${
+                            historyExtractResult.extraction_method === "llm" ? "LLM 整理" : "本地规则兜底"
+                          }${historyExtractResult.warning_messages.length ? ` · ${historyExtractResult.warning_messages.join("；")}` : ""}`
+                        : "请逐条核对名称、证书号、来源片段和有效期；确认后才会进入候选证据检索。"
+                    }
+                  />
                 </div>
                 <Table<EnterpriseMaterial>
                   size="middle"
@@ -6359,13 +6670,28 @@ export function App() {
                     {
                       title: "资料名称",
                       dataIndex: "name",
-                      width: 260,
+                      width: 300,
                       render: (value, record) => (
                         <Space direction="vertical" size={0}>
-                          <Text strong>{value}</Text>
+                          <Space wrap size={4}>
+                            <Text strong>{value}</Text>
+                            {materialExtractionMeta(record).isHistoryExtracted && <Tag color="purple">历史抽取</Tag>}
+                          </Space>
                           <Text type="secondary">
                             {record.certificate_no || record.project_name || record.holder_name || "待补充结构化字段"}
                           </Text>
+                          {materialExtractionMeta(record).isHistoryExtracted && (
+                            <Text type="secondary">
+                              来源：{materialExtractionMeta(record).sourceFileName || "历史文件"}
+                              {materialExtractionMeta(record).sourceLocationText ? ` · ${materialExtractionMeta(record).sourceLocationText}` : ""}
+                              {materialExtractionMeta(record).sourceImageCount
+                                ? ` · 原页图片 ${materialExtractionMeta(record).sourceImageCount} 张`
+                                : ""}
+                              {materialExtractionMeta(record).confidence !== null
+                                ? ` · 置信度 ${Math.round((materialExtractionMeta(record).confidence ?? 0) * 100)}%`
+                                : ""}
+                            </Text>
+                          )}
                         </Space>
                       )
                     },
@@ -6416,6 +6742,33 @@ export function App() {
                           </Upload>
                         </Space>
                       )
+                    },
+                    {
+                      title: "操作",
+                      key: "action",
+                      fixed: "right",
+                      width: 130,
+                      render: (_, record) => {
+                        const meta = materialExtractionMeta(record);
+                        const canConfirm = record.verification_status === "pending_confirm";
+                        return (
+                          <Space direction="vertical" size={4}>
+                            <Button
+                              size="small"
+                              type={canConfirm ? "primary" : "default"}
+                              icon={<CheckCircleOutlined />}
+                              disabled={!canConfirm}
+                              loading={confirmingMaterialId === record.id}
+                              onClick={() => void handleConfirmExtractedMaterial(record)}
+                            >
+                              {canConfirm ? "确认入库" : "已处理"}
+                            </Button>
+                            {meta.needsHumanConfirm && canConfirm && (
+                              <Text type="secondary">核对来源后确认</Text>
+                            )}
+                          </Space>
+                        );
+                      }
                     }
                   ]}
                 />
@@ -6685,9 +7038,18 @@ export function App() {
                   tableLayout="fixed"
                   pagination={{
                     current: homeProjectPage,
-                    pageSize: HOME_PROJECT_PAGE_SIZE,
-                    onChange: setHomeProjectPage,
-                    showSizeChanger: false,
+                    pageSize: homeProjectPageSize,
+                    pageSizeOptions: ["8", "20", "50", "100"],
+                    showSizeChanger: true,
+                    showTotal: (total) => `共 ${total} 个项目`,
+                    onChange: (page, pageSize) => {
+                      setHomeProjectPage(page);
+                      setHomeProjectPageSize(pageSize);
+                    },
+                    onShowSizeChange: (_current, pageSize) => {
+                      setHomeProjectPage(1);
+                      setHomeProjectPageSize(pageSize);
+                    },
                     hideOnSinglePage: true
                   }}
                   dataSource={filteredHomeProjects}
@@ -9640,6 +10002,35 @@ export function App() {
         )}
       </Layout>
       <Modal
+        title={projectDeleteTargets.length === 1 ? "删除项目" : `批量删除 ${projectDeleteTargets.length} 个项目`}
+        open={projectDeleteTargets.length > 0}
+        okText="删除项目"
+        okButtonProps={{ danger: true }}
+        cancelText="取消"
+        confirmLoading={deletingProjects}
+        destroyOnHidden
+        maskClosable={!deletingProjects}
+        maskTransitionName=""
+        transitionName=""
+        onOk={handleConfirmProjectDeletion}
+        onCancel={() => {
+          if (!deletingProjects) setProjectDeleteTargets([]);
+        }}
+      >
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+          <Text>
+            删除后项目会归档隐藏，默认项目列表不再显示；项目文件、矩阵、审批和审计记录会保留在系统中。
+          </Text>
+          <Text type="secondary">
+            {projectDeleteTargets
+              .slice(0, 5)
+              .map((project) => project.name)
+              .join("、")}
+            {projectDeleteTargets.length > 5 ? ` 等 ${projectDeleteTargets.length} 个项目` : ""}
+          </Text>
+        </Space>
+      </Modal>
+      <Modal
         title="新建投标项目"
         open={newProjectOpen}
         width={760}
@@ -9668,6 +10059,7 @@ export function App() {
               if (savingProject) return;
               setProjectCreateMode(key as ProjectCreateMode);
               setProjectImportDraft(null);
+              setProjectImportError("");
             }}
             items={[
               {
@@ -9731,6 +10123,17 @@ export function App() {
               }
             ]}
           />
+
+          {projectImportError && projectCreateMode !== "manual" && (
+            <Alert
+              type="error"
+              showIcon
+              closable
+              message={projectCreateMode === "file" ? "招标文件识别失败" : "导入识别失败"}
+              description={projectImportError}
+              onClose={() => setProjectImportError("")}
+            />
+          )}
 
           {projectImportDraft && (
             <div className="import-draft-panel">

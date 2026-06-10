@@ -18,7 +18,7 @@ class AsyncTask(Base):
         CheckConstraint(
             "task_type IN ('file_acquisition', 'document_parse', 'matrix_generate', "
             "'excel_export', 'document_section_plan', 'section_compliance_extract', "
-            "'business_draft_generate')",
+            "'business_draft_generate', 'history_material_extract')",
             name="async_task_type_allowed",
         ),
         CheckConstraint(

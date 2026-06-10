@@ -78,6 +78,21 @@ def test_upload_document_and_create_parse_task() -> None:
     assert repeated_response.json()["id"] == parse_task["id"]
 
 
+def test_upload_document_uses_tender_document_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.api.v1.routes.documents.TENDER_DOCUMENT_FILE_MAX_BYTES", 1024 * 1024)
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+
+    response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/upload",
+        data={"doc_type": "tender", "title": "过大招标文件"},
+        files={"file": ("large.pdf", b"x" * (1024 * 1024 + 1), "application/pdf")},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "File is too large; max 1 MiB"
+
+
 def test_public_url_acquisition_records_security_block() -> None:
     settings.run_tasks_inline = False
     client = TestClient(app)

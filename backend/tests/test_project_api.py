@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+import fitz
 from alembic import command
 from alembic.config import Config
 from docx import Document as DocxDocument
@@ -507,6 +508,36 @@ def test_project_import_confirm_accepts_async_processing(
     assert result["project"]["name"] == project_name
     assert result["parse_task_id"]
     assert result["matrix_task_id"]
+
+
+def test_project_import_upload_uses_tender_document_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.api.v1.routes.projects.TENDER_DOCUMENT_FILE_MAX_BYTES", 1024 * 1024)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/projects/import-drafts/upload",
+        files={"file": ("large.pdf", b"x" * (1024 * 1024 + 1), "application/pdf")},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "File is too large; max 1 MiB"
+
+
+def test_project_import_upload_returns_client_error_for_image_only_pdf() -> None:
+    document = fitz.open()
+    document.new_page(width=595, height=842)
+    pdf_bytes = document.tobytes()
+    document.close()
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/projects/import-drafts/upload",
+        files={"file": ("scan.pdf", pdf_bytes, "application/pdf")},
+    )
+
+    assert response.status_code == 422
+    assert "PDF 未提取到可用文本" in response.json()["detail"]
+    assert "当前只支持可复制文本" in response.json()["detail"]
 
 
 def test_project_import_from_public_url_html_creates_parsed_project(

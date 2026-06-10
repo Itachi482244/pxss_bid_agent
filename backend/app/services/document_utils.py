@@ -5,6 +5,13 @@ from pathlib import Path
 
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
+TENDER_DOCUMENT_FILE_MAX_BYTES = 200 * 1024 * 1024
+HISTORY_MATERIAL_FILE_MAX_BYTES = 200 * 1024 * 1024
+
+
+def readable_file_size(size: int) -> str:
+    mib = size / 1024 / 1024
+    return f"{mib:.0f} MiB" if mib.is_integer() else f"{mib:.1f} MiB"
 
 
 def safe_filename(filename: str | None) -> str:
