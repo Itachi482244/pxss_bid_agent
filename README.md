@@ -43,6 +43,8 @@
 - 数据库：PostgreSQL + pgvector
 - 对象存储：MinIO
 - 文档处理：PyMuPDF、pdfplumber、PaddleOCR、python-docx、openpyxl
+- 识别抽取：阿里云 OCR（`RecognizeAdvanced`）转文本 + LLM 资料萃取
+- 检索/模型服务：Infinity（`BAAI/bge-base-zh-v1.5` 嵌入 + `BAAI/bge-reranker-base` 重排，OpenAI 风格 `/embeddings` 与 `/rerank`）
 
 ## 目录结构
 
@@ -70,6 +72,36 @@ docker compose up -d postgres redis minio minio-init
 - Redis：`localhost:6379`
 - MinIO API：`http://localhost:9000`
 - MinIO Console：`http://localhost:9001`
+
+## 检索与模型服务（RAG 地基）
+
+MVP1.5 的企业资料检索依赖一个独立的推理服务来产出 embedding 和 rerank 分数。后端通过 `EMBEDDING_PROVIDER` / `RERANK_PROVIDER` 选择来源，默认 `infinity`，推理失败时按 `*_FALLBACK_ENABLED` 降级到本地（embedding 走哈希向量、rerank 走关键词重合），保证检索链路不中断。
+
+关键环境变量（见 `.env.example`）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `EMBEDDING_PROVIDER` / `RERANK_PROVIDER` | `infinity` | 取值 `infinity` 或 `local` |
+| `EMBEDDING_BASE_URL` / `RERANK_BASE_URL` | `http://localhost:7997` | Infinity 服务地址 |
+| `EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | 中文专精，输出 768 维，对齐 `vector(768)` pgvector 列 |
+| `RERANK_MODEL` | `BAAI/bge-reranker-base` | 多语 cross-encoder，召回后重排 |
+
+两种部署方式（同一套 OpenAI 风格 API，二选一）：
+
+- **Linux / GPU 生产**：用根目录 `docker-compose.yml` 里的 `infinity` 服务，`docker compose up -d infinity`（GPU 环境在 `command` 末尾追加 `--device cuda`）。
+- **Mac 本地开发**：用原生 Infinity，详见 [`infra/infinity-local/README.md`](infra/infinity-local/README.md)（`uv` + Python 3.12 venv + ModelScope 下载权重，`./start.sh` 起服务）。
+
+自测：
+
+```bash
+curl -s http://localhost:7997/health
+curl -s http://localhost:7997/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"BAAI/bge-base-zh-v1.5","input":["投标人须提供有效营业执照"]}'
+curl -s http://localhost:7997/rerank -H 'Content-Type: application/json' \
+  -d '{"model":"BAAI/bge-reranker-base","query":"营业执照","documents":["营业执照材料","财务审计报告"]}'
+```
+
+> 注意：切换 `EMBEDDING_MODEL` 维度时，需同步 `vector(N)` 列并重建索引（迁移见 `backend/migrations/versions/*_material_vectors_*`），已落库的向量需在人工确认后重新 embedding。
 
 ## 启动后端
 
