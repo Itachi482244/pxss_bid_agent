@@ -1,6 +1,6 @@
 # 投标 Agent
 
-面向中国招投标场景的专业投标 Agent 项目。当前仓库采用 Web B/S 工作台 + Python 后端 + Docker 中间件的开发模式，已从 MVP1.0 可试用闭环推进到 MVP1.1 P0 + P1：模型安全接入、合规矩阵 AI 增强、原文审阅、人工补漏、相似补票和重复项级联确认主体能力均已完成。
+面向中国招投标场景的专业投标 Agent 项目。当前仓库采用 Web B/S 工作台 + Python 后端 + Docker 中间件的开发模式，已从 MVP1.0 可试用闭环推进到 MVP1.5 P0：模型安全接入、ContextPack、商务/资格草稿、易用性优化、历史资料 OCR/抽取和企业资料检索地基正在逐步落地。
 
 ## 产品原则
 
@@ -22,15 +22,17 @@
 - MVP1.1 P1：已完成审阅聚合接口、人工划选补漏、相似补票、Diff 高亮数据、重复项关联、级联确认和高风险确认防误触。
 - MVP1.2：ContextPack First，专注商务/资格生成上下文包的预览、生成、确认和准备度门禁。
 - MVP1.3：承接基于已确认 ContextPack 的目录/章节草稿生成、结构化生成稿、覆盖检查、事实校验、审阅和 Word 导出。
-- MVP1.4：承接 pgvector RAG、Embedding/Rerank、企业资料语义检索和候选证据推荐，作为 ContextPack 的上游增强。
-- 长期规划：技术标核心章节、净化产品选型、图纸/示意图、OCR、多 Agent 编排、报价辅助和外部提交/签章集成；这些不排入具体 MVP 版本，待样本、数据和专业责任边界明确后再拆专项。
-- 最近回归：`make mvp1-check` 通过，后端 `43 passed`，前端构建通过且 Vite chunk 体积提示已处理。
+- MVP1.4：易用性优化已完成 P0 + P1 前端开发，包括首页治理、术语白话化、审阅提效、等待体验和管理看板；浏览器端验收待补，P2 拆分暂缓。
+- MVP1.5：企业资料 RAG/Embedding/Rerank 和候选证据推荐阶段已启动；历史文件 OCR/LLM 资料萃取、人工确认、确认后切片、索引健康、索引重建和矩阵项候选证据接口已完成第一版。当前检索地基默认使用 Infinity 服务的 `BAAI/bge-base-zh-v1.5`（中文专精，768 维，对齐 pgvector 索引），并使用 `BAAI/bge-reranker-base` 对候选证据做召回后重排。
+- 长期规划：技术标核心章节、净化产品选型、图纸/示意图、多 Agent 编排、报价辅助和外部提交/签章集成；这些不排入具体 MVP 版本，待样本、数据和专业责任边界明确后再拆专项。
+- 最近回归：`make mvp1-check` 通过，后端 `185 passed`，前端生产构建通过。
 
 版本需求和进度文档：
 
 - [投标Agent MVP-v1.2需求规划与开发进度.md](docs/投标Agent%20MVP-v1.2需求规划与开发进度.md)
 - [投标Agent MVP-v1.3需求规划与开发进度.md](docs/投标Agent%20MVP-v1.3需求规划与开发进度.md)
 - [投标Agent MVP-v1.4需求规划与开发进度.md](docs/投标Agent%20MVP-v1.4需求规划与开发进度.md)
+- [投标Agent MVP-v1.5需求规划与开发进度.md](docs/投标Agent%20MVP-v1.5需求规划与开发进度.md)
 - [投标Agent ContextPack分阶段生成方案.md](docs/投标Agent%20ContextPack分阶段生成方案.md)
 
 ## 技术栈

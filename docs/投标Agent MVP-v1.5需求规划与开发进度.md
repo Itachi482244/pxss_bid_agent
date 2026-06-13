@@ -1,7 +1,7 @@
 # 投标 Agent MVP-v1.5 需求规划与开发进度
 
 > 更新时间：2026-06-06
-> 当前阶段：P0 起步中；OCR 底座与历史文件资料抽取/人工确认闭环第一版已落地，RAG/Embedding/Rerank 未开始
+> 当前阶段：P0 推进中；OCR 底座、历史文件资料抽取/人工确认闭环、确认后切片、Infinity bge-base-zh-v1.5 768 维向量化、索引健康/重建、矩阵项候选证据接口和 Infinity bge-reranker-base rerank 第一版已落地
 > 版本定位：企业资料 RAG、Embedding/Rerank 和候选证据推荐，作为 ContextPack 的上游证据增强。
 > 版本沿革：原 MVP1.4 的 RAG 证据增强规划，因易用性优化插入为 MVP1.4，整体顺延为 MVP1.5。
 
@@ -77,13 +77,13 @@ MVP1.5 的目标是把“人工找证据”升级为“系统推荐候选证据�
 | 资料 LLM 抽取 | 从全文抽多条结构化企业资料（类型/编号/有效期/业绩等），每条带来源出处+置信度 | 已完成第一版 | LLM 优先输出 JSON；模型不可用时本地规则兜底；仅产出 `pending_confirm` 草稿，绝不自动可信 |
 | 抽取去重合并 | 跨历史文件识别重复资料，合并来源、保留最新有效期 | 未开始 | 避免同一资质多份重复入库 |
 | 人工复核确认 | 复核界面逐条确认/修正/拒绝抽取草稿，确认转 `confirmed` | 已完成第一版 | 企业资料表展示来源文件/页码/块号/置信度，可逐条确认入库；修正沿用现有资料编辑接口 |
-| 确认后向量化 | 仅对已确认资料切片+embedding 落库 `EnterpriseMaterialChunk` | 已完成基础门禁 | `pending_confirm` 不建检索切片；确认后才重建 chunk；状态回退会清理 chunk。真实 embedding 仍待接入 |
+| 确认后向量化 | 仅对已确认资料切片+embedding 落库 `EnterpriseMaterialChunk` | 已完成第一版 | `pending_confirm` 不建检索切片；确认后才重建 chunk；状态回退会清理 chunk。默认使用 Infinity `BAAI/bge-base-zh-v1.5`，原生输出 768 维向量直接存储 |
 | 资料切片标准化 | 对企业资料按页码、段落、表格和资料类型生成 chunk | 未开始 | 复用现有企业资料模型 |
-| Embedding 接入 | 接入中文 embedding 模型 | 未开始 | 模型可配置，失败可降级 |
-| pgvector 索引 | 建立向量字段、索引和重建任务 | 未开始 | 支持企业级和项目级过滤 |
-| 混合检索 | 关键词、元数据过滤和向量召回组合 | 未开始 | 不只依赖语义相似度 |
-| Rerank 接入 | 对候选片段重排并输出原因 | 未开始 | 支持降级返回未重排结果 |
-| 候选证据接口 | 按矩阵项返回候选材料、片段和理由 | 未开始 | 默认不自动绑定 |
+| Embedding 接入 | 接入中文 embedding 模型 | 已完成第一版 | 默认接入 Infinity `BAAI/bge-base-zh-v1.5`；测试环境使用 768 维本地 mock，运行时失败可标记 fallback |
+| pgvector 索引 | 建立向量字段、索引和重建任务 | 已完成第一版 | `embedding_vector` 已升级为 `vector(768)`，新增 ivfflat ANN 索引迁移、租户级重建接口和索引健康接口 |
+| 混合检索 | 关键词、元数据过滤和向量召回组合 | 已完成第一版 | 企业资料搜索结合关键词、资料类型/权限/状态过滤和 pgvector 距离结果 |
+| Rerank 接入 | 对候选片段重排并输出原因 | 已完成第一版 | 默认使用 Infinity `BAAI/bge-reranker-base` 对向量/关键词候选做召回后重排；接口返回 base/rerank/final 分数，支持降级返回本地重排结果 |
+| 候选证据接口 | 按矩阵项返回候选材料、片段和理由 | 已完成第一版 | 新增矩阵项候选证据接口，默认只返回未绑定且已确认材料，可显式包含待确认/风险材料 |
 | 人工绑定/拒绝 | 用户确认后绑定证据，拒绝原因写审计 | 未开始 | 反哺评测集 |
 
 ### P1：质量、权限和反馈
@@ -133,14 +133,14 @@ MVP1.5 的目标是把“人工找证据”升级为“系统推荐候选证据�
 
 ## 8. 开发进度
 
-当前为 P0 起步中。OCR 基础能力、历史文件抽取草稿和前端人工确认第一版已完成；RAG/Embedding/Rerank、跨文件去重、索引健康与评测仍未开始。
+当前为 P0 推进中。OCR 基础能力、历史文件抽取草稿、前端人工确认、确认后切片、Infinity bge-base-zh-v1.5 768 维向量化、租户级索引重建/健康、矩阵项候选证据接口和 Infinity bge-reranker-base rerank 第一版已完成；跨文件去重、候选反馈与评测仍未开始。
 
 | 范围 | 状态 | 说明 |
 | --- | --- | --- |
 | 版本边界 | 已确认 | 1.5 做 RAG/Embedding/Rerank 证据增强 + 历史文件 OCR/LLM 资料萃取（P0） |
 | 资料萃取管道 | 已完成第一版 | OCR(阿里云通用文字识别)→LLM/本地规则抽取→人工确认→确认后切片；资质识别/票证核验留第二阶段 |
-| 数据模型 | 部分完成 | 复用 `EnterpriseMaterial` 与 `EnterpriseMaterialChunk`；抽取来源和置信度进入 `structured_fields`。真实 embedding、候选动作和索引健康待扩展 |
-| 索引任务 | 未开始 | 待实现索引重建和健康检查 |
-| 检索接口 | 未开始 | 待实现混合检索、rerank 和候选解释 |
+| 数据模型 | 部分完成 | 复用 `EnterpriseMaterial` 与 `EnterpriseMaterialChunk`；抽取来源和置信度进入 `structured_fields`；`embedding_vector` 固定为 768 维，embedding provider/model/source dimension/fallback 信息写入 chunk metadata |
+| 索引任务 | 已完成第一版 | 已实现租户级索引重建、未确认资料 chunk 清理、索引覆盖率/陈旧状态/最后索引时间健康检查 |
+| 检索接口 | 已完成第一版 | 已实现企业资料混合检索、矩阵项候选证据接口和 rerank 后排序；候选拒绝/反馈仍待实现 |
 | 前端交互 | 未开始 | 待实现候选证据抽屉和绑定/拒绝 |
-| 回归测试 | 部分完成 | 已补 OCR 解析、历史资料抽取、扫描 PDF OCR fallback、确认后切片和前端抽取来源展示测试；embedding/rerank mock、降级和权限过滤待补 |
+| 回归测试 | 部分完成 | 已补 OCR 解析、历史资料抽取、扫描 PDF OCR fallback、确认后切片、embedding/rerank mock、降级和前端抽取来源展示测试；系统评测集待补 |

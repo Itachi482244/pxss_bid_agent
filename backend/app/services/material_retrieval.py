@@ -2,17 +2,32 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Any
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models import EnterpriseMaterial, EnterpriseMaterialChunk
+from app.services.embedding_gateway import (
+    EMBEDDING_DIMENSIONS,
+    configured_embedding_model,
+    configured_embedding_provider,
+    embed_text,
+)
+from app.services.rerank_gateway import (
+    configured_rerank_model,
+    configured_rerank_provider,
+    rerank_texts,
+)
 
-EMBEDDING_DIMENSIONS = 16
+DEFAULT_ALLOWED_DATA_LEVELS = {"public", "internal"}
+DEFAULT_SEARCH_STATUSES = {"confirmed"}
 
 SEARCH_KEYWORDS = (
     "营业执照",
@@ -50,9 +65,49 @@ class MaterialSearchHit:
     chunk: EnterpriseMaterialChunk | None
     snippet: str | None
     confidence_score: float
+    base_score: float | None = None
+    rerank_score: float | None = None
+    rerank_provider: str | None = None
+    rerank_model: str | None = None
+    rerank_used: bool = False
+    rerank_fallback_used: bool = False
+    rerank_error: str | None = None
     recommend_reason: str | None = None
     matched_terms: list[str] | None = None
     material_status_hint: str | None = None
+
+
+@dataclass(frozen=True)
+class MaterialIndexHealth:
+    status: str
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimensions: int
+    fallback_chunk_count: int
+    rerank_provider: str
+    rerank_model: str
+    total_material_count: int
+    confirmed_material_count: int
+    indexed_material_count: int
+    unindexed_material_count: int
+    stale_material_count: int
+    chunk_count: int
+    coverage_rate: float
+    last_indexed_at: datetime | None
+    unindexed_materials: list[dict[str, Any]]
+    stale_materials: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class MaterialIndexRebuildResult:
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimensions: int
+    rebuilt_material_count: int
+    rebuilt_chunk_count: int
+    removed_chunk_count: int
+    skipped_material_count: int
+    health: MaterialIndexHealth
 
 
 def search_terms(query: str) -> list[str]:
@@ -145,16 +200,6 @@ def recommendation_reason(query: str, material: EnterpriseMaterial, content: str
     return reason, terms, status_hint
 
 
-def pseudo_embedding(text: str) -> list[float]:
-    vector = [0.0] * EMBEDDING_DIMENSIONS
-    for token in re.findall(r"[\w\u4e00-\u9fff]+", text.lower()):
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = digest[0] % EMBEDDING_DIMENSIONS
-        vector[index] += 1.0 + digest[1] / 255.0
-    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
-    return [round(value / norm, 6) for value in vector]
-
-
 def vector_to_pg(vector: list[float]) -> str:
     return "[" + ",".join(f"{value:.6f}" for value in vector) + "]"
 
@@ -194,7 +239,7 @@ def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[E
     source_images = structured_fields.get("source_images") if isinstance(structured_fields, dict) else None
     primary_source_image = structured_fields.get("primary_source_image") if isinstance(structured_fields, dict) else None
     for index, content in enumerate(split_material_chunks(material)):
-        embedding = pseudo_embedding(content)
+        embedding = embed_text(content)
         chunk = EnterpriseMaterialChunk(
             tenant_id=material.tenant_id,
             enterprise_material_id=material.id,
@@ -207,9 +252,17 @@ def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[E
                 "verification_status": material.verification_status,
                 "source_images": source_images if isinstance(source_images, list) else [],
                 "primary_source_image": primary_source_image if isinstance(primary_source_image, dict) else None,
+                "embedding_provider": embedding.provider,
+                "embedding_runtime_provider": embedding.runtime_provider,
+                "embedding_model": embedding.model_name,
+                "embedding_dimensions": embedding.dimensions,
+                "embedding_source_dimensions": embedding.source_dimensions,
+                "embedding_duration_ms": embedding.duration_ms,
+                "embedding_fallback_used": embedding.fallback_used,
+                "embedding_error": embedding.error_message,
             },
-            embedding_vector=vector_to_pg(embedding),
-            embedding_json=embedding,
+            embedding_vector=vector_to_pg(embedding.vector),
+            embedding_json=embedding.vector,
             data_level=material.data_level,
             token_count=max(1, len(content) // 2),
         )
@@ -220,7 +273,7 @@ def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[E
 
 def _virtual_chunk(material: EnterpriseMaterial) -> EnterpriseMaterialChunk:
     text = material_text(material).strip() or material.name
-    embedding = pseudo_embedding(text)
+    embedding = embed_text(text)
     return EnterpriseMaterialChunk(
         id=uuid.uuid4(),
         tenant_id=material.tenant_id,
@@ -228,9 +281,19 @@ def _virtual_chunk(material: EnterpriseMaterial) -> EnterpriseMaterialChunk:
         chunk_index=0,
         content_text=text,
         content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        metadata_json={"material_name": material.name, "virtual": True},
-        embedding_vector=vector_to_pg(embedding),
-        embedding_json=embedding,
+        metadata_json={
+            "material_name": material.name,
+            "virtual": True,
+            "embedding_provider": embedding.provider,
+            "embedding_runtime_provider": embedding.runtime_provider,
+            "embedding_model": embedding.model_name,
+            "embedding_dimensions": embedding.dimensions,
+            "embedding_source_dimensions": embedding.source_dimensions,
+            "embedding_fallback_used": embedding.fallback_used,
+            "embedding_error": embedding.error_message,
+        },
+        embedding_vector=vector_to_pg(embedding.vector),
+        embedding_json=embedding.vector,
         data_level=material.data_level,
         token_count=max(1, len(text) // 2),
     )
@@ -248,11 +311,236 @@ def _score_chunk(
         return 0.5
     haystack = chunk_text.lower()
     matched_terms = [term for term in query_terms if term in haystack]
-    if not matched_terms:
+    vector_score = max(0.0, cosine_similarity(query_embedding, chunk_embedding or [])) * 0.2
+    if not matched_terms and vector_score < 0.08:
         return 0.0
     keyword_score = min(0.72, 0.24 * len(matched_terms))
-    vector_score = max(0.0, cosine_similarity(query_embedding, chunk_embedding or [])) * 0.2
     return min(0.99, keyword_score + vector_score)
+
+
+def _material_ref(material: EnterpriseMaterial) -> dict[str, Any]:
+    return {
+        "id": str(material.id),
+        "name": material.name,
+        "material_type": material.material_type,
+        "verification_status": material.verification_status,
+        "updated_at": material.updated_at.isoformat() if material.updated_at else None,
+    }
+
+
+def get_material_index_health(db: Session, *, tenant_id: uuid.UUID) -> MaterialIndexHealth:
+    materials = list(
+        db.scalars(
+            select(EnterpriseMaterial)
+            .where(EnterpriseMaterial.tenant_id == tenant_id)
+            .order_by(EnterpriseMaterial.updated_at.desc())
+        ).all()
+    )
+    confirmed_materials = [material for material in materials if material.verification_status == "confirmed"]
+    chunks = list(
+        db.scalars(
+            select(EnterpriseMaterialChunk).where(EnterpriseMaterialChunk.tenant_id == tenant_id)
+        ).all()
+    )
+    expected_provider = configured_embedding_provider()
+    chunk_stats: dict[uuid.UUID, dict[str, Any]] = {}
+    fallback_chunk_count = 0
+    for chunk in chunks:
+        metadata = chunk.metadata_json or {}
+        stats = chunk_stats.setdefault(
+            chunk.enterprise_material_id,
+            {
+                "count": 0,
+                "last_indexed_at": None,
+                "provider_mismatch": False,
+                "dimension_mismatch": False,
+            },
+        )
+        stats["count"] += 1
+        if stats["last_indexed_at"] is None or chunk.updated_at > stats["last_indexed_at"]:
+            stats["last_indexed_at"] = chunk.updated_at
+        if metadata.get("embedding_provider") != expected_provider:
+            stats["provider_mismatch"] = True
+        if metadata.get("embedding_dimensions") != EMBEDDING_DIMENSIONS:
+            stats["dimension_mismatch"] = True
+        if isinstance(chunk.embedding_json, list) and len(chunk.embedding_json) != EMBEDDING_DIMENSIONS:
+            stats["dimension_mismatch"] = True
+        if metadata.get("embedding_fallback_used") is True:
+            fallback_chunk_count += 1
+    indexed_material_count = 0
+    unindexed_materials: list[dict[str, Any]] = []
+    stale_materials: list[dict[str, Any]] = []
+    for material in confirmed_materials:
+        stats = chunk_stats.get(material.id)
+        if not stats or stats["count"] <= 0:
+            unindexed_materials.append(_material_ref(material))
+            continue
+        indexed_material_count += 1
+        last_indexed_at = stats["last_indexed_at"]
+        if material.updated_at and last_indexed_at and material.updated_at > last_indexed_at:
+            stale_ref = _material_ref(material)
+            stale_ref["last_indexed_at"] = last_indexed_at.isoformat()
+            stale_ref["reason"] = "material_updated_after_index"
+            stale_materials.append(stale_ref)
+        elif stats["provider_mismatch"] or stats["dimension_mismatch"]:
+            stale_ref = _material_ref(material)
+            stale_ref["last_indexed_at"] = last_indexed_at.isoformat() if last_indexed_at else None
+            reasons = []
+            if stats["provider_mismatch"]:
+                reasons.append("embedding_provider_changed")
+            if stats["dimension_mismatch"]:
+                reasons.append("embedding_dimension_changed")
+            stale_ref["reason"] = ",".join(reasons)
+            stale_materials.append(stale_ref)
+
+    chunk_count = len(chunks)
+    confirmed_count = len(confirmed_materials)
+    unhealthy_count = len(unindexed_materials) + len(stale_materials)
+    if confirmed_count == 0:
+        status = "empty"
+    elif unhealthy_count == 0:
+        status = "healthy"
+    else:
+        status = "needs_rebuild"
+    coverage_rate = round(indexed_material_count / confirmed_count, 4) if confirmed_count else 1.0
+    last_indexed_at_values = [
+        stats["last_indexed_at"] for stats in chunk_stats.values() if stats["last_indexed_at"] is not None
+    ]
+    last_indexed_at = max(last_indexed_at_values) if last_indexed_at_values else None
+    return MaterialIndexHealth(
+        status=status,
+        embedding_provider=expected_provider,
+        embedding_model=configured_embedding_model(),
+        embedding_dimensions=EMBEDDING_DIMENSIONS,
+        fallback_chunk_count=fallback_chunk_count,
+        rerank_provider=configured_rerank_provider(),
+        rerank_model=configured_rerank_model(),
+        total_material_count=len(materials),
+        confirmed_material_count=confirmed_count,
+        indexed_material_count=indexed_material_count,
+        unindexed_material_count=len(unindexed_materials),
+        stale_material_count=len(stale_materials),
+        chunk_count=chunk_count,
+        coverage_rate=coverage_rate,
+        last_indexed_at=last_indexed_at,
+        unindexed_materials=unindexed_materials[:20],
+        stale_materials=stale_materials[:20],
+    )
+
+
+def rebuild_tenant_material_index(db: Session, *, tenant_id: uuid.UUID) -> MaterialIndexRebuildResult:
+    confirmed_materials = list(
+        db.scalars(
+            select(EnterpriseMaterial)
+            .where(
+                EnterpriseMaterial.tenant_id == tenant_id,
+                EnterpriseMaterial.verification_status == "confirmed",
+            )
+            .order_by(EnterpriseMaterial.updated_at.asc())
+        ).all()
+    )
+    confirmed_ids = [material.id for material in confirmed_materials]
+    stale_delete = delete(EnterpriseMaterialChunk).where(
+        EnterpriseMaterialChunk.tenant_id == tenant_id,
+    )
+    if confirmed_ids:
+        stale_delete = stale_delete.where(EnterpriseMaterialChunk.enterprise_material_id.not_in(confirmed_ids))
+    removed_chunk_count = int(db.execute(stale_delete).rowcount or 0)
+
+    rebuilt_chunk_count = 0
+    for material in confirmed_materials:
+        rebuilt_chunk_count += len(rebuild_material_chunks(db, material))
+    db.flush()
+    health = get_material_index_health(db, tenant_id=tenant_id)
+    return MaterialIndexRebuildResult(
+        embedding_provider=configured_embedding_provider(),
+        embedding_model=configured_embedding_model(),
+        embedding_dimensions=EMBEDDING_DIMENSIONS,
+        rebuilt_material_count=len(confirmed_materials),
+        rebuilt_chunk_count=rebuilt_chunk_count,
+        removed_chunk_count=removed_chunk_count,
+        skipped_material_count=max(0, health.total_material_count - len(confirmed_materials)),
+        health=health,
+    )
+
+
+def _hit_rerank_text(hit: MaterialSearchHit) -> str:
+    values = [
+        hit.material.name,
+        hit.snippet,
+        hit.chunk.content_text if hit.chunk else None,
+        hit.material.evidence_text,
+        hit.material.project_name,
+        hit.material.certificate_no,
+    ]
+    return "\n".join(value for value in values if value)
+
+
+def _rerank_hits(query: str, hits: list[MaterialSearchHit]) -> list[MaterialSearchHit]:
+    if not query.strip() or len(hits) < 2:
+        return hits
+    documents = [_hit_rerank_text(hit) for hit in hits]
+    base_scores = [hit.confidence_score for hit in hits]
+    rerank_scores = rerank_texts(query, documents, base_scores=base_scores)
+    if not rerank_scores:
+        return hits
+    score_map = {score.index: score for score in rerank_scores}
+    reranked: list[MaterialSearchHit] = []
+    for index, hit in enumerate(hits):
+        rerank_score = score_map.get(index)
+        if rerank_score is None:
+            reranked.append(hit)
+            continue
+        final_score = min(0.99, rerank_score.score * 0.72 + hit.confidence_score * 0.28)
+        reranked.append(
+            replace(
+                hit,
+                confidence_score=round(final_score, 4),
+                base_score=hit.confidence_score,
+                rerank_score=round(rerank_score.score, 4),
+                rerank_provider=rerank_score.provider,
+                rerank_model=rerank_score.model_name,
+                rerank_used=not rerank_score.fallback_used,
+                rerank_fallback_used=rerank_score.fallback_used,
+                rerank_error=rerank_score.error_message,
+            )
+        )
+    reranked.sort(key=lambda item: (item.confidence_score, item.material.updated_at), reverse=True)
+    return reranked
+
+
+def _chunk_vector_scores(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    query_embedding: list[float],
+    allowed_data_levels: set[str],
+    verification_statuses: set[str],
+    material_type: str | None,
+    limit: int,
+) -> dict[uuid.UUID, float]:
+    distance = EnterpriseMaterialChunk.embedding_vector.op("<=>")(vector_to_pg(query_embedding))
+    stmt = (
+        select(EnterpriseMaterialChunk.id, (1 - distance).label("similarity"))
+        .join(EnterpriseMaterial, EnterpriseMaterial.id == EnterpriseMaterialChunk.enterprise_material_id)
+        .where(
+            EnterpriseMaterialChunk.tenant_id == tenant_id,
+            EnterpriseMaterialChunk.data_level.in_(allowed_data_levels),
+            EnterpriseMaterialChunk.embedding_vector.is_not(None),
+            EnterpriseMaterial.tenant_id == tenant_id,
+            EnterpriseMaterial.verification_status.in_(verification_statuses),
+        )
+        .order_by(distance.asc())
+        .limit(max(50, limit * 12))
+    )
+    if material_type:
+        stmt = stmt.where(EnterpriseMaterial.material_type == material_type)
+    try:
+        rows = db.execute(stmt).all()
+    except SQLAlchemyError:
+        db.rollback()
+        return {}
+    return {chunk_id: max(0.0, float(similarity or 0.0)) for chunk_id, similarity in rows}
 
 
 def search_material_hits(
@@ -262,24 +550,32 @@ def search_material_hits(
     query: str,
     material_type: str | None = None,
     verification_status: str | None = None,
+    verification_statuses: set[str] | None = None,
     allowed_data_levels: set[str] | None = None,
     limit: int = 20,
 ) -> list[MaterialSearchHit]:
-    allowed = allowed_data_levels or {"public", "internal"}
+    allowed = allowed_data_levels or DEFAULT_ALLOWED_DATA_LEVELS
+    statuses = verification_statuses or ({verification_status} if verification_status else DEFAULT_SEARCH_STATUSES)
     stmt = select(EnterpriseMaterial).where(
         EnterpriseMaterial.tenant_id == tenant_id,
         EnterpriseMaterial.data_level.in_(allowed),
+        EnterpriseMaterial.verification_status.in_(statuses),
     )
     if material_type:
         stmt = stmt.where(EnterpriseMaterial.material_type == material_type)
-    if verification_status:
-        stmt = stmt.where(EnterpriseMaterial.verification_status == verification_status)
-    else:
-        stmt = stmt.where(EnterpriseMaterial.verification_status == "confirmed")
     materials = db.scalars(stmt.order_by(EnterpriseMaterial.updated_at.desc()).limit(200)).all()
 
     terms = search_terms(query)
-    query_embedding = pseudo_embedding(query)
+    query_embedding = embed_text(query).vector
+    vector_scores = _chunk_vector_scores(
+        db,
+        tenant_id=tenant_id,
+        query_embedding=query_embedding,
+        allowed_data_levels=allowed,
+        verification_statuses=statuses,
+        material_type=material_type,
+        limit=limit,
+    )
     hits: list[MaterialSearchHit] = []
     for material in materials:
         chunks = db.scalars(
@@ -293,7 +589,7 @@ def search_material_hits(
         ).all()
         if chunks:
             candidates = chunks
-        elif material.verification_status == "confirmed":
+        elif material.verification_status in statuses:
             candidates = [_virtual_chunk(material)]
         else:
             continue
@@ -306,6 +602,8 @@ def search_material_hits(
                 query_embedding=query_embedding,
                 chunk_embedding=chunk.embedding_json,
             )
+            if chunk.id in vector_scores:
+                score = min(0.99, max(score, vector_scores[chunk.id] * 0.22))
             if score <= 0 and query.strip():
                 continue
             if material.verification_status == "confirmed":
@@ -327,4 +625,6 @@ def search_material_hits(
             hits.append(best_hit)
 
     hits.sort(key=lambda item: (item.confidence_score, item.material.updated_at), reverse=True)
-    return hits[:limit]
+    rerank_top_k = max(1, int(settings.rerank_top_k))
+    rerank_candidates = hits[: min(max(limit, 1), rerank_top_k)]
+    return (_rerank_hits(query, rerank_candidates) + hits[len(rerank_candidates) :])[:limit]

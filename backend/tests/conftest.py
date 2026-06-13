@@ -11,3 +11,5 @@ override (e.g. ``LOG_LEVEL=INFO`` when debugging a test).
 import os
 
 os.environ.setdefault("LOG_LEVEL", "WARNING")
+os.environ.setdefault("EMBEDDING_PROVIDER", "local")
+os.environ.setdefault("RERANK_PROVIDER", "local")

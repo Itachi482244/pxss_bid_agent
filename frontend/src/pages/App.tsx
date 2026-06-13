@@ -99,6 +99,7 @@ import {
   getMatrixReview,
   generateQualificationDecision,
   getEnterpriseProfile,
+  getEnterpriseMaterialIndexHealth,
   getProject,
   getQualificationDecision,
   getTask,
@@ -123,6 +124,7 @@ import {
   runBusinessDraftContextPackCoverageReview,
   runQualificationEvaluation,
   searchEnterpriseMaterials,
+  rebuildEnterpriseMaterialIndex,
   publishDocumentManualRevision,
   previewBusinessDraftContextPack,
   getChatModelConfig,
@@ -161,6 +163,7 @@ import type {
   DraftCoverageReview,
   EnterpriseMaterial,
   EnterpriseMaterialHistoryExtractResult,
+  EnterpriseMaterialIndexHealth,
   EnterpriseMaterialSearchResult,
   EnterpriseProfile,
   ExportFile,
@@ -331,6 +334,12 @@ function errorMessage(error: unknown, fallback: string) {
     if (candidate.message?.trim()) return candidate.message;
   }
   return fallback;
+}
+
+function isHttpNotFound(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const response = (error as { response?: { status?: number } }).response;
+  return response?.status === 404;
 }
 
 const workflowStepKeys = new Set<WorkflowStepKey>([
@@ -1438,7 +1447,10 @@ export function App() {
   const [apiError, setApiError] = useState("");
   const [enterpriseProfile, setEnterpriseProfile] = useState<EnterpriseProfile | null>(null);
   const [enterpriseMaterials, setEnterpriseMaterials] = useState<EnterpriseMaterial[]>([]);
+  const [materialIndexHealth, setMaterialIndexHealth] = useState<EnterpriseMaterialIndexHealth | null>(null);
   const [loadingEnterprise, setLoadingEnterprise] = useState(false);
+  const [loadingMaterialIndexHealth, setLoadingMaterialIndexHealth] = useState(false);
+  const [rebuildingMaterialIndex, setRebuildingMaterialIndex] = useState(false);
   const [savingEnterprise, setSavingEnterprise] = useState(false);
   const [extractingHistoryMaterial, setExtractingHistoryMaterial] = useState(false);
   const [historyExtractTaskId, setHistoryExtractTaskId] = useState<string | null>(null);
@@ -1531,15 +1543,31 @@ export function App() {
     };
   }, []);
 
+  const reloadMaterialIndexHealth = useCallback(async () => {
+    setLoadingMaterialIndexHealth(true);
+    try {
+      const health = await getEnterpriseMaterialIndexHealth();
+      setMaterialIndexHealth(health);
+      return health;
+    } catch (error) {
+      setApiError(errorMessage(error, "企业资料索引状态加载失败"));
+      return null;
+    } finally {
+      setLoadingMaterialIndexHealth(false);
+    }
+  }, []);
+
   const reloadEnterprise = useCallback(async () => {
     setLoadingEnterprise(true);
     try {
-      const [profile, materials] = await Promise.all([
+      const [profile, materials, indexHealth] = await Promise.all([
         getEnterpriseProfile(),
-        listEnterpriseMaterials({ limit: 100 })
+        listEnterpriseMaterials({ limit: 100 }),
+        getEnterpriseMaterialIndexHealth()
       ]);
       setEnterpriseProfile(profile);
       setEnterpriseMaterials(materials);
+      setMaterialIndexHealth(indexHealth);
       if (profile) {
         setProfileDraft({
           companyName: profile.company_name,
@@ -3184,6 +3212,30 @@ export function App() {
     let active = true;
     let clearTimer: number | null = null;
 
+    const clearCurrentImportProcessing = () => {
+      setImportProcessing((current) => {
+        if (
+          current?.projectId === importProcessing.projectId &&
+          current?.sectionId === importProcessing.sectionId &&
+          current?.parseTaskId === importProcessing.parseTaskId &&
+          current?.matrixTaskId === importProcessing.matrixTaskId
+        ) {
+          return null;
+        }
+        return current;
+      });
+    };
+
+    const handleTaskPollError = (error: unknown) => {
+      if (!active) return;
+      if (isHttpNotFound(error)) {
+        appendLog("后台任务记录已不存在，已停止自动刷新");
+        clearCurrentImportProcessing();
+        return;
+      }
+      setApiError(error instanceof Error ? error.message : "后台任务状态刷新失败");
+    };
+
     const pollTasks = async () => {
       const [parseTask, matrixTask] = await Promise.all([
         importProcessing.parseTaskId ? getTask(importProcessing.parseTaskId) : Promise.resolve(null),
@@ -3194,17 +3246,7 @@ export function App() {
       const staleTask = [parseTask, matrixTask].find((task) => isAsyncTaskStale(task));
       if (staleTask) {
         appendLog(`后台任务 ${staleTask.id.slice(0, 8)} 长时间未更新，已停止自动刷新`);
-        setImportProcessing((current) => {
-          if (
-            current?.projectId === importProcessing.projectId &&
-            current?.sectionId === importProcessing.sectionId &&
-            current?.parseTaskId === importProcessing.parseTaskId &&
-            current?.matrixTaskId === importProcessing.matrixTaskId
-          ) {
-            return null;
-          }
-          return current;
-        });
+        clearCurrentImportProcessing();
         return;
       }
 
@@ -3252,28 +3294,14 @@ export function App() {
       const matrixTerminal = isAsyncTaskTerminal(matrixTask, importProcessing.matrixTaskId);
       if (parseTerminal && matrixTerminal && !clearTimer) {
         clearTimer = window.setTimeout(() => {
-          setImportProcessing((current) => {
-            if (
-              current?.projectId === importProcessing.projectId &&
-              current?.sectionId === importProcessing.sectionId &&
-              current?.parseTaskId === importProcessing.parseTaskId &&
-              current?.matrixTaskId === importProcessing.matrixTaskId
-            ) {
-              return null;
-            }
-            return current;
-          });
+          clearCurrentImportProcessing();
         }, 8000);
       }
     };
 
-    void pollTasks().catch((error: unknown) => {
-      setApiError(error instanceof Error ? error.message : "后台任务状态刷新失败");
-    });
+    void pollTasks().catch(handleTaskPollError);
     const intervalId = window.setInterval(() => {
-      void pollTasks().catch((error: unknown) => {
-        setApiError(error instanceof Error ? error.message : "后台任务状态刷新失败");
-      });
+      void pollTasks().catch(handleTaskPollError);
     }, 1500);
 
     return () => {
@@ -6165,6 +6193,24 @@ export function App() {
     }
   };
 
+  const handleRebuildMaterialIndex = async () => {
+    setRebuildingMaterialIndex(true);
+    try {
+      const result = await rebuildEnterpriseMaterialIndex();
+      setMaterialIndexHealth(result.health);
+      await reloadEnterprise();
+      appendLog(`重建企业资料索引：${result.rebuilt_material_count} 条资料，${result.rebuilt_chunk_count} 个切片`);
+      notification.success({
+        message: "企业资料索引已重建",
+        description: `${result.rebuilt_material_count} 条已确认资料进入 ${result.embedding_model} / ${result.embedding_dimensions} 维检索索引。`
+      });
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "企业资料索引重建失败");
+    } finally {
+      setRebuildingMaterialIndex(false);
+    }
+  };
+
   const modelConfigPayload = (includeEmptyKey = false): ChatModelConfigPayload => ({
     provider: modelConfigDraft.provider,
     base_url: modelConfigDraft.baseUrl.trim() || null,
@@ -6305,7 +6351,7 @@ export function App() {
                 <Text type="secondary">系统设置</Text>
                 <Title level={2}>模型设置</Title>
                 <Text type="secondary">
-                  MVP1.1 先接入 Chat/LLM 配置；Embedding 与 Rerank 会在 MVP1.5 接入检索链路。
+                  Chat/LLM 配置用于生成链路；企业资料检索已接入 Infinity bge-base-zh-v1.5 向量化。
                 </Text>
               </div>
               <Space wrap>
@@ -6467,14 +6513,14 @@ export function App() {
                   <Alert
                     type="info"
                     showIcon
-                    message="Embedding：MVP1.4 预留"
-                    description="计划使用 BAAI/bge-large-zh-v1.5，将企业资料切片写入 pgvector。"
+                    message="Embedding：MVP1.5 已接入"
+                    description="默认使用 Infinity bge-base-zh-v1.5，写入 768 维 pgvector 检索索引。"
                   />
                   <Alert
                     type="info"
                     showIcon
-                    message="Rerank：MVP1.4 预留"
-                    description="计划使用 BAAI/bge-reranker-large，对候选证据做二次排序和解释。"
+                    message="Rerank：MVP1.5 已接入"
+                    description="默认使用 Infinity bge-reranker-base，对企业资料候选证据做召回后重排。"
                   />
                   <Alert
                     type="warning"
@@ -6592,6 +6638,49 @@ export function App() {
                   <Space wrap>
                     <Tag color="blue">{enterpriseMaterials.length} 条资料</Tag>
                     <Tag color="green">{enterpriseMaterials.filter((item) => item.verification_status === "confirmed").length} 条已确认</Tag>
+                  </Space>
+                </div>
+                <div className="material-index-card">
+                  <div>
+                    <Space size={8} wrap>
+                      <Text strong>检索索引</Text>
+                      <Tag color={materialIndexHealth?.status === "healthy" ? "green" : materialIndexHealth?.status === "empty" ? "default" : "orange"}>
+                        {materialIndexHealth?.status === "healthy"
+                          ? "健康"
+                          : materialIndexHealth?.status === "empty"
+                            ? "暂无索引"
+                            : "需重建"}
+                      </Tag>
+                      <Tag color="blue">
+                        {materialIndexHealth
+                          ? `${materialIndexHealth.embedding_model} · ${materialIndexHealth.embedding_dimensions} 维`
+                          : "embedding"}
+                      </Tag>
+                      <Tag color="purple">
+                        {materialIndexHealth ? `Rerank · ${materialIndexHealth.rerank_model}` : "rerank"}
+                      </Tag>
+                      {materialIndexHealth?.fallback_chunk_count ? (
+                        <Tag color="orange">{materialIndexHealth.fallback_chunk_count} 个兜底切片</Tag>
+                      ) : null}
+                    </Space>
+                    <p>
+                      {materialIndexHealth
+                        ? `已索引 ${materialIndexHealth.indexed_material_count}/${materialIndexHealth.confirmed_material_count} 条已确认资料，${materialIndexHealth.chunk_count} 个切片。`
+                        : "加载企业资料索引状态。"}
+                    </p>
+                    <Progress
+                      percent={Math.round((materialIndexHealth?.coverage_rate ?? 0) * 100)}
+                      size="small"
+                      status={materialIndexHealth?.status === "needs_rebuild" ? "exception" : "normal"}
+                    />
+                  </div>
+                  <Space wrap>
+                    <Button onClick={reloadMaterialIndexHealth} loading={loadingMaterialIndexHealth}>
+                      刷新索引状态
+                    </Button>
+                    <Button type="primary" onClick={handleRebuildMaterialIndex} loading={rebuildingMaterialIndex}>
+                      重建索引
+                    </Button>
                   </Space>
                 </div>
                 <div className="history-extract-card">
@@ -10972,7 +11061,22 @@ export function App() {
                   render: (value: string | null, record) => (
                     <Space direction="vertical" size={4}>
                       <Text className="evidence-snippet">{value ?? record.evidence_text ?? record.name}</Text>
-                      <Text type="secondary">匹配度 {Math.round(record.confidence_score * 100)}%</Text>
+                      <Space size={6} wrap>
+                        <Text type="secondary">匹配度 {Math.round(record.confidence_score * 100)}%</Text>
+                        {record.rerank_score != null && (
+                          <Tag color={record.rerank_fallback_used ? "gold" : "purple"}>
+                            Rerank {Math.round(record.rerank_score * 100)}%
+                          </Tag>
+                        )}
+                        {record.base_score != null && (
+                          <Tag color="blue">召回 {Math.round(record.base_score * 100)}%</Tag>
+                        )}
+                      </Space>
+                      {record.rerank_model && (
+                        <Text type="secondary" className="recommend-reason">
+                          重排模型：{record.rerank_model}
+                        </Text>
+                      )}
                       {record.recommend_reason && (
                         <Text type="secondary" className="recommend-reason">
                           推荐原因：{record.recommend_reason}

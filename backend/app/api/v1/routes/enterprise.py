@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -17,6 +18,8 @@ from app.models import AsyncTask, AuditLog, EnterpriseMaterial, EnterpriseMateri
 from app.schemas.document import AsyncTaskRead
 from app.schemas.enterprise import (
     EnterpriseMaterialHistoryExtractResult,
+    EnterpriseMaterialIndexHealthRead,
+    EnterpriseMaterialIndexRebuildResult,
     EnterpriseMaterialChunkRead,
     EnterpriseMaterialCreateRequest,
     EnterpriseMaterialRead,
@@ -33,7 +36,12 @@ from app.services.history_material_extract import (
     extract_history_material_drafts,
 )
 from app.services.material_identity import enterprise_material_identity_key
-from app.services.material_retrieval import rebuild_material_chunks, search_material_hits
+from app.services.material_retrieval import (
+    get_material_index_health,
+    rebuild_material_chunks,
+    rebuild_tenant_material_index,
+    search_material_hits,
+)
 from app.services.storage import put_object_bytes
 from app.services.task_dispatch import TaskDispatchError, enqueue_celery_task
 
@@ -242,6 +250,47 @@ def list_enterprise_materials(
     return list(db.scalars(query).all())
 
 
+@router.get("/materials/index-health", response_model=EnterpriseMaterialIndexHealthRead)
+def get_enterprise_material_index_health(
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    db: Annotated[Session, Depends(get_db)],
+) -> EnterpriseMaterialIndexHealthRead:
+    return EnterpriseMaterialIndexHealthRead.model_validate(
+        get_material_index_health(db, tenant_id=ctx.tenant_id).__dict__
+    )
+
+
+@router.post("/materials/index/rebuild", response_model=EnterpriseMaterialIndexRebuildResult)
+def rebuild_enterprise_material_index(
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    db: Annotated[Session, Depends(get_db)],
+) -> EnterpriseMaterialIndexRebuildResult:
+    before = get_material_index_health(db, tenant_id=ctx.tenant_id)
+    result = rebuild_tenant_material_index(db, tenant_id=ctx.tenant_id)
+    add_enterprise_audit_log(
+        db,
+        ctx,
+        action="enterprise.material_index_rebuilt",
+        object_type="enterprise_material_index",
+        object_id=None,
+        before_json=jsonable_encoder(before.__dict__),
+        after_json={
+            "rebuilt_material_count": result.rebuilt_material_count,
+            "rebuilt_chunk_count": result.rebuilt_chunk_count,
+            "removed_chunk_count": result.removed_chunk_count,
+            "health": jsonable_encoder(result.health.__dict__),
+        },
+        reason="重建企业资料检索索引",
+    )
+    db.commit()
+    return EnterpriseMaterialIndexRebuildResult.model_validate(
+        {
+            **result.__dict__,
+            "health": result.health.__dict__,
+        }
+    )
+
+
 @router.get("/materials/search", response_model=list[EnterpriseMaterialSearchResult])
 def search_enterprise_materials(
     ctx: Annotated[RequestContext, Depends(get_request_context)],
@@ -287,6 +336,13 @@ def search_enterprise_materials(
             **EnterpriseMaterialRead.model_validate(hit.material).model_dump(),
             snippet=hit.snippet,
             confidence_score=hit.confidence_score,
+            base_score=hit.base_score,
+            rerank_score=hit.rerank_score,
+            rerank_provider=hit.rerank_provider,
+            rerank_model=hit.rerank_model,
+            rerank_used=hit.rerank_used,
+            rerank_fallback_used=hit.rerank_fallback_used,
+            rerank_error=hit.rerank_error,
             chunk_id=hit.chunk.id if hit.chunk else None,
             data_level_allowed=hit.material.data_level in allowed_data_levels,
             recommend_reason=hit.recommend_reason,

@@ -45,6 +45,7 @@ from app.models import (
     EnterpriseProfile,
 )
 from app.schemas.document import AsyncTaskRead, ComplianceMatrixExportRequest, ExportFileRead
+from app.schemas.enterprise import EnterpriseMaterialRead, EnterpriseMaterialSearchResult
 from app.schemas.project import (
     AuditLogRead,
     ApprovalTaskCreateRequest,
@@ -139,6 +140,7 @@ from app.services.evidence_policy import requires_enterprise_evidence
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import FileAcquisitionError
 from app.services.material_identity import enterprise_material_identity_key, material_snapshot_identity_key
+from app.services.material_retrieval import search_material_hits
 from app.parsers.pdf import PdfTextEmptyError
 from app.services.project_import import (
     ImportDraft,
@@ -275,6 +277,30 @@ def compliance_item_snapshot(item: ComplianceItem) -> dict[str, object]:
     }
 
 
+def compliance_item_candidate_query(item: ComplianceItem, project: Project, section: BidSection) -> str:
+    values = [
+        item.requirement_text,
+        item.normalized_requirement,
+        item.evidence_text,
+        item.response_suggestion,
+        item.item_type,
+        project.region_code,
+        project.industry_code,
+        section.name,
+    ]
+    seen: set[str] = set()
+    parts: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        parts.append(text)
+    return "\n".join(parts)
+
+
 def enterprise_material_snapshot(material: EnterpriseMaterial) -> dict[str, object]:
     return {
         "id": str(material.id),
@@ -332,6 +358,30 @@ def evidence_binding_read_from_binding(binding: ComplianceEvidenceBinding) -> Co
         created_at=binding.created_at,
         deleted_by=binding.deleted_by,
         deleted_at=binding.deleted_at,
+    )
+
+
+def enterprise_material_search_result_from_hit(
+    hit,
+    *,
+    allowed_data_levels: set[str],
+) -> EnterpriseMaterialSearchResult:
+    return EnterpriseMaterialSearchResult(
+        **EnterpriseMaterialRead.model_validate(hit.material).model_dump(),
+        snippet=hit.snippet,
+        confidence_score=hit.confidence_score,
+        base_score=hit.base_score,
+        rerank_score=hit.rerank_score,
+        rerank_provider=hit.rerank_provider,
+        rerank_model=hit.rerank_model,
+        rerank_used=hit.rerank_used,
+        rerank_fallback_used=hit.rerank_fallback_used,
+        rerank_error=hit.rerank_error,
+        chunk_id=hit.chunk.id if hit.chunk else None,
+        data_level_allowed=hit.material.data_level in allowed_data_levels,
+        recommend_reason=hit.recommend_reason,
+        matched_terms=hit.matched_terms or [],
+        material_status_hint=hit.material_status_hint,
     )
 
 
@@ -4324,6 +4374,72 @@ def assign_compliance_item(
     db.commit()
     db.refresh(item)
     return compliance_item_read_from_item(db, item)
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/evidence-candidates",
+    response_model=list[EnterpriseMaterialSearchResult],
+)
+def recommend_compliance_evidence_candidates(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    material_type: Annotated[str | None, Query()] = None,
+    include_restricted: bool = False,
+    include_unconfirmed: bool = False,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> list[EnterpriseMaterialSearchResult]:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    allowed_data_levels = {"public", "internal"}
+    if include_restricted:
+        allowed_data_levels.update({"restricted", "confidential"})
+    verification_statuses = {"confirmed"}
+    if include_unconfirmed:
+        verification_statuses.update({"pending_confirm", "missing_evidence", "expired", "conflict"})
+
+    active_bindings = list(
+        db.scalars(
+            select(ComplianceEvidenceBinding).where(
+                ComplianceEvidenceBinding.tenant_id == ctx.tenant_id,
+                ComplianceEvidenceBinding.project_id == project_id,
+                ComplianceEvidenceBinding.section_id == section_id,
+                ComplianceEvidenceBinding.compliance_item_id == item_id,
+                ComplianceEvidenceBinding.status == "active",
+            )
+        ).all()
+    )
+    bound_material_keys = {
+        material_snapshot_identity_key(binding.material_snapshot) for binding in active_bindings
+    }
+    hits = search_material_hits(
+        db,
+        tenant_id=ctx.tenant_id,
+        query=compliance_item_candidate_query(item, project, section),
+        material_type=material_type,
+        verification_statuses=verification_statuses,
+        allowed_data_levels=allowed_data_levels,
+        limit=min(200, max(limit, limit * 5)),
+    )
+    results: list[EnterpriseMaterialSearchResult] = []
+    seen_material_keys: set[str] = set()
+    for hit in hits:
+        material_key = enterprise_material_identity_key(hit.material)
+        if material_key in seen_material_keys or material_key in bound_material_keys:
+            continue
+        seen_material_keys.add(material_key)
+        results.append(
+            enterprise_material_search_result_from_hit(
+                hit,
+                allowed_data_levels=allowed_data_levels,
+            )
+        )
+        if len(results) >= limit:
+            break
+    return results
 
 
 @router.get(

@@ -58,6 +58,23 @@ class Settings(BaseSettings):
     )
     aliyun_ocr_timeout_seconds: float = Field(default=30.0, alias="ALIYUN_OCR_TIMEOUT_SECONDS")
 
+    # Embedding 推理服务。provider: infinity | local
+    # 默认走 Infinity 的 OpenAI 风格 /embeddings（Mac 开发 / Linux 部署同一套）。
+    # 模型 bge-base-zh-v1.5：中文专精，102M，输出 768 维（pgvector 列对齐 768）。
+    embedding_provider: str = Field(default="infinity", alias="EMBEDDING_PROVIDER")
+    embedding_base_url: str = Field(default="http://localhost:7997", alias="EMBEDDING_BASE_URL")
+    embedding_model: str = Field(default="BAAI/bge-base-zh-v1.5", alias="EMBEDDING_MODEL")
+    embedding_timeout_seconds: float = Field(default=30.0, alias="EMBEDDING_TIMEOUT_SECONDS")
+    embedding_fallback_enabled: bool = Field(default=True, alias="EMBEDDING_FALLBACK_ENABLED")
+    # Rerank 推理服务。provider: infinity | local
+    rerank_enabled: bool = Field(default=True, alias="RERANK_ENABLED")
+    rerank_provider: str = Field(default="infinity", alias="RERANK_PROVIDER")
+    rerank_base_url: str = Field(default="http://localhost:7997", alias="RERANK_BASE_URL")
+    rerank_model: str = Field(default="BAAI/bge-reranker-base", alias="RERANK_MODEL")
+    rerank_timeout_seconds: float = Field(default=30.0, alias="RERANK_TIMEOUT_SECONDS")
+    rerank_top_k: int = Field(default=50, alias="RERANK_TOP_K")
+    rerank_fallback_enabled: bool = Field(default=True, alias="RERANK_FALLBACK_ENABLED")
+
     source_page_image_format: str = Field(default="jpeg", alias="SOURCE_PAGE_IMAGE_FORMAT")
     source_page_image_max_width: int = Field(default=1200, alias="SOURCE_PAGE_IMAGE_MAX_WIDTH")
     source_page_image_jpeg_quality: int = Field(default=70, alias="SOURCE_PAGE_IMAGE_JPEG_QUALITY")

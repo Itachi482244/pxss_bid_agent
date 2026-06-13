@@ -11,7 +11,21 @@ from sqlalchemy import select
 
 from app.db.session import SessionLocal
 from app.main import app
-from app.models import AuditLog, ComplianceEvidenceBinding, ComplianceItem, Document, DocumentChunk, EnterpriseMaterial
+from app.models import (
+    AuditLog,
+    ComplianceEvidenceBinding,
+    ComplianceItem,
+    Document,
+    DocumentChunk,
+    EnterpriseMaterial,
+    EnterpriseMaterialChunk,
+)
+from app.services.embedding_gateway import (
+    EMBEDDING_DIMENSIONS,
+    configured_embedding_model,
+    configured_embedding_provider,
+)
+from app.services.rerank_gateway import configured_rerank_model, configured_rerank_provider
 from scripts.seed_dev_data import seed
 
 
@@ -184,6 +198,130 @@ def test_cleanroom_presale_material_types_are_searchable() -> None:
     assert chunks_response.json()[0]["enterprise_material_id"] == material["id"]
 
 
+def test_enterprise_material_index_health_and_rebuild_cleanup() -> None:
+    client = TestClient(app)
+    unique = f"INDEX-{uuid4().hex[:8].upper()}"
+    confirmed_response = client.post(
+        "/api/v1/enterprise/materials",
+        json={
+            "material_type": "license",
+            "name": f"索引测试营业执照 {unique}",
+            "certificate_no": unique,
+            "data_level": "internal",
+            "verification_status": "confirmed",
+            "evidence_text": f"{unique} 营业执照载明企业主体资格有效。",
+        },
+    )
+    pending_response = client.post(
+        "/api/v1/enterprise/materials",
+        json={
+            "material_type": "qualification",
+            "name": f"待确认资质 {unique}",
+            "certificate_no": f"PENDING-{unique}",
+            "data_level": "internal",
+            "verification_status": "pending_confirm",
+            "evidence_text": f"{unique} 待确认资料不应持久化进检索索引。",
+        },
+    )
+    assert confirmed_response.status_code == 201
+    assert pending_response.status_code == 201
+    confirmed = confirmed_response.json()
+    pending = pending_response.json()
+
+    with SessionLocal() as db:
+        pending_material = db.get(EnterpriseMaterial, UUID(pending["id"]))
+        assert pending_material is not None
+        stale_chunk = EnterpriseMaterialChunk(
+            tenant_id=pending_material.tenant_id,
+            enterprise_material_id=pending_material.id,
+            chunk_index=0,
+            content_text="不应保留的待确认资料 chunk",
+            content_hash="x" * 64,
+            metadata_json={"test": unique},
+            embedding_json=[0.0] * EMBEDDING_DIMENSIONS,
+            embedding_vector="[" + ",".join("0" for _ in range(EMBEDDING_DIMENSIONS)) + "]",
+            data_level="internal",
+            token_count=1,
+        )
+        db.add(stale_chunk)
+        db.commit()
+
+    health_response = client.get("/api/v1/enterprise/materials/index-health")
+    assert health_response.status_code == 200
+    health = health_response.json()
+    assert health["embedding_provider"] == configured_embedding_provider()
+    assert health["embedding_model"] == configured_embedding_model()
+    assert health["embedding_dimensions"] == EMBEDDING_DIMENSIONS
+    assert health["rerank_provider"] == configured_rerank_provider()
+    assert health["rerank_model"] == configured_rerank_model()
+    assert health["chunk_count"] >= 1
+
+    rebuild_response = client.post("/api/v1/enterprise/materials/index/rebuild")
+    assert rebuild_response.status_code == 200
+    rebuild = rebuild_response.json()
+    assert rebuild["rebuilt_material_count"] >= 1
+    assert rebuild["rebuilt_chunk_count"] >= 1
+    assert rebuild["removed_chunk_count"] >= 1
+    assert rebuild["health"]["status"] in {"healthy", "needs_rebuild"}
+
+    chunks_response = client.get(f"/api/v1/enterprise/materials/{confirmed['id']}/chunks")
+    assert chunks_response.status_code == 200
+    chunks = chunks_response.json()
+    assert chunks
+    assert chunks[0]["metadata_json"]["embedding_provider"] == configured_embedding_provider()
+    assert chunks[0]["metadata_json"]["embedding_dimensions"] == EMBEDDING_DIMENSIONS
+    with SessionLocal() as db:
+        saved_chunk = db.scalar(
+            select(EnterpriseMaterialChunk).where(
+                EnterpriseMaterialChunk.enterprise_material_id == UUID(confirmed["id"])
+            )
+        )
+        assert saved_chunk is not None
+        assert saved_chunk.embedding_json is not None
+        assert len(saved_chunk.embedding_json) == EMBEDDING_DIMENSIONS
+
+    pending_chunks_response = client.get(f"/api/v1/enterprise/materials/{pending['id']}/chunks")
+    assert pending_chunks_response.status_code == 200
+    assert pending_chunks_response.json() == []
+
+
+def test_enterprise_material_search_can_explicitly_include_pending_materials() -> None:
+    client = TestClient(app)
+    unique = f"PENDING-CANDIDATE-{uuid4().hex[:8].upper()}"
+    create_response = client.post(
+        "/api/v1/enterprise/materials",
+        json={
+            "material_type": "qualification",
+            "name": f"待确认候选资质 {unique}",
+            "certificate_no": unique,
+            "data_level": "internal",
+            "verification_status": "pending_confirm",
+            "evidence_text": f"{unique} 待确认施工资质证明。",
+        },
+    )
+    assert create_response.status_code == 201
+    material = create_response.json()
+
+    default_search = client.get(
+        "/api/v1/enterprise/materials/search",
+        params={"query": unique, "limit": 10},
+    )
+    assert default_search.status_code == 200
+    assert all(item["id"] != material["id"] for item in default_search.json())
+
+    pending_search = client.get(
+        "/api/v1/enterprise/materials/search",
+        params={"query": unique, "verification_status": "pending_confirm", "limit": 10},
+    )
+    assert pending_search.status_code == 200
+    hit = next(item for item in pending_search.json() if item["id"] == material["id"])
+    assert hit["chunk_id"] is None
+    assert "待确认" in hit["material_status_hint"]
+    assert hit["base_score"] is not None
+    assert hit["rerank_score"] is not None
+    assert hit["rerank_model"] == configured_rerank_model()
+
+
 def test_qualification_evaluation_matches_confirmed_license() -> None:
     client = TestClient(app)
     client.post(
@@ -264,15 +402,63 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
     project = next(item for item in projects if item["name"] == "智慧园区弱电工程投标")
     sections = client.get(f"/api/v1/projects/{project['id']}/sections").json()
     section = sections[0]
-    items = client.get(
-        f"/api/v1/projects/{project['id']}/sections/{section['id']}/compliance-items"
-    ).json()
-    compliance_item = next(item for item in items if "营业执照" in item["requirement_text"])
+    unique_requirement = f"投标人须提供有效营业执照 {certificate_no}"
+    with SessionLocal() as db:
+        row = db.execute(
+            select(Document, DocumentChunk)
+            .join(DocumentChunk, DocumentChunk.document_version_id == Document.current_version_id)
+            .where(
+                Document.project_id == UUID(project["id"]),
+                Document.section_id == UUID(section["id"]),
+                Document.current_version_id.is_not(None),
+                Document.status != "deleted",
+            )
+            .order_by(Document.updated_at.desc(), DocumentChunk.chunk_index.asc())
+            .limit(1)
+        ).one()
+        document, chunk = row
+        compliance_item = ComplianceItem(
+            tenant_id=document.tenant_id,
+            project_id=document.project_id,
+            section_id=document.section_id,
+            source_document_id=document.id,
+            source_version_id=document.current_version_id,
+            source_chunk_id=chunk.id,
+            source_page_no=chunk.page_no,
+            item_type="qualification",
+            requirement_text=unique_requirement,
+            normalized_requirement=unique_requirement,
+            response_suggestion="绑定已确认营业执照后人工确认。",
+            evidence_text=unique_requirement,
+            explanation_json={"source_quote": unique_requirement},
+            status="needs_material",
+            risk_level="high",
+            is_mandatory=True,
+            is_batch_confirm_allowed=False,
+            created_by=document.created_by,
+        )
+        db.add(compliance_item)
+        db.commit()
+        compliance_item_id = str(compliance_item.id)
+
+    candidates_response = client.get(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+            f"/compliance-items/{compliance_item_id}/evidence-candidates"
+        ),
+        params={"limit": 10},
+    )
+    assert candidates_response.status_code == 200
+    candidates = candidates_response.json()
+    candidate = next(item for item in candidates if item["id"] == material["id"])
+    assert candidate["chunk_id"]
+    assert candidate["recommend_reason"]
+    assert candidate["data_level_allowed"] is True
 
     bind_response = client.post(
         (
             f"/api/v1/projects/{project['id']}/sections/{section['id']}"
-            f"/compliance-items/{compliance_item['id']}/evidence-bindings"
+            f"/compliance-items/{compliance_item_id}/evidence-bindings"
         ),
         json={
             "enterprise_material_id": material["id"],
@@ -288,16 +474,26 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
     list_response = client.get(
         (
             f"/api/v1/projects/{project['id']}/sections/{section['id']}"
-            f"/compliance-items/{compliance_item['id']}/evidence-bindings"
+            f"/compliance-items/{compliance_item_id}/evidence-bindings"
         )
     )
     assert list_response.status_code == 200
     assert any(item["id"] == binding["id"] for item in list_response.json())
 
+    candidates_after_bind_response = client.get(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+            f"/compliance-items/{compliance_item_id}/evidence-candidates"
+        ),
+        params={"limit": 20},
+    )
+    assert candidates_after_bind_response.status_code == 200
+    assert all(item["id"] != material["id"] for item in candidates_after_bind_response.json())
+
     refreshed_items = client.get(
         f"/api/v1/projects/{project['id']}/sections/{section['id']}/compliance-items"
     ).json()
-    refreshed_item = next(item for item in refreshed_items if item["id"] == compliance_item["id"])
+    refreshed_item = next(item for item in refreshed_items if item["id"] == compliance_item_id)
     assert refreshed_item["enterprise_evidence_count"] >= 1
     assert material["name"] in refreshed_item["enterprise_evidence_summary"]
 

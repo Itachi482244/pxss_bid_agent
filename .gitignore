@@ -36,3 +36,8 @@ data/storage/
 
 # Local debug / QA dumps and screenshots
 test-artifacts/
+
+# Local Infinity model server (venv + downloaded weights + logs); keep start.sh/README
+infra/infinity-local/.venv/
+infra/infinity-local/models/
+infra/infinity-local/*.log

@@ -218,6 +218,27 @@
   min-width: 0;
 }
 
+.material-index-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid #d9e1ee;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.material-index-card p {
+  margin: 6px 0 8px;
+  color: #697386;
+}
+
+.material-index-card .ant-progress {
+  max-width: 520px;
+}
+
 .history-extract-card {
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(300px, 0.95fr);

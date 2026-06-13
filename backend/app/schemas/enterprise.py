@@ -97,11 +97,49 @@ class EnterpriseMaterialRead(BaseModel):
 class EnterpriseMaterialSearchResult(EnterpriseMaterialRead):
     snippet: str | None
     confidence_score: float
+    base_score: float | None = None
+    rerank_score: float | None = None
+    rerank_provider: str | None = None
+    rerank_model: str | None = None
+    rerank_used: bool = False
+    rerank_fallback_used: bool = False
+    rerank_error: str | None = None
     chunk_id: uuid.UUID | None = None
     data_level_allowed: bool = True
     recommend_reason: str | None = None
     matched_terms: list[str] = Field(default_factory=list)
     material_status_hint: str | None = None
+
+
+class EnterpriseMaterialIndexHealthRead(BaseModel):
+    status: str
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimensions: int
+    fallback_chunk_count: int
+    rerank_provider: str
+    rerank_model: str
+    total_material_count: int
+    confirmed_material_count: int
+    indexed_material_count: int
+    unindexed_material_count: int
+    stale_material_count: int
+    chunk_count: int
+    coverage_rate: float
+    last_indexed_at: datetime | None
+    unindexed_materials: list[dict[str, Any]] = Field(default_factory=list)
+    stale_materials: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EnterpriseMaterialIndexRebuildResult(BaseModel):
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimensions: int
+    rebuilt_material_count: int
+    rebuilt_chunk_count: int
+    removed_chunk_count: int
+    skipped_material_count: int
+    health: EnterpriseMaterialIndexHealthRead
 
 
 class EnterpriseMaterialHistoryExtractResult(BaseModel):

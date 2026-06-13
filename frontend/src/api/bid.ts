@@ -637,11 +637,49 @@ export type EnterpriseMaterialHistoryExtractResult = {
 export type EnterpriseMaterialSearchResult = EnterpriseMaterial & {
   snippet: string | null;
   confidence_score: number;
+  base_score: number | null;
+  rerank_score: number | null;
+  rerank_provider: string | null;
+  rerank_model: string | null;
+  rerank_used: boolean;
+  rerank_fallback_used: boolean;
+  rerank_error: string | null;
   chunk_id: string | null;
   data_level_allowed: boolean;
   recommend_reason: string | null;
   matched_terms: string[];
   material_status_hint: string | null;
+};
+
+export type EnterpriseMaterialIndexHealth = {
+  status: string;
+  embedding_provider: string;
+  embedding_model: string;
+  embedding_dimensions: number;
+  fallback_chunk_count: number;
+  rerank_provider: string;
+  rerank_model: string;
+  total_material_count: number;
+  confirmed_material_count: number;
+  indexed_material_count: number;
+  unindexed_material_count: number;
+  stale_material_count: number;
+  chunk_count: number;
+  coverage_rate: number;
+  last_indexed_at: string | null;
+  unindexed_materials: Record<string, unknown>[];
+  stale_materials: Record<string, unknown>[];
+};
+
+export type EnterpriseMaterialIndexRebuildResult = {
+  embedding_provider: string;
+  embedding_model: string;
+  embedding_dimensions: number;
+  rebuilt_material_count: number;
+  rebuilt_chunk_count: number;
+  removed_chunk_count: number;
+  skipped_material_count: number;
+  health: EnterpriseMaterialIndexHealth;
 };
 
 export type PreflightCheckItem = {
@@ -1042,6 +1080,20 @@ export async function searchEnterpriseMaterials(params: {
   const response = await apiClient.get<EnterpriseMaterialSearchResult[]>(
     "/enterprise/materials/search",
     { params }
+  );
+  return response.data;
+}
+
+export async function getEnterpriseMaterialIndexHealth() {
+  const response = await apiClient.get<EnterpriseMaterialIndexHealth>(
+    "/enterprise/materials/index-health"
+  );
+  return response.data;
+}
+
+export async function rebuildEnterpriseMaterialIndex() {
+  const response = await apiClient.post<EnterpriseMaterialIndexRebuildResult>(
+    "/enterprise/materials/index/rebuild"
   );
   return response.data;
 }
@@ -1604,6 +1656,24 @@ export async function listComplianceEvidenceBindings(
 ) {
   const response = await apiClient.get<ComplianceEvidenceBinding[]>(
     `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/evidence-bindings`
+  );
+  return response.data;
+}
+
+export async function listComplianceEvidenceCandidates(
+  projectId: string,
+  sectionId: string,
+  itemId: string,
+  params?: {
+    material_type?: string;
+    include_restricted?: boolean;
+    include_unconfirmed?: boolean;
+    limit?: number;
+  }
+) {
+  const response = await apiClient.get<EnterpriseMaterialSearchResult[]>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/evidence-candidates`,
+    { params }
   );
   return response.data;
 }
