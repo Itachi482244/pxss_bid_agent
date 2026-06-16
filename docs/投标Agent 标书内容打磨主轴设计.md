@@ -32,7 +32,7 @@ L1–L3 是"投得出、不出错"的底线（table stakes，必须接近 100%�
 
 ## 1. 架构主轴与数据流
 
-内容产出拆成五个**纯函数、无 I/O / 无 DB** 的可单测模块，串成一条装配管道：
+内容产出拆成六个**纯函数、无 I/O / 无 DB** 的可单测模块，串成一条装配管道（落库/取文件的副作用单独收口在 `tender_format_export` 编排层）：
 
 ```
 招标正文(解析拍平)
@@ -46,12 +46,16 @@ L1–L3 是"投得出、不出错"的底线（table stakes，必须接近 100%�
    │     .fill_template(模板, facts)
    │       → FilledTemplate(填好的行 + 未填清单)        （缺事实留『［待填:字段］』占位）
    │
+   ├─ tender_pricing.build_pricing_report()       → 工程量/报价行 + Decimal 算术与预算校验（缺则留空，不臆造）
+   │
    ├─ tender_compliance_coverage.compute_coverage()
-   │       → CoverageReport(L1 完整 / L2、L3 骨架)      ← 本设计新增层
+   │       → CoverageReport(L1 完整 / L2、L3 接数据层)
    │
    └─ tender_format_assembler.assemble_format_docx()
-           → 投标文件 docx（响应文件组成 + 合规自检清单 + 逐章渲染）
+           → 投标文件 docx（响应文件组成 + 合规自检清单 + 证照嵌入 + 评分索引 + 偏离/报价表 + L4 叙述骨架）
 ```
+
+> 以上六个模块均为**纯函数、无 I/O / 无 DB**，便于单测与复用。落库/取文件的副作用集中在唯一的 IO 编排层 `tender_format_export.export_tender_format_docx()`：它取 Project/Section 事实、`ComplianceItem`/证据绑定与可嵌入 `EnterpriseMaterial` 快照，调装配器产出 docx，再落 `ExportFile` 与 `AuditLog`。
 
 ### 1.1 模块职责
 
@@ -61,7 +65,9 @@ L1–L3 是"投得出、不出错"的底线（table stakes，必须接近 100%�
 | `tender_outline` | 目录节点 → 章节类型 + 附件清单 | 已完成 |
 | `tender_format_templates` | 抽取格式表单、识别填空位、按事实填充（含上下文消歧） | 已完成 |
 | `tender_compliance_coverage` | L1/L2/L3 三层"要求→应答覆盖"统一报告 | L1 完整；L2/L3 已优先消费 `ComplianceItem`/证据绑定 |
-| `tender_format_assembler` | 按推导目录装配 docx，渲染自检清单与各章 | 已完成审阅/正式双模式，支持证照嵌入、评分索引、偏离/报价表 |
+| `tender_pricing` | 工程量/报价清单抽取 + Decimal 算术校验 + 预算/最高限价校验 | 已完成（缺单价/合价只报缺口，绝不补数） |
+| `tender_format_assembler` | 按推导目录装配 docx，渲染自检清单与各章 | 已完成审阅/正式双模式，支持证照嵌入、评分索引、偏离/报价表、L4 叙述骨架 |
+| `tender_format_export` | 导出编排（**唯一 DB/IO 边界**）：取事实/材料/合规项快照 → 装配 → 落 `ExportFile` + `AuditLog` | 已完成；图片按需懒加载（仅取命中附件/证据绑定的材料） |
 
 ### 1.2 事实来源（已摸清）
 
@@ -132,7 +138,7 @@ L3 偏离响应: {pending: 1}      （技术/商务响应与偏离表）
 | L1 | ★附件2-2 信用查询 | 材料已备 |
 | L1 | 附件2-3 特定资格条件证明 | 需上传材料 |
 
-测试覆盖：`backend/tests/test_tender_compliance_coverage.py`（7 项），含表单可填/待补、附件需材料/废标缺口、L2/L3 骨架行、汇总分组。
+测试覆盖：`backend/tests/test_tender_compliance_coverage.py`（10 项），含表单可填/待补、附件需材料/废标缺口、L2/L3 骨架行、汇总分组。
 
 ## 4. 路线图：逐层深化
 
@@ -169,7 +175,9 @@ L3 偏离响应: {pending: 1}      （技术/商务响应与偏离表）
 2. **核心资格优先暴露**：营业执照/资质/信用等缺失标 `disqualifying`，在自检清单红牌置顶。
 3. **可校验**：每个"要求"都有明确状态与缺口说明，人能一眼看到还差什么。
 4. **建议 ≠ 生效**：覆盖判定与候选材料是建议，证据绑定/最终稿需人确认（与半自主编排一致）。
-5. **来源可追溯**：嵌入的材料、引用的条款均来自检索命中的真实 material/chunk。
+5. **来源可追溯**：嵌入的材料、引用的条款均来自检索命中的真实 material/chunk；导出端 `AuditLog` 记录 `source_snapshot`（含 `material_image_diag` 取图/失败/不支持计数），剥离原始图片字节。
+6. **引用完整性不变量**：只有"确有可嵌入图片"的材料才预留 PAGEREF 书签并被评分索引引用；无可嵌入图片的材料不预留、不引用，杜绝 Word 打开后出现"未找到引用源"。`require_embeddable` 在装配阶段一处口径，回归测试钉死。
+7. **按需取图**：导出端先建元数据快照，再用 `material_render_candidate_ids` 圈出命中附件/证据绑定的材料，仅对其拉 MinIO 字节并渲染 PDF 页，避免对全量材料做无谓 I/O。
 
 ## 6. 当前进度小结
 
@@ -182,5 +190,7 @@ L3 偏离响应: {pending: 1}      （技术/商务响应与偏离表）
 - ✅ 装配器与数据层（ComplianceItem/EvidenceBinding/EnterpriseMaterial）已完成正式接线。
 - ✅ L4：技术方案/施工组织/服务承诺等章节已由人工占位升级为事实约束叙述骨架，审阅版保留待确认边界，正式版转为招标文件/施工图/工程量清单约束表达。
 - ✅ 评分索引真实页码回填已接入：装配器不猜页码，改由 Word/LibreOffice 分页引擎更新书签引用；无法定位目标的评分项在审阅版显示待定位，正式版留空。
+- ✅ 本轮加固（导出链路）：①PAGEREF 引用完整性收口——只对"有可嵌入图片"的材料预留/引用书签，回归测试钉死无悬空引用；②证照图片按需懒加载（`material_render_candidate_ids` 只取命中材料），省去全量 MinIO/PDF 渲染；③嵌入图宽收敛到 `Cm(14.0)` 防超出页边距；④图片取数全程诊断计数（选中/失败/不支持）写入审计快照。
+- ✅ 导出编排与落库：新增 `tender_format_export` 与导出接口 `POST /projects/{id}/sections/{sid}/business-draft/format-docx/export`，`export_mode` ∈ `review|submission`；产物落 `ExportFile(export_type=tender_format_docx)`（新增校验约束迁移）并写 `AuditLog`。
 
-相关代码：`backend/app/services/tender_compliance_coverage.py`、`tender_format_assembler.py`、`tender_format_templates.py`；测试：`backend/tests/test_tender_compliance_coverage.py`、`test_tender_format_templates.py`。
+相关代码：`backend/app/services/tender_compliance_coverage.py`、`tender_format_assembler.py`、`tender_format_templates.py`、`tender_pricing.py`、`tender_format_export.py`；测试：`backend/tests/test_tender_compliance_coverage.py`（10）、`test_tender_format_assembler.py`（17，含 PAGEREF 完整性回归）、`test_tender_format_templates.py`（5）、`test_tender_directory.py`（4）、`test_tender_pricing.py`（3）。
