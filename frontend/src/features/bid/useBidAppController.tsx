@@ -105,6 +105,7 @@ import {
   getEnterpriseMaterialIndexHealth,
   getProject,
   getQualificationDecision,
+  getSectionQualitySummary,
   getTask,
   listApprovalTasks,
   listBusinessDraftBlocks,
@@ -183,6 +184,9 @@ import type {
   QualityIssue,
   QualificationDecision,
   QualificationEvaluation,
+  SectionQualityCheck,
+  SectionQualityMaterial,
+  SectionQualitySummary,
   SectionSummary,
   SimilarCandidate,
   MatrixReviewDuplicateGroup,
@@ -206,6 +210,8 @@ import {
   filterHomeProjects,
   materialExtractionMeta,
   matchesDraftBlockFilter,
+  sectionQualityStatusColor,
+  sectionQualityStatusLabel,
   type DraftBlockFilter,
   type ProjectGroup
 } from "../../pages/selectors";
@@ -1439,6 +1445,8 @@ export function useBidAppController() {
   const [exportingWord, setExportingWord] = useState(false);
   const [exportingTenderFormatMode, setExportingTenderFormatMode] =
     useState<TenderFormatDocxExportMode | "">("");
+  const [sectionQualitySummary, setSectionQualitySummary] = useState<SectionQualitySummary | null>(null);
+  const [loadingSectionQuality, setLoadingSectionQuality] = useState(false);
   const [generatingDecision, setGeneratingDecision] = useState(false);
   const [approvalBusyId, setApprovalBusyId] = useState("");
   const [savingProject, setSavingProject] = useState(false);
@@ -3004,6 +3012,36 @@ export function useBidAppController() {
     setPreflightCheck(data);
   }, [selectedProjectId, selectedSectionId]);
 
+  const reloadSectionQualitySummary = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!selectedProjectId || !selectedSectionId) {
+        setSectionQualitySummary(null);
+        return null;
+      }
+      setLoadingSectionQuality(true);
+      try {
+        const data = await getSectionQualitySummary(selectedProjectId, selectedSectionId);
+        setSectionQualitySummary(data);
+        return data;
+      } catch (error) {
+        setSectionQualitySummary(null);
+        if (!options?.silent) setApiError(errorMessage(error, "标书质量体检加载失败"));
+        return null;
+      } finally {
+        setLoadingSectionQuality(false);
+      }
+    },
+    [selectedProjectId, selectedSectionId]
+  );
+
+  useEffect(() => {
+    if (!selectedProjectId || !selectedSectionId) {
+      setSectionQualitySummary(null);
+      return;
+    }
+    void reloadSectionQualitySummary({ silent: true });
+  }, [reloadSectionQualitySummary, selectedProjectId, selectedSectionId]);
+
   const refreshMatrixRelatedPanels = useCallback(async () => {
     await Promise.all([
       reloadAuditLogs(),
@@ -3015,6 +3053,7 @@ export function useBidAppController() {
       reloadBusinessDraftContext(),
       reloadApprovalTasks(),
       reloadPreflightCheck(),
+      reloadSectionQualitySummary({ silent: true }),
       reloadEvidenceQualityReports()
     ]);
   }, [
@@ -3025,6 +3064,7 @@ export function useBidAppController() {
     reloadDocumentsAndExports,
     reloadEvidenceQualityReports,
     reloadPreflightCheck,
+    reloadSectionQualitySummary,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
     reloadWorkspaceSummary
@@ -5326,18 +5366,167 @@ export function useBidAppController() {
     }
   };
 
+  const tenderFormatExportModeLabel = (exportMode: TenderFormatDocxExportMode) =>
+    exportMode === "submission" ? "正式版" : "审阅版";
+
+  const renderTenderFormatExportConfirmation = (
+    exportMode: TenderFormatDocxExportMode,
+    summary: SectionQualitySummary
+  ) => {
+    const blockers = summary.checks.filter((check) => check.status === "block");
+    const warnings = summary.checks.filter((check) => check.status === "warn");
+    const materials = Array.isArray(summary.material_summary.materials)
+      ? summary.material_summary.materials
+      : [];
+    const selectedCount = summaryNumber(summary.material_summary, "selected_count");
+    const embeddableCount = summaryNumber(summary.material_summary, "embeddable_count");
+    const scoringIndexCount = summaryNumber(summary.export_preview, "scoring_index_count");
+    const placeholderCount = summaryNumber(summary.export_preview, "placeholder_count");
+    const pagerefNote =
+      typeof summary.export_preview.pageref_note === "string"
+        ? summary.export_preview.pageref_note
+        : "评分索引页码由 Word/LibreOffice 分页引擎更新。";
+    const alertType =
+      exportMode === "submission" && summary.status === "block"
+        ? "error"
+        : summary.status === "pass"
+          ? "success"
+          : "warning";
+
+    return (
+      <Space direction="vertical" size={12} style={{ width: "100%" }}>
+        <Alert
+          type={alertType}
+          showIcon
+          message={`标书质量体检：${summary.status_label || sectionQualityStatusLabel(summary.status)}`}
+          description={summary.summary}
+        />
+        <div className="export-confirm-grid">
+          <div>
+            <Text type="secondary">导出模式</Text>
+            <strong>{tenderFormatExportModeLabel(exportMode)}</strong>
+          </div>
+          <div>
+            <Text type="secondary">嵌入材料</Text>
+            <strong>
+              {embeddableCount}/{selectedCount}
+            </strong>
+          </div>
+          <div>
+            <Text type="secondary">评分索引</Text>
+            <strong>{scoringIndexCount} 项</strong>
+          </div>
+          <div>
+            <Text type="secondary">剩余占位</Text>
+            <strong>{placeholderCount}</strong>
+          </div>
+        </div>
+
+        <div className="export-confirm-section">
+          <Text strong>将嵌入/引用的材料</Text>
+          <div className="export-confirm-list">
+            {materials.length ? (
+              materials.slice(0, 6).map((material: SectionQualityMaterial) => (
+                <div key={material.material_id}>
+                  <span>{material.material_name}</span>
+                  <Tag color={material.embeddable ? "green" : "gold"}>
+                    {material.embeddable ? "可嵌入" : "待检查"}
+                  </Tag>
+                </div>
+              ))
+            ) : (
+              <Text type="secondary">本次未识别到可嵌入的证照/证明材料。</Text>
+            )}
+            {materials.length > 6 && <Text type="secondary">还有 {materials.length - 6} 项材料会在导出诊断中列出。</Text>}
+          </div>
+        </div>
+
+        <div className="export-confirm-section">
+          <Text strong>阻断项</Text>
+          {blockers.length ? (
+            <div className="export-confirm-list">
+              {blockers.slice(0, 5).map((check: SectionQualityCheck) => (
+                <div key={check.code}>
+                  <span>{check.title}</span>
+                  <Tag color="red">{check.count || "阻断"}</Tag>
+                  <Text type="secondary">{check.message}</Text>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Text type="secondary">未发现正式稿硬阻断。</Text>
+          )}
+        </div>
+
+        <div className="export-confirm-section">
+          <Text strong>可接受风险</Text>
+          {warnings.length ? (
+            <div className="export-confirm-list">
+              {warnings.slice(0, 5).map((check: SectionQualityCheck) => (
+                <div key={check.code}>
+                  <span>{check.title}</span>
+                  <Tag color="gold">{check.count || "复核"}</Tag>
+                  <Text type="secondary">{check.message}</Text>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Text type="secondary">没有待复核项。</Text>
+          )}
+        </div>
+
+        <Alert type="info" showIcon message="PAGEREF 更新提示" description={pagerefNote} />
+      </Space>
+    );
+  };
+
+  const confirmTenderFormatExport = (
+    exportMode: TenderFormatDocxExportMode,
+    summary: SectionQualitySummary
+  ) =>
+    new Promise<boolean>((resolve) => {
+      const submissionBlocked = exportMode === "submission" && summary.status === "block";
+      Modal.confirm({
+        title: submissionBlocked ? "正式版导出被阻断" : `导出前确认：${tenderFormatExportModeLabel(exportMode)}`,
+        width: 760,
+        content: renderTenderFormatExportConfirmation(exportMode, summary),
+        okText: submissionBlocked ? "处理阻断后再导出" : `确认导出${tenderFormatExportModeLabel(exportMode)}`,
+        cancelText: "取消",
+        okButtonProps: {
+          disabled: submissionBlocked,
+          danger: submissionBlocked
+        },
+        onOk: () => {
+          resolve(!submissionBlocked);
+        },
+        onCancel: () => {
+          resolve(false);
+        }
+      });
+    });
+
   const handleExportTenderFormatDocx = async (exportMode: TenderFormatDocxExportMode) => {
     if (!selectedProjectId || !selectedSectionId) return;
     setExportingTenderFormatMode(exportMode);
     try {
+      const qualitySummary = await reloadSectionQualitySummary();
+      if (!qualitySummary) return;
+      const confirmed = await confirmTenderFormatExport(exportMode, qualitySummary);
+      if (!confirmed) return;
       const exportFile = await exportTenderFormatDocx(selectedProjectId, selectedSectionId, {
         export_mode: exportMode
       });
       appendLog(`导出格式标装配 ${exportMode === "review" ? "审阅版" : "正式版"}：${exportFile.file_name}`);
-      await Promise.all([reloadDocumentsAndExports(), reloadAuditLogs(), reloadPreflightCheck()]);
+      await Promise.all([
+        reloadDocumentsAndExports(),
+        reloadAuditLogs(),
+        reloadPreflightCheck(),
+        reloadSectionQualitySummary({ silent: true })
+      ]);
       window.open(`/api/v1/projects/${selectedProjectId}/export-files/${exportFile.id}/download`, "_blank");
     } catch (error) {
       setApiError(errorMessage(error, "格式标装配导出失败"));
+      void reloadSectionQualitySummary({ silent: true });
     } finally {
       setExportingTenderFormatMode("");
     }
@@ -6767,6 +6956,7 @@ export function useBidAppController() {
     loadingMatrix,
     loadingModelConfig,
     loadingProjects,
+    loadingSectionQuality,
     loadingQualityChunks,
     loadingReviewChunks,
     loadingRevisionChunks,
@@ -6915,6 +7105,7 @@ export function useBidAppController() {
     reloadMatrix,
     reloadMatrixReview,
     reloadPreflightCheck,
+    reloadSectionQualitySummary,
     reloadProjects,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
@@ -6971,6 +7162,9 @@ export function useBidAppController() {
     SearchOutlined,
     sectionExtractingId,
     sectionPlanLoading,
+    sectionQualityStatusColor,
+    sectionQualityStatusLabel,
+    sectionQualitySummary,
     sections,
     Segmented,
     Select,

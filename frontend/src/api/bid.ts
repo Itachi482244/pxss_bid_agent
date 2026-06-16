@@ -799,6 +799,68 @@ export type PreflightCheck = {
   suggested_actions: string[];
 };
 
+export type SectionQualityStatus = "pass" | "warn" | "block";
+
+export type SectionQualityCheck = {
+  code: string;
+  title: string;
+  status: SectionQualityStatus;
+  message: string;
+  category: string;
+  count: number;
+  action_label: string | null;
+  target: string | null;
+  details: Record<string, unknown>[];
+};
+
+export type SectionQualityMaterial = {
+  material_id: string;
+  material_name: string;
+  material_type: string | null;
+  verification_status: string | null;
+  data_level: string | null;
+  certificate_no: string | null;
+  evidence_text: string | null;
+  file_name: string | null;
+  content_type: string | null;
+  selected_for_export: boolean;
+  embeddable: boolean;
+  embed_status: string | null;
+  embed_reason: string | null;
+};
+
+export type SectionQualitySummary = {
+  project_id: string;
+  section_id: string;
+  status: SectionQualityStatus;
+  status_label: string;
+  summary: string;
+  generated_at: string;
+  checks: SectionQualityCheck[];
+  suggested_actions: string[];
+  coverage_summary: Record<string, unknown>;
+  pricing_summary: Record<string, unknown>;
+  material_summary: Record<string, unknown> & {
+    total_confirmed_allowed_count?: number;
+    selected_count?: number;
+    embeddable_count?: number;
+    not_embeddable_count?: number;
+    materials?: SectionQualityMaterial[];
+  };
+  export_preview: Record<string, unknown> & {
+    review_allowed?: boolean;
+    submission_allowed?: boolean;
+    submission_blocked_reason?: string | null;
+    scoring_index_count?: number;
+    technical_response_count?: number;
+    placeholder_count?: number;
+    pageref_note?: string;
+  };
+  context_pack_status: Record<string, unknown> | null;
+  draft_summary: Record<string, unknown>;
+  source: Record<string, unknown>;
+};
+
 export type ComplianceEvidenceBinding = {
   id: string;
   project_id: string;
@@ -1489,6 +1551,13 @@ export async function listComplianceItems(
 export async function getPreflightCheck(projectId: string, sectionId: string) {
   const response = await apiClient.get<PreflightCheck>(
     `/projects/${projectId}/sections/${sectionId}/preflight-check`
+  );
+  return response.data;
+}
+
+export async function getSectionQualitySummary(projectId: string, sectionId: string) {
+  const response = await apiClient.get<SectionQualitySummary>(
+    `/projects/${projectId}/sections/${sectionId}/section-quality-summary`
   );
   return response.data;
 }

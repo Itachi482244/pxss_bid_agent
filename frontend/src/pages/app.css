@@ -1207,6 +1207,43 @@
   background: #eff6ff;
 }
 
+.section-quality-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid #d9e1ee;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.section-quality-strip.warn {
+  border-color: #f7d78a;
+  background: #fffaf0;
+}
+
+.section-quality-strip.block {
+  border-color: #ffccc7;
+  background: #fff7f5;
+}
+
+.section-quality-main {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.section-quality-main .ant-typography-secondary {
+  overflow-wrap: anywhere;
+}
+
+.section-quality-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .context-pack-preview {
   display: grid;
   gap: 18px;
@@ -1942,6 +1979,58 @@
   border: 1px solid #d9e1ee;
   border-radius: 8px;
   background: #ffffff;
+}
+
+.export-confirm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.export-confirm-grid > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid #edf0f5;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.export-confirm-grid strong {
+  overflow-wrap: anywhere;
+}
+
+.export-confirm-section {
+  display: grid;
+  gap: 8px;
+}
+
+.export-confirm-list {
+  display: grid;
+  gap: 6px;
+}
+
+.export-confirm-list > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid #edf0f5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.export-confirm-list > div > span:first-child,
+.export-confirm-list .ant-typography {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.export-confirm-list > div > .ant-typography {
+  grid-column: 1 / -1;
 }
 
 .quality-gate-alert {

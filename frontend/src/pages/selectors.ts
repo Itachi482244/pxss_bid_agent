@@ -8,6 +8,20 @@ export type ProjectGroup = "needs_me" | "in_progress" | "done";
 // 草稿块过滤维度。
 export type DraftBlockFilter = "all" | "needs_confirm" | "needs_evidence" | "pending";
 
+export type SectionQualityStatus = "pass" | "warn" | "block";
+
+export function sectionQualityStatusLabel(status: string): string {
+  if (status === "block") return "阻断";
+  if (status === "warn") return "需复核";
+  return "可继续";
+}
+
+export function sectionQualityStatusColor(status: string): string {
+  if (status === "block") return "red";
+  if (status === "warn") return "gold";
+  return "green";
+}
+
 // 项目分组：终态归"已完成"，需要人工动作归"待我处理"，其余归"进行中"。
 export function classifyProjectGroup(project: ProjectSummary): ProjectGroup {
   if (project.status === "exported" || project.status === "archived") return "done";

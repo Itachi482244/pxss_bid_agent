@@ -372,6 +372,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     loadingMatrix,
     loadingModelConfig,
     loadingProjects,
+    loadingSectionQuality,
     loadingQualityChunks,
     loadingReviewChunks,
     loadingRevisionChunks,
@@ -518,6 +519,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     reloadMatrix,
     reloadMatrixReview,
     reloadPreflightCheck,
+    reloadSectionQualitySummary,
     reloadProjects,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
@@ -574,6 +576,9 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     SearchOutlined,
     sectionExtractingId,
     sectionPlanLoading,
+    sectionQualityStatusColor,
+    sectionQualityStatusLabel,
+    sectionQualitySummary,
     sections,
     Segmented,
     Select,
@@ -1055,6 +1060,58 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                         {recommendedStep.actionText}
                       </Button>
                     </div>
+                  )}
+                  {(sectionQualitySummary || loadingSectionQuality) && (
+                    <section className={`section-quality-strip ${sectionQualitySummary?.status ?? "loading"}`}>
+                      <div className="section-quality-main">
+                        <Space wrap>
+                          <Text strong>标书质量体检</Text>
+                          <Tag color={sectionQualityStatusColor(sectionQualitySummary?.status ?? "pass")}>
+                            {sectionQualitySummary
+                              ? sectionQualitySummary.status_label || sectionQualityStatusLabel(sectionQualitySummary.status)
+                              : "加载中"}
+                          </Tag>
+                          {sectionQualitySummary?.export_preview.submission_allowed === false && (
+                            <Tag color="red">正式版不可导出</Tag>
+                          )}
+                        </Space>
+                        <Text type="secondary">
+                          {sectionQualitySummary?.summary ?? "正在汇总覆盖、报价、草稿事实和导出材料状态。"}
+                        </Text>
+                        {sectionQualitySummary && (
+                          <div className="section-quality-tags">
+                            <Tag color="red">
+                              阻断 {sectionQualitySummary.checks.filter((check) => check.status === "block").length}
+                            </Tag>
+                            <Tag color="gold">
+                              复核 {sectionQualitySummary.checks.filter((check) => check.status === "warn").length}
+                            </Tag>
+                            <Tag color="blue">
+                              评分索引 {summaryNumber(sectionQualitySummary.export_preview, "scoring_index_count")}
+                            </Tag>
+                            <Tag color="blue">
+                              占位 {summaryNumber(sectionQualitySummary.export_preview, "placeholder_count")}
+                            </Tag>
+                            <Tag color="green">
+                              材料 {summaryNumber(sectionQualitySummary.material_summary, "embeddable_count")}/
+                              {summaryNumber(sectionQualitySummary.material_summary, "selected_count")}
+                            </Tag>
+                          </div>
+                        )}
+                      </div>
+                      <Space wrap>
+                        <Button
+                          size="small"
+                          loading={loadingSectionQuality}
+                          onClick={() => void reloadSectionQualitySummary()}
+                        >
+                          刷新体检
+                        </Button>
+                        <Button size="small" onClick={() => activateWorkflowStep("documents")}>
+                          去导出
+                        </Button>
+                      </Space>
+                    </section>
                   )}
                   <div className="workflow-steps" aria-label="项目简化流程">
                     {simpleWorkflowSteps.map((step, index) => (

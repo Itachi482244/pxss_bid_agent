@@ -115,6 +115,7 @@ from app.schemas.project import (
     QualificationEvaluationRead,
     ProjectSummary,
     SectionCreateRequest,
+    SectionQualitySummaryRead,
     SectionSummary,
     SectionUpdateRequest,
     SimilarCandidateApplyRequest,
@@ -142,6 +143,7 @@ from app.services.compliance_generation import execute_compliance_matrix_generat
 from app.services.document_utils import TENDER_DOCUMENT_FILE_MAX_BYTES, readable_file_size
 from app.services.tender_outline import derive_project_directory
 from app.services.tender_format_export import TenderFormatExportError, export_tender_format_docx
+from app.services.section_quality import build_section_quality_summary
 from app.services.evidence_policy import (
     enterprise_evidence_not_required as policy_enterprise_evidence_not_required,
 )
@@ -2805,6 +2807,31 @@ def derive_business_draft_directory(
     return BusinessDraftDirectoryDeriveRead.model_validate(result)
 
 
+@router.get(
+    "/{project_id}/sections/{section_id}/section-quality-summary",
+    response_model=SectionQualitySummaryRead,
+)
+def get_section_quality_summary(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    profile_id: str | None = None,
+) -> SectionQualitySummaryRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        summary = build_section_quality_summary(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            profile_id=profile_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return SectionQualitySummaryRead.model_validate(summary)
+
+
 @router.post(
     "/{project_id}/sections/{section_id}/business-draft/format-docx/export",
     response_model=ExportFileRead,
@@ -2822,6 +2849,18 @@ def export_tender_format_docx_file(
     """
     get_section_or_404(db, ctx, project_id, section_id)
     try:
+        if payload.export_mode == "submission":
+            quality_summary = build_section_quality_summary(
+                db,
+                tenant_id=ctx.tenant_id,
+                project_id=project_id,
+                section_id=section_id,
+                profile_id=payload.profile_id,
+            )
+            if quality_summary["status"] == "block":
+                raise TenderFormatExportError(
+                    f"正式版导出已拦截：{quality_summary['summary']}"
+                )
         export_file = export_tender_format_docx(
             db,
             tenant_id=ctx.tenant_id,

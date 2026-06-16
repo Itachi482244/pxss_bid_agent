@@ -777,6 +777,52 @@ class BusinessDraftDirectoryDeriveRead(BaseModel):
     source: dict[str, Any] = Field(default_factory=dict)
 
 
+class SectionQualityCheckRead(BaseModel):
+    code: str
+    title: str
+    status: str
+    message: str
+    category: str
+    count: int = 0
+    action_label: str | None = None
+    target: str | None = None
+    details: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SectionQualityMaterialRead(BaseModel):
+    material_id: str
+    material_name: str
+    material_type: str | None = None
+    verification_status: str | None = None
+    data_level: str | None = None
+    certificate_no: str | None = None
+    evidence_text: str | None = None
+    file_name: str | None = None
+    content_type: str | None = None
+    selected_for_export: bool = False
+    embeddable: bool = False
+    embed_status: str | None = None
+    embed_reason: str | None = None
+
+
+class SectionQualitySummaryRead(BaseModel):
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    status: str
+    status_label: str
+    summary: str
+    generated_at: datetime
+    checks: list[SectionQualityCheckRead] = Field(default_factory=list)
+    suggested_actions: list[str] = Field(default_factory=list)
+    coverage_summary: dict[str, Any] = Field(default_factory=dict)
+    pricing_summary: dict[str, Any] = Field(default_factory=dict)
+    material_summary: dict[str, Any] = Field(default_factory=dict)
+    export_preview: dict[str, Any] = Field(default_factory=dict)
+    context_pack_status: dict[str, Any] | None = None
+    draft_summary: dict[str, Any] = Field(default_factory=dict)
+    source: dict[str, Any] = Field(default_factory=dict)
+
+
 class TenderFormatDocxExportRequest(BaseModel):
     """导出按招标文件格式装配的 docx。
 

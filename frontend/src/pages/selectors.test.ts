@@ -8,7 +8,9 @@ import {
   computeDraftBlockFilterCounts,
   filterHomeProjects,
   materialExtractionMeta,
-  matchesDraftBlockFilter
+  matchesDraftBlockFilter,
+  sectionQualityStatusColor,
+  sectionQualityStatusLabel
 } from "./selectors";
 
 function makeProject(partial: Partial<ProjectSummary>): ProjectSummary {
@@ -93,6 +95,21 @@ describe("matchesDraftBlockFilter", () => {
     expect(matchesDraftBlockFilter(makeBlock("approved"), "pending")).toBe(false);
     expect(matchesDraftBlockFilter(makeBlock("needs_confirm"), "pending")).toBe(false);
     expect(matchesDraftBlockFilter(makeBlock("needs_evidence"), "pending")).toBe(false);
+  });
+});
+
+describe("sectionQualityStatusLabel", () => {
+  it("复用 pass/warn/block 三态并输出面向用户文案", () => {
+    expect(sectionQualityStatusLabel("pass")).toBe("可继续");
+    expect(sectionQualityStatusLabel("warn")).toBe("需复核");
+    expect(sectionQualityStatusLabel("block")).toBe("阻断");
+    expect(sectionQualityStatusLabel("unknown")).toBe("可继续");
+  });
+
+  it("状态颜色与三态严重度一致", () => {
+    expect(sectionQualityStatusColor("pass")).toBe("green");
+    expect(sectionQualityStatusColor("warn")).toBe("gold");
+    expect(sectionQualityStatusColor("block")).toBe("red");
   });
 });
 
