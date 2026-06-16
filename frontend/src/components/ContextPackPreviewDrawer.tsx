@@ -67,15 +67,19 @@ export function ContextPackPreviewDrawer({
   const checks = asRecords(readiness.checks);
   const matrixItems = asRecords(context.matrix_items);
   const evidence = asRecords(context.bound_evidence);
+  const candidateEvidence = asRecords(context.candidate_evidence);
   const missingFacts = asRecords(context.missing_facts);
   const sections = asRecords(outline.sections);
   const readinessStatus = String(source?.readiness_status ?? "warn");
+  const requirementByItemId = new Map(
+    matrixItems.map((item) => [String(item.compliance_item_id), displayValue(item.requirement_text)])
+  );
 
   return (
     <Drawer
       title="投标素材包完整预览"
       open={open}
-      width={980}
+      width="min(980px, 100vw)"
       loading={loading}
       onClose={onClose}
       extra={
@@ -192,6 +196,7 @@ export function ContextPackPreviewDrawer({
               size="small"
               rowKey={(row) => String(row.compliance_item_id)}
               pagination={{ pageSize: 10, showSizeChanger: false }}
+              scroll={{ x: 760 }}
               dataSource={matrixItems}
               columns={[
                 {
@@ -216,6 +221,12 @@ export function ContextPackPreviewDrawer({
                   dataIndex: "bound_evidence_count",
                   width: 90,
                   render: (value: unknown) => displayValue(value)
+                },
+                {
+                  title: "候选",
+                  dataIndex: "candidate_evidence_count",
+                  width: 90,
+                  render: (value: unknown) => displayValue(value)
                 }
               ]}
             />
@@ -223,6 +234,7 @@ export function ContextPackPreviewDrawer({
               size="small"
               rowKey={(row) => String(row.binding_id)}
               pagination={{ pageSize: 8, hideOnSinglePage: true }}
+              scroll={{ x: 760 }}
               dataSource={evidence}
               locale={{ emptyText: "暂无已绑定企业资料证据" }}
               columns={[
@@ -231,13 +243,51 @@ export function ContextPackPreviewDrawer({
                 { title: "证据摘录", dataIndex: "evidence_text" }
               ]}
             />
+            <Table
+              size="small"
+              rowKey={(row) =>
+                `${String(row.compliance_item_id)}-${String(row.enterprise_material_id)}-${String(row.chunk_id ?? "material")}`
+              }
+              pagination={{ pageSize: 6, hideOnSinglePage: true }}
+              scroll={{ x: 900 }}
+              dataSource={candidateEvidence}
+              locale={{ emptyText: "暂无候选企业资料证据" }}
+              columns={[
+                { title: "候选资料", dataIndex: "material_name", width: 220 },
+                {
+                  title: "关联条款",
+                  dataIndex: "compliance_item_id",
+                  width: 260,
+                  render: (value: unknown) => <Text>{requirementByItemId.get(String(value)) ?? displayValue(value)}</Text>
+                },
+                {
+                  title: "确认状态",
+                  dataIndex: "confirmation_status",
+                  width: 120,
+                  render: () => <Tag color="gold">待绑定</Tag>
+                },
+                {
+                  title: "推荐理由",
+                  dataIndex: "recommend_reason",
+                  render: (value: unknown) => <Text>{displayValue(value)}</Text>
+                },
+                {
+                  title: "分数",
+                  dataIndex: "confidence_score",
+                  width: 90,
+                  render: (value: unknown) => displayValue(value)
+                }
+              ]}
+            />
           </section>
 
           <section className="context-pack-preview-section">
             <Title level={5}>待补事实</Title>
             <Table
               size="small"
-              rowKey={(row, index) => `${String(row.field ?? row.compliance_item_id ?? "missing")}-${index}`}
+              rowKey={(row) =>
+                `${String(row.field ?? row.compliance_item_id ?? "missing")}-${String(row.reason ?? "")}`
+              }
               pagination={false}
               dataSource={missingFacts}
               locale={{ emptyText: "没有待补事实" }}

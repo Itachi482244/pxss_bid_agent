@@ -6,17 +6,44 @@ from typing import Any, Mapping
 
 from app.models import EnterpriseMaterial
 
+VOLATILE_STRUCTURED_FIELD_KEYS = {
+    "duplicate_merge",
+    "duplicate_of_material_id",
+    "duplicate_review",
+    "extraction_confidence",
+    "extraction_method",
+    "needs_human_confirm",
+    "primary_source_image",
+    "source",
+    "source_file_name",
+    "source_files",
+    "source_images",
+    "source_locations",
+    "source_sha256",
+    "trust_boundary",
+}
+
 
 def _fingerprint_text(value: object) -> str:
     text = str(value or "").strip().lower()
     return "".join(re.findall(r"[0-9a-z\u4e00-\u9fff]+", text))
 
 
+def _stable_structured_fields(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    return {
+        key: _stable_structured_fields(item)
+        for key, item in value.items()
+        if key not in VOLATILE_STRUCTURED_FIELD_KEYS
+    }
+
+
 def _structured_fingerprint(value: object) -> str:
     if not value:
         return ""
     try:
-        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        text = json.dumps(_stable_structured_fields(value), ensure_ascii=False, sort_keys=True)
     except TypeError:
         text = str(value)
     return _fingerprint_text(text)

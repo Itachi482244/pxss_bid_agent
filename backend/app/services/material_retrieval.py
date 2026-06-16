@@ -20,6 +20,7 @@ from app.services.embedding_gateway import (
     configured_embedding_provider,
     embed_text,
 )
+from app.services.material_safety import safe_rerank_text_for_material
 from app.services.rerank_gateway import (
     configured_rerank_model,
     configured_rerank_provider,
@@ -110,6 +111,31 @@ class MaterialIndexRebuildResult:
     health: MaterialIndexHealth
 
 
+@dataclass(frozen=True)
+class MaterialChunkDraft:
+    content_text: str
+    metadata: dict[str, Any]
+
+
+CHUNK_SCHEMA_VERSION = "enterprise-material-chunk-v2"
+VOLATILE_MATERIAL_TEXT_FIELDS = {
+    "duplicate_merge",
+    "duplicate_of_material_id",
+    "duplicate_review",
+    "extraction_confidence",
+    "extraction_method",
+    "needs_human_confirm",
+    "primary_source_image",
+    "source",
+    "source_file_name",
+    "source_files",
+    "source_images",
+    "source_locations",
+    "source_sha256",
+    "trust_boundary",
+}
+
+
 def search_terms(query: str) -> list[str]:
     normalized = query.lower().replace("，", " ").replace("。", " ")
     terms = [item for item in re.split(r"\s+", normalized) if len(item) >= 2]
@@ -124,8 +150,8 @@ def matched_search_terms(query: str, text: str) -> list[str]:
 
 def material_text(material: EnterpriseMaterial) -> str:
     searchable_fields = dict(material.structured_fields or {})
-    searchable_fields.pop("source_images", None)
-    searchable_fields.pop("primary_source_image", None)
+    for key in VOLATILE_MATERIAL_TEXT_FIELDS:
+        searchable_fields.pop(key, None)
     structured = json.dumps(searchable_fields, ensure_ascii=False)
     values = [
         material.name,
@@ -211,20 +237,203 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return sum(left[index] * right[index] for index in range(size))
 
 
-def split_material_chunks(material: EnterpriseMaterial) -> list[str]:
+def _as_dict_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _compact_json(value: object, *, limit: int = 800) -> str | None:
+    if value in (None, "", [], {}):
+        return None
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else f"{text[:limit].rstrip()}..."
+
+
+def _material_identity_lines(material: EnterpriseMaterial) -> list[str]:
+    pairs = [
+        ("资料名称", material.name),
+        ("资料类型", material.material_type),
+        ("证书编号", material.certificate_no),
+        ("发证机关", material.issuing_authority),
+        ("持有人", material.holder_name),
+        ("项目名称", material.project_name),
+        ("金额", material.amount),
+        ("有效期至", material.valid_until.isoformat() if material.valid_until else None),
+    ]
+    return [f"{label}：{value}" for label, value in pairs if value]
+
+
+def _base_chunk_metadata(material: EnterpriseMaterial) -> dict[str, Any]:
+    return {
+        "chunk_schema_version": CHUNK_SCHEMA_VERSION,
+        "material_name": material.name,
+        "material_type": material.material_type,
+        "verification_status": material.verification_status,
+        "data_level": material.data_level,
+        "certificate_no": material.certificate_no,
+        "valid_until": material.valid_until.isoformat() if material.valid_until else None,
+    }
+
+
+def _source_images_for_location(
+    source_images: list[dict[str, Any]],
+    location: dict[str, Any],
+) -> list[dict[str, Any]]:
+    page_no = location.get("page_no")
+    block_index = location.get("block_index")
+    matches = [
+        image
+        for image in source_images
+        if (page_no is None or image.get("page_no") == page_no)
+        and (block_index is None or image.get("block_index") in (None, block_index))
+    ]
+    return matches or (source_images[:1] if len(source_images) == 1 else [])
+
+
+def _source_locations_from_fields(fields: dict[str, Any]) -> list[dict[str, Any]]:
+    source_files = _as_dict_list(fields.get("source_files"))
+    if not source_files:
+        return [
+            {
+                **location,
+                "source_file_name": fields.get("source_file_name"),
+                "source_sha256": fields.get("source_sha256"),
+            }
+            for location in _as_dict_list(fields.get("source_locations"))
+        ]
+
+    locations: list[dict[str, Any]] = []
+    for source_file in source_files:
+        source_file_locations = _as_dict_list(source_file.get("source_locations"))
+        if not source_file_locations:
+            locations.append(
+                {
+                    "source_file_name": source_file.get("source_file_name") or source_file.get("file_name"),
+                    "source_sha256": source_file.get("source_sha256") or source_file.get("sha256"),
+                    "source_images": _as_dict_list(source_file.get("source_images")),
+                }
+            )
+            continue
+        for location in source_file_locations:
+            locations.append(
+                {
+                    **location,
+                    "source_file_name": source_file.get("source_file_name") or source_file.get("file_name"),
+                    "source_sha256": source_file.get("source_sha256") or source_file.get("sha256"),
+                    "source_images": _as_dict_list(source_file.get("source_images")),
+                }
+            )
+    return locations
+
+
+def _history_source_chunk_drafts(
+    material: EnterpriseMaterial,
+    fields: dict[str, Any],
+) -> list[MaterialChunkDraft]:
+    source_locations = _source_locations_from_fields(fields)
+    if not source_locations:
+        return []
+
+    base_lines = _material_identity_lines(material)
+    all_source_images = _as_dict_list(fields.get("source_images"))
+    drafts: list[MaterialChunkDraft] = []
+    for location in source_locations:
+        snippet = str(location.get("snippet") or "").strip()
+        table_text = _compact_json(location.get("table_json"))
+        source_file_name = location.get("source_file_name") or fields.get("source_file_name") or material.file_name
+        source_images = _source_images_for_location(
+            _as_dict_list(location.get("source_images")) or all_source_images,
+            location,
+        )
+        location_lines = [
+            f"来源文件：{source_file_name}" if source_file_name else None,
+            f"页码：{location.get('page_no')}" if location.get("page_no") is not None else None,
+            f"来源块：{location.get('block_index')}" if location.get("block_index") is not None else None,
+            f"标题路径：{location.get('heading_path')}" if location.get("heading_path") else None,
+            f"原文片段：{snippet}" if snippet else None,
+            f"表格内容：{table_text}" if table_text else None,
+            f"证据摘要：{material.evidence_text}" if material.evidence_text and not snippet else None,
+        ]
+        content = "\n".join([*base_lines, *[line for line in location_lines if line]]).strip()
+        if not content:
+            continue
+        metadata = {
+            **_base_chunk_metadata(material),
+            "chunk_strategy": "history_source_location",
+            "source_file_name": source_file_name,
+            "source_sha256": location.get("source_sha256") or fields.get("source_sha256"),
+            "source_location": {
+                key: location.get(key)
+                for key in ("page_no", "block_index", "heading_path", "parser", "ocr_confidence")
+                if location.get(key) is not None
+            },
+            "source_locations": [
+                {
+                    key: location.get(key)
+                    for key in ("page_no", "block_index", "heading_path", "parser", "ocr_confidence", "snippet")
+                    if location.get(key) is not None
+                }
+            ],
+            "source_images": source_images,
+            "primary_source_image": source_images[0] if source_images else None,
+            "has_table": location.get("table_json") is not None,
+        }
+        drafts.append(MaterialChunkDraft(content_text=content, metadata=metadata))
+    return drafts
+
+
+def _paragraph_chunk_drafts(material: EnterpriseMaterial) -> list[MaterialChunkDraft]:
     source = material_text(material).strip() or material.name
     paragraphs = [item.strip() for item in re.split(r"\n+", source) if item.strip()]
-    chunks: list[str] = []
+    chunks: list[MaterialChunkDraft] = []
     current = ""
     for paragraph in paragraphs:
         if len(current) + len(paragraph) + 1 > 500 and current:
-            chunks.append(current)
+            chunks.append(
+                MaterialChunkDraft(
+                    content_text=current,
+                    metadata={
+                        **_base_chunk_metadata(material),
+                        "chunk_strategy": "material_paragraph",
+                    },
+                )
+            )
             current = paragraph
         else:
             current = f"{current}\n{paragraph}".strip()
     if current:
-        chunks.append(current)
-    return chunks or [material.name]
+        chunks.append(
+            MaterialChunkDraft(
+                content_text=current,
+                metadata={
+                    **_base_chunk_metadata(material),
+                    "chunk_strategy": "material_paragraph",
+                },
+            )
+        )
+    return chunks or [
+        MaterialChunkDraft(
+            content_text=material.name,
+            metadata={
+                **_base_chunk_metadata(material),
+                "chunk_strategy": "material_paragraph",
+            },
+        )
+    ]
+
+
+def split_material_chunks(material: EnterpriseMaterial) -> list[MaterialChunkDraft]:
+    structured_fields = material.structured_fields or {}
+    if isinstance(structured_fields, dict) and structured_fields.get("source") == "history_file_extract":
+        history_chunks = _history_source_chunk_drafts(material, structured_fields)
+        if history_chunks:
+            return history_chunks
+    return _paragraph_chunk_drafts(material)
 
 
 def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[EnterpriseMaterialChunk]:
@@ -235,10 +444,8 @@ def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[E
         )
     )
     chunks: list[EnterpriseMaterialChunk] = []
-    structured_fields = material.structured_fields or {}
-    source_images = structured_fields.get("source_images") if isinstance(structured_fields, dict) else None
-    primary_source_image = structured_fields.get("primary_source_image") if isinstance(structured_fields, dict) else None
-    for index, content in enumerate(split_material_chunks(material)):
+    for index, chunk_draft in enumerate(split_material_chunks(material)):
+        content = chunk_draft.content_text
         embedding = embed_text(content)
         chunk = EnterpriseMaterialChunk(
             tenant_id=material.tenant_id,
@@ -247,11 +454,7 @@ def rebuild_material_chunks(db: Session, material: EnterpriseMaterial) -> list[E
             content_text=content,
             content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
             metadata_json={
-                "material_name": material.name,
-                "material_type": material.material_type,
-                "verification_status": material.verification_status,
-                "source_images": source_images if isinstance(source_images, list) else [],
-                "primary_source_image": primary_source_image if isinstance(primary_source_image, dict) else None,
+                **chunk_draft.metadata,
                 "embedding_provider": embedding.provider,
                 "embedding_runtime_provider": embedding.runtime_provider,
                 "embedding_model": embedding.model_name,
@@ -465,6 +668,9 @@ def rebuild_tenant_material_index(db: Session, *, tenant_id: uuid.UUID) -> Mater
 
 
 def _hit_rerank_text(hit: MaterialSearchHit) -> str:
+    safe_text = safe_rerank_text_for_material(hit.material)
+    if safe_text:
+        return safe_text
     values = [
         hit.material.name,
         hit.snippet,

@@ -8,7 +8,6 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from pathlib import Path
 from typing import Any
 
 import fitz
@@ -22,7 +21,7 @@ from app.parsers.word import parse_docx_bytes
 from app.schemas.enterprise import EnterpriseMaterialRead
 from app.services.document_utils import file_extension, safe_filename
 from app.services.llm_gateway import LLMGatewayError, chat_completion
-from app.services.material_identity import material_identity_key_from_values
+from app.services.material_identity import enterprise_material_identity_key, material_identity_key_from_values
 from app.services.ocr import OcrError, get_ocr_client
 from app.services.source_page_images import get_or_create_pdf_page_image_asset, page_image_payload
 from app.services.storage import get_object_bytes
@@ -84,6 +83,8 @@ SOURCE_IMAGE_KEYWORDS = (
     "法定代表人授权",
 )
 PERFORMANCE_SIGNAL_KEYWORDS = ("业绩", "合同", "中标", "竣工", "验收", "项目名称", "工程名称", "合同金额", "中标金额")
+MERGEABLE_DUPLICATE_STATUSES = {"draft", "pending_confirm"}
+DATA_LEVEL_RANK = {"public": 0, "internal": 1, "restricted": 2, "confidential": 3}
 
 
 class HistoryMaterialExtractError(Exception):
@@ -254,6 +255,8 @@ def _source_locations(blocks: list[SourceTextBlock], block_indexes: list[int]) -
         }
         if block.ocr_confidence is not None:
             payload["ocr_confidence"] = block.ocr_confidence
+        if block.table_json is not None:
+            payload["table_json"] = block.table_json
         locations.append(payload)
     return locations
 
@@ -365,32 +368,299 @@ def _source_images_for_draft(
     return images
 
 
+def _source_reference(
+    *,
+    source_file_name: str,
+    source_sha256: str,
+    source_file_size: int | None,
+    source_content_type: str | None,
+    source_locations: list[dict[str, Any]],
+    extraction_method: str | None,
+    extraction_confidence: float | None,
+    source_images: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    reference: dict[str, Any] = {
+        "source_file_name": source_file_name,
+        "file_name": source_file_name,
+        "source_sha256": source_sha256,
+        "sha256": source_sha256,
+        "source_file_size": source_file_size,
+        "content_type": source_content_type,
+        "source_locations": source_locations,
+    }
+    if extraction_method:
+        reference["extraction_method"] = extraction_method
+    if extraction_confidence is not None:
+        reference["extraction_confidence"] = round(float(extraction_confidence), 4)
+    if source_images:
+        reference["source_images"] = source_images
+    return reference
+
+
 def _make_structured_fields(
     draft: ExtractedMaterialDraft,
     *,
     blocks: list[SourceTextBlock],
     source_file_name: str,
     source_sha256: str,
+    source_file_size: int | None,
+    source_content_type: str | None,
     extraction_method: str,
     source_images: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     fields = dict(draft.structured_fields or {})
+    source_locations = _source_locations(blocks, draft.source_block_indexes)
+    confidence = round(float(draft.confidence), 4)
     fields.update(
         {
             "source": "history_file_extract",
             "source_file_name": source_file_name,
             "source_sha256": source_sha256,
-            "source_locations": _source_locations(blocks, draft.source_block_indexes),
+            "source_locations": source_locations,
             "extraction_method": extraction_method,
-            "extraction_confidence": round(float(draft.confidence), 4),
+            "extraction_confidence": confidence,
             "needs_human_confirm": True,
             "trust_boundary": "pending_confirm_until_human_review",
+            "source_files": [
+                _source_reference(
+                    source_file_name=source_file_name,
+                    source_sha256=source_sha256,
+                    source_file_size=source_file_size,
+                    source_content_type=source_content_type,
+                    source_locations=source_locations,
+                    extraction_method=extraction_method,
+                    extraction_confidence=confidence,
+                    source_images=source_images,
+                )
+            ],
         }
     )
     if source_images:
         fields["source_images"] = source_images
         fields["primary_source_image"] = source_images[0]
     return fields
+
+
+def _json_fingerprint(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _dict_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _merge_unique_dicts(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            key = _json_fingerprint(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def _source_references_from_fields(fields: dict[str, Any]) -> list[dict[str, Any]]:
+    source_files = _dict_list(fields.get("source_files"))
+    if source_files:
+        return source_files
+    source_file_name = fields.get("source_file_name")
+    source_sha256 = fields.get("source_sha256")
+    if not source_file_name and not source_sha256:
+        return []
+    return [
+        _source_reference(
+            source_file_name=str(source_file_name or ""),
+            source_sha256=str(source_sha256 or ""),
+            source_file_size=None,
+            source_content_type=None,
+            source_locations=_dict_list(fields.get("source_locations")),
+            extraction_method=str(fields.get("extraction_method") or "") or None,
+            extraction_confidence=float(fields["extraction_confidence"])
+            if isinstance(fields.get("extraction_confidence"), (int, float))
+            else None,
+            source_images=_dict_list(fields.get("source_images")),
+        )
+    ]
+
+
+def _merge_extraction_structured_fields(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any],
+    *,
+    merged_at: datetime,
+) -> dict[str, Any]:
+    existing_fields = dict(existing or {})
+    merged = dict(existing_fields)
+    source_keys = {
+        "duplicate_merge",
+        "extraction_confidence",
+        "extraction_method",
+        "needs_human_confirm",
+        "primary_source_image",
+        "source_file_name",
+        "source_files",
+        "source_images",
+        "source_locations",
+        "source_sha256",
+        "trust_boundary",
+    }
+    for key, value in incoming.items():
+        if key in source_keys:
+            continue
+        if key not in merged or merged[key] in (None, "", [], {}):
+            merged[key] = value
+
+    source_files = _merge_unique_dicts(
+        _source_references_from_fields(existing_fields),
+        _source_references_from_fields(incoming),
+    )
+    source_locations = _merge_unique_dicts(
+        _dict_list(existing_fields.get("source_locations")),
+        _dict_list(incoming.get("source_locations")),
+    )
+    source_images = _merge_unique_dicts(
+        _dict_list(existing_fields.get("source_images")),
+        _dict_list(incoming.get("source_images")),
+    )
+    confidence_values = [
+        value
+        for value in (
+            existing_fields.get("extraction_confidence"),
+            incoming.get("extraction_confidence"),
+        )
+        if isinstance(value, (int, float))
+    ]
+    previous_merge = existing_fields.get("duplicate_merge")
+    previous_merge = previous_merge if isinstance(previous_merge, dict) else {}
+
+    merged.update(
+        {
+            "source": "history_file_extract",
+            "source_file_name": incoming.get("source_file_name") or existing_fields.get("source_file_name"),
+            "source_sha256": incoming.get("source_sha256") or existing_fields.get("source_sha256"),
+            "source_locations": source_locations,
+            "source_files": source_files,
+            "extraction_method": incoming.get("extraction_method") or existing_fields.get("extraction_method"),
+            "extraction_confidence": max(confidence_values) if confidence_values else incoming.get("extraction_confidence"),
+            "needs_human_confirm": True,
+            "trust_boundary": "pending_confirm_until_human_review",
+            "duplicate_merge": {
+                "merged": True,
+                "merge_count": len(source_files),
+                "first_merged_at": previous_merge.get("first_merged_at") or merged_at.isoformat(),
+                "last_merged_at": merged_at.isoformat(),
+                "latest_source_file_name": incoming.get("source_file_name"),
+                "latest_source_sha256": incoming.get("source_sha256"),
+            },
+        }
+    )
+    if source_images:
+        merged["source_images"] = source_images
+        merged["primary_source_image"] = source_images[0]
+    return merged
+
+
+def _draft_identity_key(draft: ExtractedMaterialDraft) -> str:
+    return material_identity_key_from_values(
+        material_type=draft.material_type,
+        name=draft.name,
+        issuing_authority=draft.issuing_authority,
+        certificate_no=draft.certificate_no,
+        holder_name=draft.holder_name,
+        project_name=draft.project_name,
+        amount=draft.amount,
+        structured_fields=draft.structured_fields,
+        evidence_text=draft.evidence_text,
+    )
+
+
+def _duplicate_materials_by_identity(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    material_types: set[str],
+) -> dict[str, list[EnterpriseMaterial]]:
+    if not material_types:
+        return {}
+    materials = db.scalars(
+        select(EnterpriseMaterial).where(
+            EnterpriseMaterial.tenant_id == tenant_id,
+            EnterpriseMaterial.material_type.in_(material_types),
+        )
+    ).all()
+    by_identity: dict[str, list[EnterpriseMaterial]] = {}
+    for material in materials:
+        by_identity.setdefault(enterprise_material_identity_key(material), []).append(material)
+    return by_identity
+
+
+def _select_duplicate_material(candidates: list[EnterpriseMaterial]) -> EnterpriseMaterial | None:
+    if not candidates:
+        return None
+    mergeable = [material for material in candidates if material.verification_status in MERGEABLE_DUPLICATE_STATUSES]
+    pool = mergeable or candidates
+    return max(
+        pool,
+        key=lambda material: material.updated_at or material.created_at or datetime.min.replace(tzinfo=UTC),
+    )
+
+
+def _more_restrictive_data_level(left: str, right: str) -> str:
+    return left if DATA_LEVEL_RANK.get(left, 1) >= DATA_LEVEL_RANK.get(right, 1) else right
+
+
+def _latest_date(left: date | None, right: date | None) -> date | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return max(left, right)
+
+
+def _merge_into_pending_duplicate(
+    material: EnterpriseMaterial,
+    *,
+    draft: ExtractedMaterialDraft,
+    structured_fields: dict[str, Any],
+    actor_user_id: uuid.UUID,
+    now: datetime,
+    data_level: str,
+    extraction: HistoryMaterialExtraction,
+    bucket: str,
+    object_key: str,
+) -> EnterpriseMaterial:
+    material.issuing_authority = material.issuing_authority or draft.issuing_authority
+    material.certificate_no = material.certificate_no or draft.certificate_no
+    material.holder_name = material.holder_name or draft.holder_name
+    material.project_name = material.project_name or draft.project_name
+    material.amount = material.amount or draft.amount
+    material.valid_from = material.valid_from or draft.valid_from
+    material.valid_until = _latest_date(material.valid_until, draft.valid_until)
+    if len(draft.evidence_text or "") > len(material.evidence_text or ""):
+        material.evidence_text = draft.evidence_text
+    material.data_level = _more_restrictive_data_level(material.data_level, data_level)
+    material.structured_fields = _merge_extraction_structured_fields(
+        material.structured_fields,
+        structured_fields,
+        merged_at=now,
+    )
+    material.file_name = extraction.source_file_name
+    material.content_type = extraction.source_content_type
+    material.file_size = extraction.source_file_size
+    material.sha256 = extraction.source_sha256
+    material.bucket = bucket
+    material.object_key = object_key
+    material.updated_by = actor_user_id
+    material.updated_at = now
+    return material
 
 
 def _dedupe_drafts(drafts: list[ExtractedMaterialDraft]) -> list[ExtractedMaterialDraft]:
@@ -912,6 +1182,11 @@ def create_pending_materials_from_extraction(
         source_file_name=extraction.source_file_name,
         source_sha256=extraction.source_sha256,
     )
+    duplicate_materials = _duplicate_materials_by_identity(
+        db,
+        tenant_id=tenant_id,
+        material_types={draft.material_type for draft in extraction.drafts},
+    )
     for draft in extraction.drafts:
         source_images = _source_images_for_draft(
             draft,
@@ -924,6 +1199,41 @@ def create_pending_materials_from_extraction(
             source_content_type=extraction.source_content_type,
             source_sha256=extraction.source_sha256,
         )
+        structured_fields = _make_structured_fields(
+            draft,
+            blocks=extraction.text_blocks,
+            source_file_name=extraction.source_file_name,
+            source_sha256=extraction.source_sha256,
+            source_file_size=extraction.source_file_size,
+            source_content_type=extraction.source_content_type,
+            extraction_method=extraction.extraction_method,
+            source_images=source_images,
+        )
+        identity_key = _draft_identity_key(draft)
+        duplicate = _select_duplicate_material(duplicate_materials.get(identity_key, []))
+        if duplicate is not None and duplicate.verification_status in MERGEABLE_DUPLICATE_STATUSES:
+            material = _merge_into_pending_duplicate(
+                duplicate,
+                draft=draft,
+                structured_fields=structured_fields,
+                actor_user_id=actor_user_id,
+                now=now,
+                data_level=data_level,
+                extraction=extraction,
+                bucket=bucket,
+                object_key=object_key,
+            )
+            materials.append(material)
+            continue
+        if duplicate is not None:
+            structured_fields["duplicate_of_material_id"] = str(duplicate.id)
+            structured_fields["duplicate_review"] = {
+                "status": "needs_human_review",
+                "reason": "identity_match_existing_non_draft_material",
+                "duplicate_of_material_id": str(duplicate.id),
+                "duplicate_of_verification_status": duplicate.verification_status,
+                "duplicate_of_name": duplicate.name,
+            }
         material = EnterpriseMaterial(
             tenant_id=tenant_id,
             material_type=draft.material_type,
@@ -937,14 +1247,7 @@ def create_pending_materials_from_extraction(
             valid_until=draft.valid_until,
             data_level=data_level,
             verification_status="pending_confirm",
-            structured_fields=_make_structured_fields(
-                draft,
-                blocks=extraction.text_blocks,
-                source_file_name=extraction.source_file_name,
-                source_sha256=extraction.source_sha256,
-                extraction_method=extraction.extraction_method,
-                source_images=source_images,
-            ),
+            structured_fields=structured_fields,
             evidence_text=draft.evidence_text,
             file_name=extraction.source_file_name,
             content_type=extraction.source_content_type,
@@ -959,6 +1262,7 @@ def create_pending_materials_from_extraction(
         )
         db.add(material)
         materials.append(material)
+        duplicate_materials.setdefault(identity_key, []).append(material)
     return materials
 
 

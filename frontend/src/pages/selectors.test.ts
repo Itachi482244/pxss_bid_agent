@@ -196,6 +196,8 @@ describe("materialExtractionMeta", () => {
     expect(meta).toEqual({
       isHistoryExtracted: true,
       sourceFileName: "历史投标资料.docx",
+      sourceFileCount: 1,
+      sourceFileSummary: "历史投标资料.docx",
       sourceLocationText: "P3 · 块 7",
       sourceImageCount: 1,
       confidence: 0.83,
@@ -204,10 +206,33 @@ describe("materialExtractionMeta", () => {
     });
   });
 
+  it("展示跨文件合并后的来源数量和最近来源", () => {
+    const meta = materialExtractionMeta(
+      makeMaterial({
+        structured_fields: {
+          source: "history_file_extract",
+          source_file_name: "新版营业执照.docx",
+          source_files: [
+            { source_file_name: "旧版营业执照.docx" },
+            { source_file_name: "新版营业执照.docx" }
+          ],
+          source_locations: [{ block_index: 1 }]
+        }
+      })
+    );
+
+    expect(meta.sourceFileName).toBe("新版营业执照.docx");
+    expect(meta.sourceFileCount).toBe(2);
+    expect(meta.sourceFileSummary).toBe("2 个历史文件");
+    expect(meta.sourceLocationText).toBe("块 1");
+  });
+
   it("普通手工资料保持温和默认值", () => {
     const meta = materialExtractionMeta(makeMaterial({ verification_status: "confirmed", file_name: "资质.pdf" }));
     expect(meta.isHistoryExtracted).toBe(false);
     expect(meta.sourceFileName).toBe("资质.pdf");
+    expect(meta.sourceFileCount).toBe(1);
+    expect(meta.sourceFileSummary).toBe("资质.pdf");
     expect(meta.needsHumanConfirm).toBe(false);
   });
 });

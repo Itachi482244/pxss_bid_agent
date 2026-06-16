@@ -563,6 +563,20 @@ class ComplianceEvidenceBindRequest(BaseModel):
     reason: str = Field(default="绑定企业资料作为响应证据", min_length=2, max_length=1000)
 
 
+class ComplianceEvidenceCandidateRejectRequest(BaseModel):
+    reason: str = Field(default="候选证据与当前条款不匹配", min_length=2, max_length=1000)
+
+
+class ComplianceEvidenceCandidateRejectRead(BaseModel):
+    audit_log_id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    compliance_item_id: uuid.UUID
+    enterprise_material_id: uuid.UUID
+    reason: str
+    created_at: datetime
+
+
 class ComplianceEvidenceWaiveRequest(BaseModel):
     reason: str = Field(default="人工判定该条款无需绑定企业资料证据", min_length=2, max_length=1000)
 
@@ -738,6 +752,40 @@ class BusinessDraftContextPackPreviewRead(BaseModel):
     context_json: dict[str, Any]
     readiness_json: dict[str, Any]
     outline_plan_json: dict[str, Any]
+
+
+class TenderDirectoryChapterRead(BaseModel):
+    """招标文件推导出的单个目录章节（可直接转 OutlineChapterInput）。"""
+
+    section_type: str
+    title: str
+    custom: bool = False
+    mapped_from: str = "custom"
+    attachments: list[str] = Field(default_factory=list)
+
+
+class BusinessDraftDirectoryDeriveRead(BaseModel):
+    """从招标文件推导建议目录的结果（L2 骨架 + L1 采购信号）。"""
+
+    available: bool
+    reason: str | None = None
+    procurement_method: str | None = None
+    document_term: str | None = None
+    signals: dict[str, Any] = Field(default_factory=dict)
+    diagnostics: list[str] = Field(default_factory=list)
+    chapters: list[TenderDirectoryChapterRead] = Field(default_factory=list)
+    source: dict[str, Any] = Field(default_factory=dict)
+
+
+class TenderFormatDocxExportRequest(BaseModel):
+    """导出按招标文件格式装配的 docx。
+
+    review：审阅版，包含合规自检清单和附件状态；
+    submission：正式版，不输出内部自检/风险/待办状态。
+    """
+
+    export_mode: str = Field(default="review", pattern="^(review|submission)$")
+    profile_id: str | None = None
 
 
 class DraftSectionContextPackRead(BaseModel):
@@ -948,6 +996,86 @@ class AuditLogRead(BaseModel):
     reason: str | None
     severity: str
     created_at: datetime
+
+
+class ComplianceEvidenceFeedbackActionStats(BaseModel):
+    action: str
+    count: int
+    latest_at: datetime | None
+
+
+class ComplianceEvidenceFeedbackMaterialStats(BaseModel):
+    enterprise_material_id: uuid.UUID
+    material_name: str | None
+    material_type: str | None
+    bound_count: int
+    rejected_count: int
+    unbound_count: int
+    latest_reason: str | None
+    latest_action: str | None
+    latest_at: datetime | None
+
+
+class ComplianceEvidenceFeedbackItemStats(BaseModel):
+    compliance_item_id: uuid.UUID
+    requirement_text: str | None
+    bound_count: int
+    rejected_count: int
+    unbound_count: int
+    not_required_count: int
+    replacement_count: int
+    latest_reason: str | None
+    latest_action: str | None
+    latest_at: datetime | None
+
+
+class ComplianceEvidenceFeedbackReportRead(BaseModel):
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    total_feedback_count: int
+    bound_count: int
+    rejected_count: int
+    unbound_count: int
+    not_required_count: int
+    replacement_count: int
+    binding_acceptance_rate: float | None
+    actions: list[ComplianceEvidenceFeedbackActionStats]
+    materials_with_feedback: list[ComplianceEvidenceFeedbackMaterialStats]
+    top_rejected_materials: list[ComplianceEvidenceFeedbackMaterialStats]
+    items_with_feedback: list[ComplianceEvidenceFeedbackItemStats]
+    generated_at: datetime
+
+
+class ComplianceEvidenceEvaluationSampleRead(BaseModel):
+    compliance_item_id: uuid.UUID
+    requirement_text: str
+    expected_material_ids: list[uuid.UUID]
+    rejected_material_ids: list[uuid.UUID]
+    candidate_material_ids: list[uuid.UUID]
+    hit_at_k: bool
+    recall_at_k: float
+    precision_at_k: float
+    false_positive_material_ids: list[uuid.UUID]
+    missed_material_ids: list[uuid.UUID]
+    misrecommendation_types: list[str]
+
+
+class ComplianceEvidenceRetrievalEvaluationRead(BaseModel):
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    top_k: int
+    sample_count: int
+    labeled_positive_count: int
+    rejected_label_count: int
+    recall_at_k: float | None
+    precision_at_k: float | None
+    topk_hit_rate: float | None
+    binding_acceptance_rate: float | None
+    false_positive_count: int
+    missed_positive_count: int
+    misrecommendation_counts: dict[str, int]
+    samples: list[ComplianceEvidenceEvaluationSampleRead]
+    generated_at: datetime
 
 
 class ModelInvocationLogRead(BaseModel):

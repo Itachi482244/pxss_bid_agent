@@ -43,3 +43,5 @@ def test_prompt_registry_contains_mvp12_business_draft_section_prompt() -> None:
     assert prompt.output_schema["required"] == ["blocks"]
     assert "DraftBlock" in messages[0]["content"]
     assert "missing_fact_placeholders" in messages[1]["content"]
+    assert "工程量清单" in prompt.safety_boundary
+    assert "content_quality_policy" in messages[1]["content"]

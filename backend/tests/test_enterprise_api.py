@@ -9,6 +9,7 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.api.v1.routes.projects import enterprise_evidence_summary_for_item
 from app.db.session import SessionLocal
 from app.main import app
 from app.models import (
@@ -285,6 +286,72 @@ def test_enterprise_material_index_health_and_rebuild_cleanup() -> None:
     assert pending_chunks_response.json() == []
 
 
+def test_history_extracted_material_chunks_preserve_source_locations_and_tables() -> None:
+    client = TestClient(app)
+    unique = f"CHUNK-{uuid4().hex[:8].upper()}"
+    create_response = client.post(
+        "/api/v1/enterprise/materials",
+        json={
+            "material_type": "qualification",
+            "name": f"标准化切片测试资质 {unique}",
+            "certificate_no": unique,
+            "data_level": "internal",
+            "verification_status": "confirmed",
+            "structured_fields": {
+                "source": "history_file_extract",
+                "source_file_name": "历史资质文件.pdf",
+                "source_sha256": f"sha-{unique}",
+                "source_locations": [
+                    {
+                        "page_no": 2,
+                        "block_index": 5,
+                        "heading_path": "资质证书",
+                        "parser": "pdf_text",
+                        "snippet": f"{unique} 建筑工程施工总承包一级资质。",
+                        "table_json": {"tables": [[["资质类别", "等级"], ["建筑工程施工总承包", "一级"]]]},
+                    },
+                    {
+                        "page_no": 3,
+                        "block_index": 6,
+                        "heading_path": "许可信息",
+                        "parser": "pdf_text",
+                        "snippet": f"{unique} 安全生产许可证仍在有效期内。",
+                    },
+                ],
+                "source_images": [
+                    {"page_no": 2, "block_index": 5, "object_key": "source-pages/page-0002.jpg"},
+                    {"page_no": 3, "block_index": 6, "object_key": "source-pages/page-0003.jpg"},
+                ],
+                "extraction_confidence": 0.92,
+                "needs_human_confirm": False,
+            },
+            "evidence_text": f"{unique} 资质证书和许可信息来源于历史文件。",
+        },
+    )
+    assert create_response.status_code == 201
+    material = create_response.json()
+
+    chunks_response = client.get(f"/api/v1/enterprise/materials/{material['id']}/chunks")
+    assert chunks_response.status_code == 200
+    chunks = chunks_response.json()
+    assert len(chunks) == 2
+    first, second = chunks
+    assert first["content_text"].find("建筑工程施工总承包一级资质") >= 0
+    assert first["metadata_json"]["chunk_schema_version"] == "enterprise-material-chunk-v2"
+    assert first["metadata_json"]["chunk_strategy"] == "history_source_location"
+    assert first["metadata_json"]["source_file_name"] == "历史资质文件.pdf"
+    assert first["metadata_json"]["source_location"]["page_no"] == 2
+    assert first["metadata_json"]["source_location"]["block_index"] == 5
+    assert first["metadata_json"]["has_table"] is True
+    assert first["metadata_json"]["source_images"] == [
+        {"page_no": 2, "block_index": 5, "object_key": "source-pages/page-0002.jpg"}
+    ]
+    assert second["metadata_json"]["source_location"]["page_no"] == 3
+    assert second["metadata_json"]["source_images"] == [
+        {"page_no": 3, "block_index": 6, "object_key": "source-pages/page-0003.jpg"}
+    ]
+
+
 def test_enterprise_material_search_can_explicitly_include_pending_materials() -> None:
     client = TestClient(app)
     unique = f"PENDING-CANDIDATE-{uuid4().hex[:8].upper()}"
@@ -455,6 +522,88 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
     assert candidate["recommend_reason"]
     assert candidate["data_level_allowed"] is True
 
+    context_pack_preview_response = client.post(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}/"
+            "business-draft/context-pack/preview"
+        ),
+        json={
+            "profile_id": "engineering_construction_business_v1",
+            "section_types": ["qualification_performance_summary"],
+        },
+    )
+    assert context_pack_preview_response.status_code == 200
+    context_pack_preview = context_pack_preview_response.json()
+    preview_candidate_evidence = [
+        item
+        for item in context_pack_preview["context_json"]["candidate_evidence"]
+        if item["compliance_item_id"] == compliance_item_id
+    ]
+    assert any(item["enterprise_material_id"] == material["id"] for item in preview_candidate_evidence)
+    preview_matrix_item = next(
+        item
+        for item in context_pack_preview["context_json"]["matrix_items"]
+        if item["compliance_item_id"] == compliance_item_id
+    )
+    assert preview_matrix_item["bound_evidence_count"] == 0
+    assert preview_matrix_item["candidate_evidence_count"] >= 1
+    assert all(item["can_enter_context_pack"] is False for item in preview_candidate_evidence)
+
+    reject_response = client.post(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+            f"/compliance-items/{compliance_item_id}/evidence-candidates/{material['id']}/reject"
+        ),
+        json={"reason": "候选证据只说明主体有效，暂未覆盖本条款完整资格口径"},
+    )
+    assert reject_response.status_code == 200
+    rejected = reject_response.json()
+    assert rejected["compliance_item_id"] == compliance_item_id
+    assert rejected["enterprise_material_id"] == material["id"]
+    assert rejected["reason"] == "候选证据只说明主体有效，暂未覆盖本条款完整资格口径"
+
+    restricted_response = client.post(
+        "/api/v1/enterprise/materials",
+        json={
+            "material_type": "license",
+            "name": f"需脱敏营业执照 {uuid4().hex[:8]}",
+            "data_level": "confidential",
+            "verification_status": "confirmed",
+            "evidence_text": f"该证照包含敏感信息，提及 {certificate_no}，不能直接作为可引用响应证据。",
+        },
+    )
+    assert restricted_response.status_code == 201
+    restricted_material = restricted_response.json()
+    restricted_candidates_response = client.get(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+            f"/compliance-items/{compliance_item_id}/evidence-candidates"
+        ),
+        params={"include_restricted": True, "limit": 20},
+    )
+    assert restricted_candidates_response.status_code == 200
+    restricted_candidate = next(
+        item for item in restricted_candidates_response.json() if item["id"] == restricted_material["id"]
+    )
+    assert restricted_candidate["name"] == "机密资料（需授权查看）"
+    assert restricted_candidate["evidence_text"] is None
+    assert certificate_no not in (restricted_candidate["snippet"] or "")
+    assert restricted_candidate["data_level_allowed"] is False
+    assert restricted_candidate["structured_fields"]["redacted"] is True
+
+    restricted_bind_response = client.post(
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+            f"/compliance-items/{compliance_item_id}/evidence-bindings"
+        ),
+        json={
+            "enterprise_material_id": restricted_material["id"],
+            "reason": "尝试绑定未脱敏资料",
+            "confidence_score": "0.9200",
+        },
+    )
+    assert restricted_bind_response.status_code == 409
+
     bind_response = client.post(
         (
             f"/api/v1/projects/{project['id']}/sections/{section['id']}"
@@ -490,17 +639,15 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
     assert candidates_after_bind_response.status_code == 200
     assert all(item["id"] != material["id"] for item in candidates_after_bind_response.json())
 
-    refreshed_items = client.get(
-        f"/api/v1/projects/{project['id']}/sections/{section['id']}/compliance-items"
-    ).json()
-    refreshed_item = next(item for item in refreshed_items if item["id"] == compliance_item_id)
-    assert refreshed_item["enterprise_evidence_count"] >= 1
-    assert material["name"] in refreshed_item["enterprise_evidence_summary"]
-
     with SessionLocal() as db:
         saved = db.get(ComplianceEvidenceBinding, UUID(binding["id"]))
         assert saved is not None
         assert saved.material_snapshot["name"] == material["name"]
+        evidence_count, evidence_summary = enterprise_evidence_summary_for_item(
+            db, saved.tenant_id, UUID(compliance_item_id)
+        )
+        assert evidence_count >= 1
+        assert material["name"] in (evidence_summary or "")
         logs = db.scalars(
             select(AuditLog).where(
                 AuditLog.action == "matrix.evidence_bound",
@@ -508,6 +655,72 @@ def test_enterprise_material_search_and_compliance_evidence_binding() -> None:
             )
         ).all()
         assert logs
+        reject_logs = db.scalars(
+            select(AuditLog).where(
+                AuditLog.action == "matrix.evidence_candidate_rejected",
+                AuditLog.object_id == UUID(material["id"]),
+            )
+        ).all()
+        assert reject_logs
+        assert reject_logs[-1].after_json["item"]["id"] == compliance_item_id
+        assert reject_logs[-1].after_json["feedback_type"] == "rejected"
+
+    unbind_response = client.request(
+        "DELETE",
+        (
+            f"/api/v1/projects/{project['id']}/sections/{section['id']}"
+            f"/compliance-items/{compliance_item_id}/evidence-bindings/{binding['id']}"
+        ),
+        json={"reason": "用户反馈统计验证解除绑定原因"},
+    )
+    assert unbind_response.status_code == 200
+
+    feedback_response = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/evidence-feedback-report"
+    )
+    assert feedback_response.status_code == 200
+    feedback_report = feedback_response.json()
+    assert feedback_report["bound_count"] >= 1
+    assert feedback_report["rejected_count"] >= 1
+    assert feedback_report["unbound_count"] >= 1
+    assert feedback_report["binding_acceptance_rate"] is not None
+    item_feedback = next(
+        item
+        for item in feedback_report["items_with_feedback"]
+        if item["compliance_item_id"] == compliance_item_id
+    )
+    assert item_feedback["bound_count"] == 1
+    assert item_feedback["rejected_count"] == 1
+    assert item_feedback["unbound_count"] == 1
+    assert item_feedback["latest_reason"] == "用户反馈统计验证解除绑定原因"
+    material_feedback = next(
+        item
+        for item in feedback_report["materials_with_feedback"]
+        if item["enterprise_material_id"] == material["id"]
+    )
+    assert material_feedback["bound_count"] == 1
+    assert material_feedback["rejected_count"] == 1
+    assert material_feedback["unbound_count"] == 1
+    assert any(item["enterprise_material_id"] == material["id"] for item in feedback_report["top_rejected_materials"])
+
+    evaluation_response = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/evidence-retrieval-evaluation",
+        params={"top_k": 5},
+    )
+    assert evaluation_response.status_code == 200
+    evaluation = evaluation_response.json()
+    assert evaluation["top_k"] == 5
+    assert evaluation["sample_count"] >= 1
+    assert evaluation["labeled_positive_count"] >= 1
+    assert evaluation["topk_hit_rate"] is not None
+    evaluation_sample = next(
+        item
+        for item in evaluation["samples"]
+        if item["compliance_item_id"] == compliance_item_id
+    )
+    assert evaluation_sample["hit_at_k"] is True
+    assert material["id"] in evaluation_sample["candidate_material_ids"]
+    assert material["id"] in evaluation_sample["expected_material_ids"]
 
 
 def test_equivalent_enterprise_materials_are_deduped_for_search_and_binding() -> None:
@@ -864,6 +1077,18 @@ def test_compliance_evidence_requirement_can_be_waived() -> None:
     )
     assert after_preflight.status_code == 200
     assert after_preflight.json()["mandatory_missing_evidence_count"] == before_missing - 1
+
+    feedback_response = client.get(
+        f"/api/v1/projects/{project['id']}/sections/{section['id']}/evidence-feedback-report"
+    )
+    assert feedback_response.status_code == 200
+    item_feedback = next(
+        item
+        for item in feedback_response.json()["items_with_feedback"]
+        if item["compliance_item_id"] == str(item_id)
+    )
+    assert item_feedback["not_required_count"] == 1
+    assert item_feedback["latest_reason"] == "该履约担保条款当前仅作为商务承诺响应，暂不绑定企业资料证据"
 
     with SessionLocal() as db:
         logs = db.scalars(

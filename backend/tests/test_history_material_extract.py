@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -17,7 +18,9 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.main import app
 from app.models import AsyncTask, EnterpriseMaterial, EnterpriseMaterialChunk, SourcePageImage, Tenant, User
+from app.services.history_material_extract import ExtractedMaterialDraft
 from app.services.history_material_extract import SourceTextBlock
+from app.services.history_material_extract import create_pending_materials_from_extraction
 from app.services.history_material_extract import execute_history_material_extract_task
 from app.services.llm_gateway import LLMGatewayError, LLMResult
 from app.services.history_material_extract import HistoryMaterialExtraction
@@ -58,6 +61,50 @@ def make_scanned_pdf(page_count: int = 1) -> bytes:
     for _ in range(page_count):
         doc.new_page(width=300, height=200)
     return doc.tobytes()
+
+
+def make_extracted_license(
+    *,
+    source_file_name: str,
+    source_sha256: str,
+    certificate_no: str,
+    valid_until: date | None = None,
+    evidence_text: str | None = None,
+) -> HistoryMaterialExtraction:
+    evidence = evidence_text or (
+        f"营业执照\n企业名称：测试建设有限公司\n统一社会信用代码：{certificate_no}\n"
+        f"有效期至：{valid_until.isoformat() if valid_until else '长期'}"
+    )
+    block = SourceTextBlock(block_index=1, parser="word", heading_path="营业执照", content_text=evidence)
+    draft = ExtractedMaterialDraft(
+        material_type="license",
+        name="测试建设有限公司营业执照",
+        certificate_no=certificate_no,
+        valid_until=valid_until,
+        evidence_text=evidence,
+        confidence=0.86,
+        source_block_indexes=[1],
+        structured_fields={"fallback_rule": "license.business_license"},
+    )
+    return HistoryMaterialExtraction(
+        source_file_name=source_file_name,
+        source_content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        source_file_size=len(evidence.encode("utf-8")),
+        source_sha256=source_sha256,
+        parser_summary={"parser": "word", "mode": "test", "block_count": 1},
+        text_blocks=[block],
+        drafts=[draft],
+        extraction_method="local_rules",
+        warnings=[],
+    )
+
+
+def demo_tenant_user(db):
+    tenant = db.scalar(select(Tenant).where(Tenant.code == "demo"))
+    user = db.scalar(select(User).where(User.external_id == "demo-admin"))
+    assert tenant is not None
+    assert user is not None
+    return tenant, user
 
 
 def test_parse_docx_history_file_to_source_blocks() -> None:
@@ -194,6 +241,122 @@ def test_history_extract_api_creates_pending_materials_without_chunks(
             )
         )
         assert chunk_count == 0
+
+
+def test_history_extract_merges_duplicate_pending_material_sources_and_valid_until() -> None:
+    certificate_no = f"91310000{uuid4().hex[:12].upper()}"
+
+    with SessionLocal() as db:
+        tenant, user = demo_tenant_user(db)
+        first = create_pending_materials_from_extraction(
+            db,
+            tenant_id=tenant.id,
+            actor_user_id=user.id,
+            extraction=make_extracted_license(
+                source_file_name="旧版营业执照.docx",
+                source_sha256=f"old-{certificate_no}",
+                certificate_no=certificate_no,
+                valid_until=date(2027, 12, 31),
+            ),
+            bucket="test-bucket",
+            object_key="history/old-license.docx",
+            data_level="internal",
+        )
+        db.flush()
+        material_id = first[0].id
+
+        second = create_pending_materials_from_extraction(
+            db,
+            tenant_id=tenant.id,
+            actor_user_id=user.id,
+            extraction=make_extracted_license(
+                source_file_name="新版营业执照.docx",
+                source_sha256=f"new-{certificate_no}",
+                certificate_no=certificate_no,
+                valid_until=date(2029, 12, 31),
+                evidence_text=f"营业执照\n企业名称：测试建设有限公司\n统一社会信用代码：{certificate_no}\n有效期至：2029-12-31\n复核备注：新版证照",
+            ),
+            bucket="test-bucket",
+            object_key="history/new-license.docx",
+            data_level="restricted",
+        )
+        db.flush()
+
+        assert second[0].id == material_id
+        saved = db.get(EnterpriseMaterial, material_id)
+        assert saved is not None
+        assert saved.valid_until == date(2029, 12, 31)
+        assert saved.data_level == "restricted"
+        assert saved.verification_status == "pending_confirm"
+        assert "新版证照" in (saved.evidence_text or "")
+        assert saved.structured_fields is not None
+        assert saved.structured_fields["duplicate_merge"]["merge_count"] == 2
+        assert [item["source_file_name"] for item in saved.structured_fields["source_files"]] == [
+            "旧版营业执照.docx",
+            "新版营业执照.docx",
+        ]
+        duplicate_count = db.scalar(
+            select(func.count(EnterpriseMaterial.id)).where(
+                EnterpriseMaterial.tenant_id == tenant.id,
+                EnterpriseMaterial.certificate_no == certificate_no,
+            )
+        )
+        assert duplicate_count == 1
+        chunk_count = db.scalar(
+            select(func.count(EnterpriseMaterialChunk.id)).where(
+                EnterpriseMaterialChunk.enterprise_material_id == saved.id
+            )
+        )
+        assert chunk_count == 0
+
+
+def test_history_extract_flags_duplicate_of_confirmed_material_without_overwriting() -> None:
+    certificate_no = f"91310000{uuid4().hex[:12].upper()}"
+
+    with SessionLocal() as db:
+        tenant, user = demo_tenant_user(db)
+        confirmed = EnterpriseMaterial(
+            tenant_id=tenant.id,
+            material_type="license",
+            name="已确认营业执照",
+            certificate_no=certificate_no,
+            valid_until=date(2027, 12, 31),
+            data_level="internal",
+            verification_status="confirmed",
+            structured_fields={"manual_entry": True},
+            evidence_text="已人工确认的营业执照",
+            created_by=user.id,
+            updated_by=user.id,
+        )
+        db.add(confirmed)
+        db.flush()
+
+        materials = create_pending_materials_from_extraction(
+            db,
+            tenant_id=tenant.id,
+            actor_user_id=user.id,
+            extraction=make_extracted_license(
+                source_file_name="疑似重复营业执照.docx",
+                source_sha256=f"dup-{certificate_no}",
+                certificate_no=certificate_no,
+                valid_until=date(2029, 12, 31),
+            ),
+            bucket="test-bucket",
+            object_key="history/duplicate-license.docx",
+            data_level="internal",
+        )
+        db.flush()
+
+        duplicate = materials[0]
+        assert duplicate.id != confirmed.id
+        assert duplicate.verification_status == "pending_confirm"
+        assert duplicate.valid_until == date(2029, 12, 31)
+        assert duplicate.structured_fields is not None
+        assert duplicate.structured_fields["duplicate_of_material_id"] == str(confirmed.id)
+        assert duplicate.structured_fields["duplicate_review"]["status"] == "needs_human_review"
+        db.refresh(confirmed)
+        assert confirmed.valid_until == date(2027, 12, 31)
+        assert confirmed.evidence_text == "已人工确认的营业执照"
 
 
 def test_history_extract_drops_llm_blob_misclassified_as_performance(
@@ -440,6 +603,7 @@ def test_confirming_pdf_certificate_material_keeps_source_page_image_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stored_objects: list[dict[str, object]] = []
+    certificate_no = f"91310000PDFIMAGE{uuid4().hex[:8].upper()}"
 
     class FakeOcrClient:
         provider = "fake"
@@ -447,7 +611,7 @@ def test_confirming_pdf_certificate_material_keeps_source_page_image_payload(
         def recognize_image(self, image_bytes: bytes) -> OcrResult:
             assert image_bytes
             return OcrResult(
-                text="营业执照\n企业名称：测试建设有限公司\n统一社会信用代码：91310000PDFIMAGE001",
+                text=f"营业执照\n企业名称：测试建设有限公司\n统一社会信用代码：{certificate_no}",
                 confidence=0.93,
                 provider="fake",
             )

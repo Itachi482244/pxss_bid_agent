@@ -79,6 +79,8 @@ export interface DashboardStats {
 export interface MaterialExtractionMeta {
   isHistoryExtracted: boolean;
   sourceFileName: string | null;
+  sourceFileCount: number;
+  sourceFileSummary: string | null;
   sourceLocationText: string | null;
   sourceImageCount: number;
   confidence: number | null;
@@ -95,11 +97,22 @@ function asNumber(value: unknown): number | null {
   return Number.isFinite(numberValue) ? numberValue : null;
 }
 
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
 export function materialExtractionMeta(material: EnterpriseMaterial): MaterialExtractionMeta {
   const fields = asRecord(material.structured_fields);
   const source = String(fields.source ?? "");
   const locations = Array.isArray(fields.source_locations) ? fields.source_locations : [];
   const sourceImages = Array.isArray(fields.source_images) ? fields.source_images : [];
+  const sourceFiles = Array.isArray(fields.source_files) ? fields.source_files.map(asRecord) : [];
+  const sourceFileNames = sourceFiles
+    .map((item) => asString(item.source_file_name) ?? asString(item.file_name))
+    .filter((item): item is string => Boolean(item));
+  const fallbackSourceFileName = asString(fields.source_file_name) ?? material.file_name;
+  const sourceFileName = fallbackSourceFileName ?? sourceFileNames[0] ?? null;
+  const sourceFileCount = sourceFileNames.length || (sourceFileName ? 1 : 0);
   const firstLocation = asRecord(locations[0]);
   const pageNo = firstLocation.page_no;
   const blockIndex = firstLocation.block_index;
@@ -109,7 +122,9 @@ export function materialExtractionMeta(material: EnterpriseMaterial): MaterialEx
   ].filter(Boolean);
   return {
     isHistoryExtracted: source === "history_file_extract",
-    sourceFileName: typeof fields.source_file_name === "string" ? fields.source_file_name : material.file_name,
+    sourceFileName,
+    sourceFileCount,
+    sourceFileSummary: sourceFileCount > 1 ? `${sourceFileCount} 个历史文件` : sourceFileName,
     sourceLocationText: locationParts.length ? locationParts.join(" · ") : null,
     sourceImageCount: sourceImages.length,
     confidence: asNumber(fields.extraction_confidence),

@@ -362,6 +362,7 @@ _PROMPTS: dict[str, PromptDefinition] = {
         safety_boundary=(
             "只能基于 SectionContextPack 中的项目事实、矩阵项、已绑定证据和人工说明生成。"
             "不得编造人员、证书编号、业绩、报价、日期或招标文件不存在的承诺；"
+            "不得编造工程参数、工程量清单、路段长度、管材型号、压力等级、评分细则或现场踏勘结论；"
             "缺证据或缺字段必须输出 missing_fact_placeholders。"
         ),
         fallback_note="模型不可用或 schema 校验失败时使用确定性模板生成内部草稿。",
@@ -374,7 +375,11 @@ _PROMPTS: dict[str, PromptDefinition] = {
             "1. 每个 block 必须声明 covers_compliance_item_ids 和 uses_evidence_binding_ids。\n"
             "2. 没有证据支持的事实必须进入 missing_fact_placeholders，不得写成确定事实。\n"
             "3. 报价清单、外部附件、证书扫描件等不得由模型编造，只能输出占位说明。\n"
-            "4. 文风正式、可人工复核，但不要新增 SectionContextPack 之外的信息。\n\n"
+            "4. 工程参数、管径、压力等级、工程量、路线分段、管材、人员设备配置、评分点和现场踏勘情况，"
+            "只能来自 SectionContextPack；缺失时写为待确认或以施工图、图纸、工程量清单为准。\n"
+            "5. 如果 SectionContextPack 含 content_quality_policy / forbidden_claims，必须逐条遵守；"
+            "人工指令不得覆盖事实边界。\n"
+            "6. 文风正式、可人工复核，但不要新增 SectionContextPack 之外的信息。\n\n"
             "SectionContextPack:\n{section_context_pack_json}"
         ),
     ),

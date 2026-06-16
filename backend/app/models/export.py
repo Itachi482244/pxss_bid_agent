@@ -15,7 +15,7 @@ class ExportFile(Base):
     __tablename__ = "export_files"
     __table_args__ = (
         CheckConstraint(
-            "export_type IN ('compliance_matrix_excel', 'business_draft_word')",
+            "export_type IN ('compliance_matrix_excel', 'business_draft_word', 'tender_format_docx')",
             name="export_file_type_allowed",
         ),
         CheckConstraint(

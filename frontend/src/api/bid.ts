@@ -477,6 +477,86 @@ export type AuditLog = {
   created_at: string;
 };
 
+export type ComplianceEvidenceFeedbackActionStats = {
+  action: string;
+  count: number;
+  latest_at: string | null;
+};
+
+export type ComplianceEvidenceFeedbackMaterialStats = {
+  enterprise_material_id: string;
+  material_name: string | null;
+  material_type: string | null;
+  bound_count: number;
+  rejected_count: number;
+  unbound_count: number;
+  latest_reason: string | null;
+  latest_action: string | null;
+  latest_at: string | null;
+};
+
+export type ComplianceEvidenceFeedbackItemStats = {
+  compliance_item_id: string;
+  requirement_text: string | null;
+  bound_count: number;
+  rejected_count: number;
+  unbound_count: number;
+  not_required_count: number;
+  replacement_count: number;
+  latest_reason: string | null;
+  latest_action: string | null;
+  latest_at: string | null;
+};
+
+export type ComplianceEvidenceFeedbackReport = {
+  project_id: string;
+  section_id: string;
+  total_feedback_count: number;
+  bound_count: number;
+  rejected_count: number;
+  unbound_count: number;
+  not_required_count: number;
+  replacement_count: number;
+  binding_acceptance_rate: number | null;
+  actions: ComplianceEvidenceFeedbackActionStats[];
+  materials_with_feedback: ComplianceEvidenceFeedbackMaterialStats[];
+  top_rejected_materials: ComplianceEvidenceFeedbackMaterialStats[];
+  items_with_feedback: ComplianceEvidenceFeedbackItemStats[];
+  generated_at: string;
+};
+
+export type ComplianceEvidenceEvaluationSample = {
+  compliance_item_id: string;
+  requirement_text: string;
+  expected_material_ids: string[];
+  rejected_material_ids: string[];
+  candidate_material_ids: string[];
+  hit_at_k: boolean;
+  recall_at_k: number;
+  precision_at_k: number;
+  false_positive_material_ids: string[];
+  missed_material_ids: string[];
+  misrecommendation_types: string[];
+};
+
+export type ComplianceEvidenceRetrievalEvaluation = {
+  project_id: string;
+  section_id: string;
+  top_k: number;
+  sample_count: number;
+  labeled_positive_count: number;
+  rejected_label_count: number;
+  recall_at_k: number | null;
+  precision_at_k: number | null;
+  topk_hit_rate: number | null;
+  binding_acceptance_rate: number | null;
+  false_positive_count: number;
+  missed_positive_count: number;
+  misrecommendation_counts: Record<string, number>;
+  samples: ComplianceEvidenceEvaluationSample[];
+  generated_at: string;
+};
+
 export type ModelInvocationLog = {
   id: string;
   project_id: string | null;
@@ -904,6 +984,25 @@ export type BusinessDraftContextPackPayload = {
   section_types?: string[] | null;
   outline?: OutlineChapterInput[] | null;
   directives?: AuthorDirectiveInput[] | null;
+};
+
+export type TenderDirectoryChapter = {
+  section_type: string;
+  title: string;
+  custom: boolean;
+  mapped_from: string;
+  attachments: string[];
+};
+
+export type BusinessDraftDirectoryDerive = {
+  available: boolean;
+  reason?: string | null;
+  procurement_method?: string | null;
+  document_term?: string | null;
+  signals: Record<string, unknown>;
+  diagnostics: string[];
+  chapters: TenderDirectoryChapter[];
+  source: Record<string, unknown>;
 };
 
 export type BusinessDraftContextPackGenerateResult = {
@@ -1456,6 +1555,18 @@ export async function previewBusinessDraftContextPack(
   return response.data;
 }
 
+export async function deriveBusinessDraftDirectory(
+  projectId: string,
+  sectionId: string,
+  profileId?: string
+) {
+  const response = await apiClient.get<BusinessDraftDirectoryDerive>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/directory/derive`,
+    { params: profileId ? { profile_id: profileId } : undefined }
+  );
+  return response.data;
+}
+
 export async function listBusinessDraftContextPacks(projectId: string, sectionId: string) {
   const response = await apiClient.get<BusinessDraftContextPack[]>(
     `/projects/${projectId}/sections/${sectionId}/business-draft/context-pack`
@@ -1598,6 +1709,23 @@ export async function exportBusinessDraftWord(
   return response.data;
 }
 
+export type TenderFormatDocxExportMode = "review" | "submission";
+
+export async function exportTenderFormatDocx(
+  projectId: string,
+  sectionId: string,
+  payload: {
+    export_mode: TenderFormatDocxExportMode;
+    profile_id?: string | null;
+  }
+) {
+  const response = await apiClient.post<ExportFile>(
+    `/projects/${projectId}/sections/${sectionId}/business-draft/format-docx/export`,
+    payload
+  );
+  return response.data;
+}
+
 export async function listApprovalTasks(
   projectId: string,
   sectionId: string,
@@ -1691,6 +1819,30 @@ export async function bindComplianceEvidence(
 ) {
   const response = await apiClient.post<ComplianceEvidenceBinding>(
     `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/evidence-bindings`,
+    payload
+  );
+  return response.data;
+}
+
+export async function rejectComplianceEvidenceCandidate(
+  projectId: string,
+  sectionId: string,
+  itemId: string,
+  materialId: string,
+  payload: {
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<{
+    audit_log_id: string;
+    project_id: string;
+    section_id: string;
+    compliance_item_id: string;
+    enterprise_material_id: string;
+    reason: string;
+    created_at: string;
+  }>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/${itemId}/evidence-candidates/${materialId}/reject`,
     payload
   );
   return response.data;
@@ -1987,6 +2139,27 @@ export async function listAuditLogs(
   const response = await apiClient.get<AuditLog[]>(`/projects/${projectId}/audit-logs`, {
     params
   });
+  return response.data;
+}
+
+export async function getComplianceEvidenceFeedbackReport(projectId: string, sectionId: string) {
+  const response = await apiClient.get<ComplianceEvidenceFeedbackReport>(
+    `/projects/${projectId}/sections/${sectionId}/evidence-feedback-report`
+  );
+  return response.data;
+}
+
+export async function getComplianceEvidenceRetrievalEvaluation(
+  projectId: string,
+  sectionId: string,
+  params?: {
+    top_k?: number;
+  }
+) {
+  const response = await apiClient.get<ComplianceEvidenceRetrievalEvaluation>(
+    `/projects/${projectId}/sections/${sectionId}/evidence-retrieval-evaluation`,
+    { params }
+  );
   return response.data;
 }
 

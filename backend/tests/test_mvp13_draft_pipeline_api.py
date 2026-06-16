@@ -13,10 +13,12 @@ confirmable ContextPack) from ``test_mingzhu_mock_enterprise_data``.
 from __future__ import annotations
 
 from pathlib import Path
-from uuid import UUID
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 from alembic import command
 from alembic.config import Config
+from docx import Document as WordDocument
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -26,7 +28,6 @@ from app.models import (
     AuditLog,
     BusinessDraftChapter,
     ComplianceItem,
-    DraftBlock,
     DraftContextPack,
     DraftFactCheck,
     QualificationDecision,
@@ -34,9 +35,18 @@ from app.models import (
     User,
 )
 from app.services.business_draft import (
+    _chapter_label_rows,
+    _configure_bid_document,
+    _directory_lines,
+    _engineering_fact_candidates,
+    _fact_supported_by_corpus,
     _performance_fact_candidates,
     _personnel_fact_candidates,
+    _sanitize_export_paragraph,
 )
+from app.services.context_pack import _content_quality_policy
+from app.services.context_pack import _build_outline_plan, _build_section_draft_content
+from app.services.template_profile import get_template_profile
 from scripts.seed_dev_data import (
     DEMO_TENANT_CODE,
     DEMO_USER_EXTERNAL_ID,
@@ -47,6 +57,22 @@ from test_mingzhu_mock_enterprise_data import _add_mingzhu_project_with_items
 
 API = "/api/v1"
 SECTION_TYPES = ["bid_letter", "bid_commitment", "qualification_performance_summary"]
+INTERNAL_DRAFT_TERMS = [
+    "字段填充草稿",
+    "响应草稿",
+    "已绑定证据",
+    "事实性校验",
+    "ContextPack",
+    "MVP1.3",
+    "project_name",
+    "bidder_name",
+    "legal_representative_name",
+    "bid_date",
+    "招标要求：",
+    "投标响应：",
+    "招标文件要求及投标响应",
+    "燃气项目模拟-",
+]
 
 
 def setup_module() -> None:
@@ -132,6 +158,12 @@ def test_generate_produces_per_clause_blocks_with_backlinks() -> None:
     assert body["chapters"], "expected at least one generated chapter"
     blocks = body["blocks"]
     assert blocks, "expected structured draft blocks"
+    rendered_text = "\n".join(
+        [chapter["content_text"] for chapter in body["chapters"]]
+        + [block["content_text"] for block in blocks]
+    )
+    for term in INTERNAL_DRAFT_TERMS:
+        assert term not in rendered_text, f"internal term leaked into bid draft: {term}"
 
     block_types = {block["block_type"] for block in blocks}
     assert "heading" in block_types
@@ -157,6 +189,64 @@ def test_generate_produces_per_clause_blocks_with_backlinks() -> None:
     listed = client.get(f"{_base(project_id, section_id)}/blocks")
     assert listed.status_code == 200
     assert len(listed.json()) == len(blocks)
+
+
+def test_word_export_sanitizes_review_only_bid_language() -> None:
+    assert _sanitize_export_paragraph("1. 招标要求：类似工程业绩要求：不要求。") is None
+    cleaned = _sanitize_export_paragraph(
+        "我方响应：根据招标文件（招标项目编号：section-001），本次招标类似工程业绩不作为资格要求"
+        "（证据：燃气项目模拟-类似业绩不作资格要求确认）。"
+    )
+    assert cleaned is not None
+    assert "我方响应：" not in cleaned
+    assert "招标项目编号：section-001" not in cleaned
+    assert "证据：" not in cleaned
+    assert "燃气项目模拟-" not in cleaned
+
+
+def test_word_export_directory_uses_actual_chapter_titles() -> None:
+    class Chapter:
+        def __init__(self, title: str) -> None:
+            self.title = title
+
+    lines = _directory_lines(
+        [
+            Chapter("商务标封面"),  # type: ignore[list-item]
+            Chapter("商务标目录"),  # type: ignore[list-item]
+            Chapter("法定代表人身份证明书"),  # type: ignore[list-item]
+            Chapter("授权委托书"),  # type: ignore[list-item]
+            Chapter("投标函"),  # type: ignore[list-item]
+        ]
+    )
+    assert lines == ["一、法定代表人身份证明书", "二、授权委托书", "三、投标函"]
+
+
+def test_word_export_detects_label_value_rows_for_form_tables() -> None:
+    rows, remaining = _chapter_label_rows(
+        [
+            "投 标 文 件",
+            "项目名称：君山区城区燃气管网改造项目（EPC）",
+            "补充说明：",
+            "投标人：杭州明筑更新工程有限公司（盖单位章）",
+            "1. 我方承诺全面响应招标文件要求。",
+        ]
+    )
+    assert rows == [
+        ("项目名称", "君山区城区燃气管网改造项目（EPC）"),
+        ("投标人", "杭州明筑更新工程有限公司（盖单位章）"),
+    ]
+    assert remaining == ["投 标 文 件", "补充说明：", "1. 我方承诺全面响应招标文件要求。"]
+
+
+def test_word_export_configures_bid_document_style() -> None:
+    document = WordDocument()
+    _configure_bid_document(document)
+
+    section = document.sections[0]
+    assert round(section.left_margin.cm, 1) == 3.0
+    assert round(section.right_margin.cm, 1) == 2.5
+    assert document.styles["Normal"].font.size.pt == 12
+    assert document.styles["Heading 1"].font.bold is True
 
 
 # --- #2 outline preview + human selection of section scope ---
@@ -367,6 +457,166 @@ def test_performance_fact_candidates_detect_amount_and_contract() -> None:
     facts = _performance_fact_candidates(text)
     assert ("amount", "325.5万元") in facts
     assert ("other", "某老旧小区改造工程") in facts
+
+
+def test_engineering_fact_candidates_detect_unsupported_parameters() -> None:
+    text = "本项目柳林洲段5.23km，采用DN160管道，设计压力0.4MPa，按GB1级管理，不得误写为高压输气。"
+    facts = _engineering_fact_candidates(text)
+
+    assert ("number", "5.23km") in facts
+    assert ("number", "DN160") in facts
+    assert ("number", "0.4MPa") in facts
+    assert ("other", "GB1级") in facts
+    assert ("other", "高压") in facts
+
+    corpus = "招标文件载明：DN160，设计压力0.4MPa，压力管道GB1级，中压A。"
+    assert _fact_supported_by_corpus("number", "DN160", corpus) is True
+    assert _fact_supported_by_corpus("number", "0.4MPa", corpus) is True
+    assert _fact_supported_by_corpus("other", "GB1级", corpus) is True
+    assert _fact_supported_by_corpus("number", "5.23km", corpus) is False
+    assert _fact_supported_by_corpus("other", "高压", corpus) is False
+
+
+def test_gas_epc_content_quality_policy_blocks_unverified_engineering_inference() -> None:
+    project = SimpleNamespace(
+        name="君山区城区燃气管网改造项目（EPC）",
+        purchaser="岳阳市君山区城市建设投资有限公司",
+        industry_code="燃气",
+        region_code="湖南岳阳",
+    )
+    section = SimpleNamespace(name="城区燃气管网改造 EPC 标段", code="")
+    item = SimpleNamespace(
+        requirement_text="本项目为中压A燃气管网改造，DN90/DN110/DN160，设计压力0.4MPa，EPC工程总承包。",
+        normalized_requirement="燃气管网 EPC 工程总承包",
+        response_suggestion="",
+        evidence_text="",
+        item_type="technical_response",
+    )
+
+    policy = _content_quality_policy(project, section, [item])
+
+    assert policy["domain"] == "municipal_gas_pipeline_epc"
+    assert any("工程量清单" in rule and "不得" in rule for rule in policy["missing_material_strategy"])
+    assert any("实地勘察" in rule for rule in policy["missing_material_strategy"])
+    assert any("长输输气" in rule for rule in policy["industry_focus"])
+    assert "中压 GB1 燃气管道施工组织方案" in policy["recommended_technical_chapters"]
+
+
+def _fake_compliance_item(**overrides):
+    defaults = {
+        "id": uuid4(),
+        "item_type": "technical_response",
+        "requirement_text": "本项目为中压A燃气管网改造，DN90/DN110/DN160，设计压力0.4MPa，EPC工程总承包。",
+        "normalized_requirement": "燃气管网 EPC 工程总承包",
+        "response_suggestion": "",
+        "evidence_text": "",
+        "status": "confirmed",
+        "risk_level": "medium",
+        "is_mandatory": False,
+        "explanation_json": {"enterprise_evidence_not_required": True},
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def test_gas_epc_outline_auto_adds_technical_bid_sections() -> None:
+    profile = get_template_profile("engineering_construction_business_v1")
+    project = SimpleNamespace(
+        name="君山区城区燃气管网改造项目（EPC）",
+        purchaser="岳阳市君山区城市建设投资有限公司",
+        industry_code="燃气",
+        region_code="湖南岳阳",
+    )
+    section = SimpleNamespace(name="城区燃气管网改造 EPC 标段", code="")
+    item = _fake_compliance_item()
+    policy = _content_quality_policy(project, section, [item])
+
+    plan = _build_outline_plan(
+        profile=profile,
+        items=[item],
+        section_types=None,
+        content_quality_policy=policy,
+    )
+    section_types = [section["section_type"] for section in plan["sections"]]
+
+    assert "business_cover" in section_types
+    assert "gas_project_understanding" in section_types
+    assert "gas_pipeline_construction_method" in section_types
+    assert "gas_pressure_test_purge_acceptance" in section_types
+    gas_section = next(section for section in plan["sections"] if section["section_type"] == "gas_pipeline_construction_method")
+    assert gas_section["volume_title"] == "投标文件技术标"
+    assert gas_section["generation_mode"] == "technical_generated_paragraph"
+
+
+def test_non_gas_outline_does_not_auto_add_gas_technical_sections() -> None:
+    profile = get_template_profile("engineering_construction_business_v1")
+    project = SimpleNamespace(
+        name="明珠公寓老旧小区综合改造提升项目",
+        purchaser="杭州市上城区九堡街道明珠公寓业委会",
+        industry_code="building-renovation",
+        region_code="CN-330102",
+    )
+    section = SimpleNamespace(name="建安工程一标段", code="")
+    item = _fake_compliance_item(
+        requirement_text="质量要求：符合现行国家有关工程施工验收规范和标准的合格要求。",
+        normalized_requirement="质量要求",
+    )
+    policy = _content_quality_policy(project, section, [item])
+
+    plan = _build_outline_plan(
+        profile=profile,
+        items=[item],
+        section_types=None,
+        content_quality_policy=policy,
+    )
+    section_types = {section["section_type"] for section in plan["sections"]}
+
+    assert "gas_project_understanding" not in section_types
+    assert "gas_pipeline_construction_method" not in section_types
+
+
+def test_gas_technical_fallback_uses_source_facts_without_route_or_material_invention() -> None:
+    context_json = {
+        "section": {
+            "section_type": "gas_pipeline_construction_method",
+            "title": "中压GB1燃气管道施工组织方案",
+            "required": False,
+            "generation_mode": "technical_generated_paragraph",
+            "required_fields": ["project_name"],
+        },
+        "project_facts": {
+            "project_name": "君山区城区燃气管网改造项目（EPC）",
+            "construction_period_days": 270,
+            "quality_standard": "合格",
+        },
+        "tender_engineering_facts": {
+            "pipeline_lengths": ["13.23km"],
+            "pipe_diameters": ["DN90", "DN110", "DN160"],
+            "pressure_levels": ["中压A", "0.4MPa"],
+            "license_or_standards": ["GB1级"],
+            "period_terms": ["270日历日"],
+        },
+        "matrix_items": [],
+        "author_directives": [],
+    }
+    section_pack = SimpleNamespace(
+        context_json=context_json,
+        generation_mode="technical_generated_paragraph",
+        section_type="gas_pipeline_construction_method",
+        title="中压GB1燃气管道施工组织方案",
+    )
+
+    content, refs = _build_section_draft_content(section_pack)  # type: ignore[arg-type]
+
+    assert refs == []
+    assert "13.23km" in content
+    assert "DN160" in content
+    assert "0.4MPa" in content
+    assert "GB1级" in content
+    assert "以施工图" in content or "以招标人最终发布或审定资料为准" in content
+    assert "柳林洲段5.23km" not in content
+    assert "经实地勘察" not in content
+    assert "高压输气" not in content
 
 
 # --- #2(扩展) 章节级目录编辑：增/删/改名/重排 ---

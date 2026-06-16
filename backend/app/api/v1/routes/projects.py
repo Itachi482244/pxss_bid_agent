@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from difflib import SequenceMatcher
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
@@ -45,7 +45,7 @@ from app.models import (
     EnterpriseProfile,
 )
 from app.schemas.document import AsyncTaskRead, ComplianceMatrixExportRequest, ExportFileRead
-from app.schemas.enterprise import EnterpriseMaterialRead, EnterpriseMaterialSearchResult
+from app.schemas.enterprise import EnterpriseMaterialSearchResult
 from app.schemas.project import (
     AuditLogRead,
     ApprovalTaskCreateRequest,
@@ -59,12 +59,21 @@ from app.schemas.project import (
     BusinessDraftContextPackRead,
     BusinessDraftContextPackRequest,
     BusinessDraftDirectivesRequest,
+    BusinessDraftDirectoryDeriveRead,
     BusinessDraftEvidenceRefRead,
     BusinessDraftExportRequest,
     BusinessDraftGenerateRequest,
     ComplianceItemAssignRequest,
     ComplianceEvidenceBindRequest,
+    ComplianceEvidenceCandidateRejectRead,
+    ComplianceEvidenceCandidateRejectRequest,
     ComplianceEvidenceBindingRead,
+    ComplianceEvidenceFeedbackActionStats,
+    ComplianceEvidenceFeedbackItemStats,
+    ComplianceEvidenceFeedbackMaterialStats,
+    ComplianceEvidenceFeedbackReportRead,
+    ComplianceEvidenceEvaluationSampleRead,
+    ComplianceEvidenceRetrievalEvaluationRead,
     ComplianceEvidenceUnbindRequest,
     ComplianceEvidenceWaiveRequest,
     ComplianceItemsBulkAssignRequest,
@@ -110,6 +119,7 @@ from app.schemas.project import (
     SectionUpdateRequest,
     SimilarCandidateApplyRequest,
     SimilarCandidateRead,
+    TenderFormatDocxExportRequest,
     TextDiffSegment,
 )
 from app.schemas.document import DocumentChunkRead
@@ -130,6 +140,8 @@ from app.services.context_pack import (
 )
 from app.services.compliance_generation import execute_compliance_matrix_generation_task
 from app.services.document_utils import TENDER_DOCUMENT_FILE_MAX_BYTES, readable_file_size
+from app.services.tender_outline import derive_project_directory
+from app.services.tender_format_export import TenderFormatExportError, export_tender_format_docx
 from app.services.evidence_policy import (
     enterprise_evidence_not_required as policy_enterprise_evidence_not_required,
 )
@@ -141,6 +153,7 @@ from app.services.export_excel import execute_compliance_matrix_excel_export_tas
 from app.services.file_acquisition import FileAcquisitionError
 from app.services.material_identity import enterprise_material_identity_key, material_snapshot_identity_key
 from app.services.material_retrieval import search_material_hits
+from app.services.material_safety import material_search_result_from_hit
 from app.parsers.pdf import PdfTextEmptyError
 from app.services.project_import import (
     ImportDraft,
@@ -366,23 +379,7 @@ def enterprise_material_search_result_from_hit(
     *,
     allowed_data_levels: set[str],
 ) -> EnterpriseMaterialSearchResult:
-    return EnterpriseMaterialSearchResult(
-        **EnterpriseMaterialRead.model_validate(hit.material).model_dump(),
-        snippet=hit.snippet,
-        confidence_score=hit.confidence_score,
-        base_score=hit.base_score,
-        rerank_score=hit.rerank_score,
-        rerank_provider=hit.rerank_provider,
-        rerank_model=hit.rerank_model,
-        rerank_used=hit.rerank_used,
-        rerank_fallback_used=hit.rerank_fallback_used,
-        rerank_error=hit.rerank_error,
-        chunk_id=hit.chunk.id if hit.chunk else None,
-        data_level_allowed=hit.material.data_level in allowed_data_levels,
-        recommend_reason=hit.recommend_reason,
-        matched_terms=hit.matched_terms or [],
-        material_status_hint=hit.material_status_hint,
-    )
+    return material_search_result_from_hit(hit, allowed_data_levels=allowed_data_levels)
 
 
 def dedupe_evidence_bindings(
@@ -2786,6 +2783,62 @@ def preview_business_draft_context_pack(
 
 
 @router.get(
+    "/{project_id}/sections/{section_id}/business-draft/directory/derive",
+    response_model=BusinessDraftDirectoryDeriveRead,
+)
+def derive_business_draft_directory(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    profile_id: str | None = None,
+) -> BusinessDraftDirectoryDeriveRead:
+    """从招标文件正文推导建议目录（采购方式驱动），供前端 seed 目录编辑器后人工确认。"""
+    get_section_or_404(db, ctx, project_id, section_id)
+    result = derive_project_directory(
+        db,
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        profile_id=profile_id,
+    )
+    return BusinessDraftDirectoryDeriveRead.model_validate(result)
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/business-draft/format-docx/export",
+    response_model=ExportFileRead,
+)
+def export_tender_format_docx_file(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: TenderFormatDocxExportRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> ExportFileRead:
+    """导出招标文件格式装配 docx。
+
+    review 模式包含合规自检清单；submission 模式清除内部审阅状态，用于正式稿检查。
+    """
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        export_file = export_tender_format_docx(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=ctx.user_id,
+            profile_id=payload.profile_id,
+            export_mode=payload.export_mode,
+        )
+    except TenderFormatExportError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    db.commit()
+    db.refresh(export_file)
+    return export_file_read(export_file)
+
+
+@router.get(
     "/{project_id}/sections/{section_id}/business-draft/context-pack",
     response_model=list[BusinessDraftContextPackRead],
 )
@@ -4442,6 +4495,67 @@ def recommend_compliance_evidence_candidates(
     return results
 
 
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/{item_id}/evidence-candidates/{material_id}/reject",
+    response_model=ComplianceEvidenceCandidateRejectRead,
+)
+def reject_compliance_evidence_candidate(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    item_id: uuid.UUID,
+    material_id: uuid.UUID,
+    payload: ComplianceEvidenceCandidateRejectRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> ComplianceEvidenceCandidateRejectRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
+    material = db.scalar(
+        select(EnterpriseMaterial).where(
+            EnterpriseMaterial.tenant_id == ctx.tenant_id,
+            EnterpriseMaterial.id == material_id,
+        )
+    )
+    if material is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Material not found")
+
+    reason = payload.reason.strip()
+    audit_log = AuditLog(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        actor_user_id=ctx.user_id,
+        actor_type="user",
+        action="matrix.evidence_candidate_rejected",
+        object_type="enterprise_material",
+        object_id=material.id,
+        before_json=None,
+        after_json={
+            "project": {"id": str(project.id), "name": project.name},
+            "section": {"id": str(section.id), "name": section.name},
+            "item": compliance_item_snapshot(item),
+            "material": enterprise_material_snapshot(material),
+            "candidate_query": compliance_item_candidate_query(item, project, section),
+            "feedback_type": "rejected",
+        },
+        reason=reason,
+        severity="info",
+    )
+    db.add(audit_log)
+    db.commit()
+    db.refresh(audit_log)
+    return ComplianceEvidenceCandidateRejectRead(
+        audit_log_id=audit_log.id,
+        project_id=project_id,
+        section_id=section_id,
+        compliance_item_id=item.id,
+        enterprise_material_id=material.id,
+        reason=reason,
+        created_at=audit_log.created_at,
+    )
+
+
 @router.get(
     "/{project_id}/sections/{section_id}/compliance-items/{item_id}/evidence-bindings",
     response_model=list[ComplianceEvidenceBindingRead],
@@ -4551,6 +4665,11 @@ def bind_compliance_evidence(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Conflict or expired material cannot be bound as evidence",
+        )
+    if material.data_level in {"restricted", "confidential"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Restricted or confidential material cannot be bound as response evidence",
         )
 
     active_bindings = list(
@@ -4824,6 +4943,491 @@ def bulk_confirm_compliance_items(
     )
     db.commit()
     return [compliance_item_read_from_item(db, item) for item in items]
+
+
+EVIDENCE_FEEDBACK_ACTIONS = (
+    "matrix.evidence_bound",
+    "matrix.evidence_candidate_rejected",
+    "matrix.evidence_unbound",
+    "matrix.evidence_not_required",
+)
+
+
+def feedback_uuid(value: object) -> uuid.UUID | None:
+    if isinstance(value, uuid.UUID):
+        return value
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def feedback_json_object(payload: dict[str, Any] | None, key: str) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def feedback_timestamp(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/evidence-feedback-report",
+    response_model=ComplianceEvidenceFeedbackReportRead,
+)
+def get_evidence_feedback_report(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> ComplianceEvidenceFeedbackReportRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    logs = list(
+        db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.tenant_id == ctx.tenant_id,
+                AuditLog.project_id == project_id,
+                AuditLog.section_id == section_id,
+                AuditLog.action.in_(EVIDENCE_FEEDBACK_ACTIONS),
+            )
+            .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+        ).all()
+    )
+
+    action_counts = {action: 0 for action in EVIDENCE_FEEDBACK_ACTIONS}
+    action_latest_at: dict[str, datetime] = {}
+    item_stats: dict[str, dict[str, Any]] = {}
+    material_stats: dict[str, dict[str, Any]] = {}
+    last_unbound_by_item: dict[str, bool] = {}
+    replacement_count = 0
+
+    def item_stat_for(item_id: uuid.UUID) -> dict[str, Any]:
+        key = str(item_id)
+        if key not in item_stats:
+            item_stats[key] = {
+                "compliance_item_id": item_id,
+                "requirement_text": None,
+                "bound_count": 0,
+                "rejected_count": 0,
+                "unbound_count": 0,
+                "not_required_count": 0,
+                "replacement_count": 0,
+                "latest_reason": None,
+                "latest_action": None,
+                "latest_at": None,
+            }
+        return item_stats[key]
+
+    def material_stat_for(material_id: uuid.UUID) -> dict[str, Any]:
+        key = str(material_id)
+        if key not in material_stats:
+            material_stats[key] = {
+                "enterprise_material_id": material_id,
+                "material_name": None,
+                "material_type": None,
+                "bound_count": 0,
+                "rejected_count": 0,
+                "unbound_count": 0,
+                "latest_reason": None,
+                "latest_action": None,
+                "latest_at": None,
+            }
+        return material_stats[key]
+
+    for log in logs:
+        action_counts[log.action] = action_counts.get(log.action, 0) + 1
+        action_latest_at[log.action] = log.created_at
+        after_json = log.after_json if isinstance(log.after_json, dict) else {}
+        before_json = log.before_json if isinstance(log.before_json, dict) else {}
+        item_snapshot = feedback_json_object(after_json, "item")
+        binding_snapshot = feedback_json_object(after_json, "binding")
+        if not binding_snapshot and "compliance_item_id" in before_json:
+            binding_snapshot = before_json
+        material_snapshot = feedback_json_object(after_json, "material")
+        if not material_snapshot and binding_snapshot:
+            material_snapshot = binding_snapshot
+
+        item_id = (
+            feedback_uuid(item_snapshot.get("id"))
+            or feedback_uuid(binding_snapshot.get("compliance_item_id"))
+            or (log.object_id if log.action == "matrix.evidence_not_required" else None)
+        )
+        if item_id is not None:
+            stat = item_stat_for(item_id)
+            if item_snapshot.get("requirement_text"):
+                stat["requirement_text"] = str(item_snapshot["requirement_text"])
+            if log.action == "matrix.evidence_bound":
+                stat["bound_count"] += 1
+                if last_unbound_by_item.get(str(item_id)):
+                    stat["replacement_count"] += 1
+                    replacement_count += 1
+                    last_unbound_by_item[str(item_id)] = False
+            elif log.action == "matrix.evidence_candidate_rejected":
+                stat["rejected_count"] += 1
+            elif log.action == "matrix.evidence_unbound":
+                stat["unbound_count"] += 1
+                last_unbound_by_item[str(item_id)] = True
+            elif log.action == "matrix.evidence_not_required":
+                stat["not_required_count"] += 1
+            if stat["latest_at"] is None or log.created_at >= stat["latest_at"]:
+                stat["latest_reason"] = log.reason
+                stat["latest_action"] = log.action
+                stat["latest_at"] = log.created_at
+
+        material_id = feedback_uuid(
+            material_snapshot.get("enterprise_material_id") or material_snapshot.get("id")
+        )
+        if material_id is not None:
+            stat = material_stat_for(material_id)
+            if material_snapshot.get("name"):
+                stat["material_name"] = str(material_snapshot["name"])
+            elif material_snapshot.get("material_name"):
+                stat["material_name"] = str(material_snapshot["material_name"])
+            if material_snapshot.get("material_type"):
+                stat["material_type"] = str(material_snapshot["material_type"])
+            if log.action == "matrix.evidence_bound":
+                stat["bound_count"] += 1
+            elif log.action == "matrix.evidence_candidate_rejected":
+                stat["rejected_count"] += 1
+            elif log.action == "matrix.evidence_unbound":
+                stat["unbound_count"] += 1
+            if stat["latest_at"] is None or log.created_at >= stat["latest_at"]:
+                stat["latest_reason"] = log.reason
+                stat["latest_action"] = log.action
+                stat["latest_at"] = log.created_at
+
+    missing_item_ids = [
+        stat["compliance_item_id"]
+        for stat in item_stats.values()
+        if stat["requirement_text"] is None
+    ]
+    if missing_item_ids:
+        for item in db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == ctx.tenant_id,
+                ComplianceItem.project_id == project_id,
+                ComplianceItem.section_id == section_id,
+                ComplianceItem.id.in_(missing_item_ids),
+            )
+        ).all():
+            item_stats[str(item.id)]["requirement_text"] = item.requirement_text
+
+    bound_count = action_counts["matrix.evidence_bound"]
+    rejected_count = action_counts["matrix.evidence_candidate_rejected"]
+    acceptance_denominator = bound_count + rejected_count
+    acceptance_rate = (
+        round(bound_count / acceptance_denominator, 4) if acceptance_denominator else None
+    )
+
+    materials_with_feedback = sorted(
+        material_stats.values(),
+        key=lambda stat: (
+            stat["bound_count"] + stat["rejected_count"] + stat["unbound_count"],
+            feedback_timestamp(stat["latest_at"]),
+        ),
+        reverse=True,
+    )
+    top_rejected_materials = sorted(
+        [stat for stat in material_stats.values() if stat["rejected_count"] > 0],
+        key=lambda stat: (stat["rejected_count"], feedback_timestamp(stat["latest_at"])),
+        reverse=True,
+    )[:10]
+    items_with_feedback = sorted(
+        item_stats.values(),
+        key=lambda stat: (
+            stat["bound_count"]
+            + stat["rejected_count"]
+            + stat["unbound_count"]
+            + stat["not_required_count"],
+            feedback_timestamp(stat["latest_at"]),
+        ),
+        reverse=True,
+    )
+
+    return ComplianceEvidenceFeedbackReportRead(
+        project_id=project_id,
+        section_id=section_id,
+        total_feedback_count=len(logs),
+        bound_count=bound_count,
+        rejected_count=rejected_count,
+        unbound_count=action_counts["matrix.evidence_unbound"],
+        not_required_count=action_counts["matrix.evidence_not_required"],
+        replacement_count=replacement_count,
+        binding_acceptance_rate=acceptance_rate,
+        actions=[
+            ComplianceEvidenceFeedbackActionStats(
+                action=action,
+                count=action_counts[action],
+                latest_at=action_latest_at.get(action),
+            )
+            for action in EVIDENCE_FEEDBACK_ACTIONS
+        ],
+        materials_with_feedback=[
+            ComplianceEvidenceFeedbackMaterialStats(**stat) for stat in materials_with_feedback
+        ],
+        top_rejected_materials=[
+            ComplianceEvidenceFeedbackMaterialStats(**stat) for stat in top_rejected_materials
+        ],
+        items_with_feedback=[
+            ComplianceEvidenceFeedbackItemStats(**stat) for stat in items_with_feedback
+        ],
+        generated_at=datetime.now(UTC),
+    )
+
+
+def evidence_evaluation_reason_types(reason: str | None) -> set[str]:
+    text = (reason or "").strip()
+    reason_types: set[str] = set()
+    if any(signal in text for signal in ("无关", "不匹配", "未覆盖", "不覆盖", "口径")):
+        reason_types.add("requirement_mismatch")
+    if any(signal in text for signal in ("过期", "失效", "旧版", "超期")):
+        reason_types.add("expired_or_stale")
+    if any(signal in text for signal in ("敏感", "脱敏", "授权", "保密", "机密", "受限")):
+        reason_types.add("permission_or_sensitivity")
+    if any(signal in text for signal in ("低置信", "不清晰", "不完整", "缺少", "不足")):
+        reason_types.add("low_confidence_or_incomplete")
+    return reason_types or {"manual_rejected"}
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/evidence-retrieval-evaluation",
+    response_model=ComplianceEvidenceRetrievalEvaluationRead,
+)
+def get_evidence_retrieval_evaluation(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    top_k: Annotated[int, Query(ge=1, le=20)] = 5,
+) -> ComplianceEvidenceRetrievalEvaluationRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    logs = list(
+        db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.tenant_id == ctx.tenant_id,
+                AuditLog.project_id == project_id,
+                AuditLog.section_id == section_id,
+                AuditLog.action.in_(
+                    ("matrix.evidence_bound", "matrix.evidence_candidate_rejected")
+                ),
+            )
+            .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+        ).all()
+    )
+
+    labels_by_item: dict[str, dict[str, Any]] = {}
+
+    def label_for(item_id: uuid.UUID) -> dict[str, Any]:
+        key = str(item_id)
+        if key not in labels_by_item:
+            labels_by_item[key] = {
+                "expected_ids": set(),
+                "expected_keys": set(),
+                "rejected_ids": set(),
+                "rejected_keys": set(),
+                "rejection_types_by_id": {},
+                "rejection_types_by_key": {},
+            }
+        return labels_by_item[key]
+
+    for log in logs:
+        after_json = log.after_json if isinstance(log.after_json, dict) else {}
+        item_snapshot = feedback_json_object(after_json, "item")
+        binding_snapshot = feedback_json_object(after_json, "binding")
+        material_snapshot = feedback_json_object(after_json, "material")
+        if not material_snapshot and binding_snapshot:
+            material_snapshot = binding_snapshot
+        item_id = (
+            feedback_uuid(item_snapshot.get("id"))
+            or feedback_uuid(binding_snapshot.get("compliance_item_id"))
+        )
+        material_id = feedback_uuid(
+            material_snapshot.get("enterprise_material_id") or material_snapshot.get("id")
+        )
+        if material_id is None and log.action == "matrix.evidence_candidate_rejected":
+            material_id = log.object_id
+        if item_id is None or material_id is None:
+            continue
+
+        label = label_for(item_id)
+        material_key = material_snapshot_identity_key(material_snapshot) if material_snapshot else None
+        if log.action == "matrix.evidence_bound":
+            label["expected_ids"].add(material_id)
+            if material_key:
+                label["expected_keys"].add(material_key)
+        elif log.action == "matrix.evidence_candidate_rejected":
+            reason_types = evidence_evaluation_reason_types(log.reason)
+            label["rejected_ids"].add(material_id)
+            label["rejection_types_by_id"].setdefault(str(material_id), set()).update(reason_types)
+            if material_key:
+                label["rejected_keys"].add(material_key)
+                label["rejection_types_by_key"].setdefault(material_key, set()).update(reason_types)
+
+    all_material_ids = {
+        material_id
+        for label in labels_by_item.values()
+        for material_id in label["expected_ids"] | label["rejected_ids"]
+    }
+    materials_by_id = {
+        material.id: material
+        for material in db.scalars(
+            select(EnterpriseMaterial).where(
+                EnterpriseMaterial.tenant_id == ctx.tenant_id,
+                EnterpriseMaterial.id.in_(all_material_ids),
+            )
+        ).all()
+    } if all_material_ids else {}
+    for label in labels_by_item.values():
+        for material_id in list(label["expected_ids"]):
+            material = materials_by_id.get(material_id)
+            if material is not None:
+                label["expected_keys"].add(enterprise_material_identity_key(material))
+        for material_id in list(label["rejected_ids"]):
+            material = materials_by_id.get(material_id)
+            if material is not None:
+                material_key = enterprise_material_identity_key(material)
+                label["rejected_keys"].add(material_key)
+                reason_types = label["rejection_types_by_id"].get(str(material_id), set())
+                label["rejection_types_by_key"].setdefault(material_key, set()).update(reason_types)
+        label["rejected_ids"] -= label["expected_ids"]
+        label["rejected_keys"] -= label["expected_keys"]
+
+    item_ids = [uuid.UUID(item_id) for item_id in labels_by_item]
+    items = list(
+        db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == ctx.tenant_id,
+                ComplianceItem.project_id == project_id,
+                ComplianceItem.section_id == section_id,
+                ComplianceItem.id.in_(item_ids),
+                ComplianceItem.deleted_at.is_(None),
+            )
+        ).all()
+    ) if item_ids else []
+
+    samples: list[ComplianceEvidenceEvaluationSampleRead] = []
+    recall_values: list[float] = []
+    precision_values: list[float] = []
+    hit_sample_count = 0
+    false_positive_count = 0
+    missed_positive_count = 0
+    misrecommendation_counts: dict[str, int] = {}
+
+    for item in items:
+        label = labels_by_item[str(item.id)]
+        expected_ids: set[uuid.UUID] = label["expected_ids"]
+        expected_keys: set[str] = label["expected_keys"]
+        rejected_ids: set[uuid.UUID] = label["rejected_ids"]
+        rejected_keys: set[str] = label["rejected_keys"]
+        hits = search_material_hits(
+            db,
+            tenant_id=ctx.tenant_id,
+            query=compliance_item_candidate_query(item, project, section),
+            verification_statuses={"confirmed"},
+            allowed_data_levels={"public", "internal"},
+            limit=max(top_k * 4, top_k),
+        )
+        candidates = []
+        seen_keys: set[str] = set()
+        for hit in hits:
+            material_key = enterprise_material_identity_key(hit.material)
+            if material_key in seen_keys:
+                continue
+            seen_keys.add(material_key)
+            candidates.append(hit.material)
+            if len(candidates) >= top_k:
+                break
+        candidate_ids = {material.id for material in candidates}
+        candidate_keys = {enterprise_material_identity_key(material) for material in candidates}
+        expected_hit_ids = {
+            material_id
+            for material_id in expected_ids
+            if material_id in candidate_ids
+            or (
+                material_id in materials_by_id
+                and enterprise_material_identity_key(materials_by_id[material_id]) in candidate_keys
+            )
+        }
+        false_positive_ids = {
+            material_id
+            for material_id in rejected_ids
+            if material_id in candidate_ids
+            or (
+                material_id in materials_by_id
+                and enterprise_material_identity_key(materials_by_id[material_id]) in candidate_keys
+            )
+        }
+        false_positive_ids -= expected_hit_ids
+        missed_material_ids = expected_ids - expected_hit_ids
+        sample_recall = round(len(expected_hit_ids) / len(expected_ids), 4) if expected_ids else 0.0
+        sample_precision = round(len(expected_hit_ids) / len(candidates), 4) if candidates else 0.0
+        misrecommendation_types: set[str] = set()
+        if missed_material_ids:
+            misrecommendation_types.add("missed_positive")
+        for material_id in false_positive_ids:
+            misrecommendation_types.update(
+                label["rejection_types_by_id"].get(str(material_id), {"manual_rejected"})
+            )
+        for material_key in candidate_keys & rejected_keys:
+            if material_key not in expected_keys:
+                misrecommendation_types.update(
+                    label["rejection_types_by_key"].get(material_key, {"manual_rejected"})
+                )
+        for reason_type in misrecommendation_types:
+            misrecommendation_counts[reason_type] = misrecommendation_counts.get(reason_type, 0) + 1
+
+        if expected_ids:
+            recall_values.append(sample_recall)
+            precision_values.append(sample_precision)
+            if expected_hit_ids:
+                hit_sample_count += 1
+        false_positive_count += len(false_positive_ids)
+        missed_positive_count += len(missed_material_ids)
+        samples.append(
+            ComplianceEvidenceEvaluationSampleRead(
+                compliance_item_id=item.id,
+                requirement_text=item.requirement_text,
+                expected_material_ids=sorted(expected_ids, key=str),
+                rejected_material_ids=sorted(rejected_ids, key=str),
+                candidate_material_ids=sorted(candidate_ids, key=str),
+                hit_at_k=bool(expected_hit_ids),
+                recall_at_k=sample_recall,
+                precision_at_k=sample_precision,
+                false_positive_material_ids=sorted(false_positive_ids, key=str),
+                missed_material_ids=sorted(missed_material_ids, key=str),
+                misrecommendation_types=sorted(misrecommendation_types),
+            )
+        )
+
+    labeled_positive_count = sum(len(label["expected_ids"]) for label in labels_by_item.values())
+    rejected_label_count = sum(len(label["rejected_ids"]) for label in labels_by_item.values())
+    label_total = labeled_positive_count + rejected_label_count
+    return ComplianceEvidenceRetrievalEvaluationRead(
+        project_id=project_id,
+        section_id=section_id,
+        top_k=top_k,
+        sample_count=len(samples),
+        labeled_positive_count=labeled_positive_count,
+        rejected_label_count=rejected_label_count,
+        recall_at_k=round(sum(recall_values) / len(recall_values), 4) if recall_values else None,
+        precision_at_k=round(sum(precision_values) / len(precision_values), 4)
+        if precision_values
+        else None,
+        topk_hit_rate=round(hit_sample_count / len(recall_values), 4) if recall_values else None,
+        binding_acceptance_rate=round(labeled_positive_count / label_total, 4) if label_total else None,
+        false_positive_count=false_positive_count,
+        missed_positive_count=missed_positive_count,
+        misrecommendation_counts=dict(sorted(misrecommendation_counts.items())),
+        samples=sorted(samples, key=lambda sample: sample.requirement_text),
+        generated_at=datetime.now(UTC),
+    )
 
 
 @router.get("/{project_id}/audit-logs", response_model=list[AuditLogRead])

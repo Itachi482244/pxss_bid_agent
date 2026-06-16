@@ -42,6 +42,7 @@ from app.services.material_retrieval import (
     rebuild_tenant_material_index,
     search_material_hits,
 )
+from app.services.material_safety import material_search_result_from_hit
 from app.services.storage import put_object_bytes
 from app.services.task_dispatch import TaskDispatchError, enqueue_celery_task
 
@@ -332,23 +333,7 @@ def search_enterprise_materials(
         if len(deduped_hits) >= limit:
             break
     return [
-        EnterpriseMaterialSearchResult(
-            **EnterpriseMaterialRead.model_validate(hit.material).model_dump(),
-            snippet=hit.snippet,
-            confidence_score=hit.confidence_score,
-            base_score=hit.base_score,
-            rerank_score=hit.rerank_score,
-            rerank_provider=hit.rerank_provider,
-            rerank_model=hit.rerank_model,
-            rerank_used=hit.rerank_used,
-            rerank_fallback_used=hit.rerank_fallback_used,
-            rerank_error=hit.rerank_error,
-            chunk_id=hit.chunk.id if hit.chunk else None,
-            data_level_allowed=hit.material.data_level in allowed_data_levels,
-            recommend_reason=hit.recommend_reason,
-            matched_terms=hit.matched_terms or [],
-            material_status_hint=hit.material_status_hint,
-        )
+        material_search_result_from_hit(hit, allowed_data_levels=allowed_data_levels)
         for hit in deduped_hits
     ]
 

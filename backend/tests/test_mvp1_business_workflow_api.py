@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from docx import Document as WordDocument
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
 from app.main import app
+from app.services.rerank_gateway import RerankScore
 from scripts.seed_dev_data import seed
 
 
@@ -29,10 +32,25 @@ def get_seed_project_and_section(client: TestClient) -> tuple[str, str]:
     return project["id"], sections[0]["id"]
 
 
-def test_material_chunks_search_and_data_level_filter() -> None:
+def test_material_chunks_search_and_data_level_filter(monkeypatch: pytest.MonkeyPatch) -> None:
     client = TestClient(app)
     unique_query = f"MVP1CONFIDENTIAL{uuid4().hex[:8].upper()}"
     public_query = f"MVP1PUBLIC{uuid4().hex[:8].upper()}"
+    captured_rerank_documents: list[str] = []
+
+    def fake_rerank_texts(query: str, documents: list[str], *, base_scores: list[float] | None = None):
+        captured_rerank_documents.extend(documents)
+        return [
+            RerankScore(
+                index=index,
+                score=0.8 - index * 0.01,
+                provider="fake",
+                runtime_provider="fake",
+                model_name="fake-rerank",
+                duration_ms=1,
+            )
+            for index, _ in enumerate(documents)
+        ]
 
     public_response = client.post(
         "/api/v1/enterprise/materials",
@@ -41,7 +59,7 @@ def test_material_chunks_search_and_data_level_filter() -> None:
             "name": f"公开商务响应模板 {public_query}",
             "data_level": "internal",
             "verification_status": "confirmed",
-            "evidence_text": f"{public_query} 可用于商务标承诺响应和保修条款响应。",
+            "evidence_text": f"{public_query} {unique_query} 可用于商务标承诺响应和保修条款响应。",
         },
     )
     assert public_response.status_code == 201
@@ -74,6 +92,7 @@ def test_material_chunks_search_and_data_level_filter() -> None:
     assert default_search.status_code == 200
     assert all(item["id"] != restricted_material["id"] for item in default_search.json())
 
+    monkeypatch.setattr("app.services.material_retrieval.rerank_texts", fake_rerank_texts)
     restricted_search = client.get(
         "/api/v1/enterprise/materials/search",
         params={"query": unique_query, "include_restricted": True, "limit": 10},
@@ -82,7 +101,16 @@ def test_material_chunks_search_and_data_level_filter() -> None:
     restricted_results = restricted_search.json()
     hit = next(item for item in restricted_results if item["id"] == restricted_material["id"])
     assert hit["chunk_id"]
-    assert hit["data_level_allowed"] is True
+    assert hit["data_level_allowed"] is False
+    assert hit["name"] == "机密资料（需授权查看）"
+    assert hit["evidence_text"] is None
+    assert unique_query not in (hit["snippet"] or "")
+    assert unique_query not in (hit["recommend_reason"] or "")
+    assert hit["matched_terms"] == []
+    assert hit["structured_fields"]["redacted"] is True
+    assert captured_rerank_documents
+    assert all("仅允许授权上下文召回" not in document for document in captured_rerank_documents)
+    assert any("资料内容受限，不能进入模型重排上下文" in document for document in captured_rerank_documents)
 
     rebuild_response = client.post(f"/api/v1/enterprise/materials/{public_material['id']}/chunks/rebuild")
     assert rebuild_response.status_code == 200
@@ -174,7 +202,8 @@ def test_business_draft_decision_fact_check_export_and_approval(
     qualification_chapter = next(item for item in chapters if item["chapter_type"] == "qualification_response")
     assert qualification_chapter["evidence_refs"]
     assert qualification_chapter["fact_checks"]
-    assert material["name"] in qualification_chapter["content_text"]
+    assert "证明材料" in qualification_chapter["content_text"]
+    assert material["name"] not in qualification_chapter["content_text"]
 
     unknown_fact = "FAKECERT9999"
     update_response = client.patch(
@@ -225,6 +254,13 @@ def test_business_draft_decision_fact_check_export_and_approval(
         == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
     assert download_response.content.startswith(b"PK")
+    document = WordDocument(BytesIO(download_response.content))
+    document_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    assert "投 标 文 件" in document_text
+    assert "事实性校验" not in document_text
+    assert "响应草稿" not in document_text
+    assert "招标要求：" not in document_text
+    assert "投标响应：" not in document_text
 
     approval_response = client.get(
         f"/api/v1/projects/{project_id}/sections/{section_id}/approval-tasks",
