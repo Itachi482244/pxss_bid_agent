@@ -1827,6 +1827,29 @@
   overflow-x: auto;
 }
 
+.candidate-explanation-list {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.candidate-explanation-list > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.candidate-explanation-list span:not(.ant-tag):not(.ant-typography) {
+  color: #303849;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.candidate-explanation-list .ant-typography-secondary {
+  color: #6b7280;
+  font-size: 12px;
+}
+
 .ant-drawer-content-wrapper {
   max-width: 100vw;
 }
@@ -2332,12 +2355,20 @@
   border-radius: 8px;
   cursor: pointer;
   display: grid;
-  grid-template-columns: minmax(84px, auto) 42px minmax(0, 1fr);
+  grid-template-columns: minmax(120px, auto) minmax(48px, max-content) minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   min-height: 50px;
   padding: 7px 9px;
   text-align: left;
+}
+
+.project-todo-labels {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
 }
 
 .preflight-check .ant-tag {
@@ -2368,9 +2399,10 @@
 }
 
 .preflight-check strong {
-  font-size: 18px;
+  font-size: 16px;
   line-height: 1.1;
   text-align: right;
+  white-space: nowrap;
 }
 
 .preflight-check span {
@@ -2976,7 +3008,7 @@
   }
 
   .preflight-check {
-    grid-template-columns: auto 30px minmax(0, 1fr);
+    grid-template-columns: minmax(108px, auto) minmax(48px, max-content) minmax(0, 1fr);
   }
 
   .preflight-action-text {

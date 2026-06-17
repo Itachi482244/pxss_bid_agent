@@ -1,8 +1,16 @@
 import dayjs from "dayjs";
 import { describe, expect, it } from "vitest";
 
-import type { DraftBlock, EnterpriseMaterial, ProjectSummary } from "../api/bid";
+import type {
+  DraftBlock,
+  EnterpriseMaterial,
+  PreflightCheckItem,
+  ProjectSummary,
+  SectionQualityCheck,
+  SectionQualitySummary
+} from "../api/bid";
 import {
+  buildProjectTodoActions,
   classifyProjectGroup,
   computeDashboardStats,
   computeDraftBlockFilterCounts,
@@ -60,6 +68,66 @@ function makeMaterial(partial: Partial<EnterpriseMaterial>): EnterpriseMaterial 
   };
 }
 
+function makeQualityCheck(partial: Partial<SectionQualityCheck>): SectionQualityCheck {
+  return {
+    code: "coverage.gaps",
+    title: "覆盖缺口",
+    status: "warn",
+    message: "仍有覆盖缺口",
+    category: "coverage",
+    count: 1,
+    action_label: "查看缺口",
+    target: "chapter",
+    details: [],
+    ...partial
+  };
+}
+
+function makeQualitySummary(checks: SectionQualityCheck[]): SectionQualitySummary {
+  return {
+    project_id: "p1",
+    section_id: "s1",
+    status: checks.some((check) => check.status === "block")
+      ? "block"
+      : checks.some((check) => check.status === "warn")
+        ? "warn"
+        : "pass",
+    status_label: "需处理",
+    summary: "质量体检摘要",
+    generated_at: "2026-06-16T00:00:00Z",
+    checks,
+    suggested_actions: [],
+    coverage_summary: {},
+    pricing_summary: {},
+    material_summary: {},
+    export_preview: {
+      review_allowed: true,
+      submission_allowed: false,
+      export_modes: ["review", "submission"],
+      chapter_count: 0,
+      scoring_index_count: 0,
+      technical_response_count: 0,
+      placeholder_count: 0
+    },
+    context_pack_status: null,
+    draft_summary: {},
+    source: {}
+  };
+}
+
+function makePreflightCheckItem(partial: Partial<PreflightCheckItem>): PreflightCheckItem {
+  return {
+    code: "high_risk",
+    title: "高风险",
+    status: "block",
+    count: 1,
+    message: "还有高风险项未确认",
+    action_label: "打开审阅台",
+    target: "review",
+    ...partial
+  };
+}
+
 describe("classifyProjectGroup", () => {
   it("归类终态为 done", () => {
     expect(classifyProjectGroup(makeProject({ status: "exported" }))).toBe("done");
@@ -110,6 +178,143 @@ describe("sectionQualityStatusLabel", () => {
     expect(sectionQualityStatusColor("pass")).toBe("green");
     expect(sectionQualityStatusColor("warn")).toBe("gold");
     expect(sectionQualityStatusColor("block")).toBe("red");
+  });
+});
+
+describe("buildProjectTodoActions", () => {
+  it("合并质量体检和提交前核验，并排除已通过项", () => {
+    const actions = buildProjectTodoActions(
+      makeQualitySummary([
+        makeQualityCheck({
+          code: "coverage.disqualifying_gaps",
+          title: "L1 合规格式",
+          status: "block",
+          count: 2,
+          message: "2 项核心资格/废标项尚未满足",
+          action_label: "补齐资格材料",
+          target: "evidence"
+        }),
+        makeQualityCheck({ code: "pricing.ready", title: "报价校验", status: "pass" })
+      ]),
+      [
+        makePreflightCheckItem({ code: "mandatory_evidence", title: "强制证据", status: "warn", count: 3 }),
+        makePreflightCheckItem({ code: "draft_exists", title: "商务草稿", status: "pass" })
+      ]
+    );
+
+    expect(actions.map((item) => item.key)).toEqual([
+      "quality:coverage.disqualifying_gaps",
+      "preflight:mandatory_evidence"
+    ]);
+    expect(actions[0]).toMatchObject({
+      source: "quality",
+      sourceLabel: "质量体检",
+      actionLabel: "补齐资格材料",
+      target: "evidence"
+    });
+  });
+
+  it("阻断项优先于复核项，废标/高风险优先于报价和导出问题", () => {
+    const actions = buildProjectTodoActions(
+      makeQualitySummary([
+        makeQualityCheck({
+          code: "pricing.blocking_issues",
+          title: "L3 报价校验",
+          status: "block",
+          count: 5,
+          message: "报价存在正式稿阻断问题",
+          target: "chapter"
+        }),
+        makeQualityCheck({
+          code: "coverage.disqualifying_gaps",
+          title: "废标风险缺口",
+          status: "block",
+          count: 1,
+          message: "核心资格尚未满足",
+          target: "evidence"
+        }),
+        makeQualityCheck({
+          code: "export_materials.not_embeddable",
+          title: "导出材料嵌入",
+          status: "warn",
+          count: 8,
+          message: "材料暂无可嵌入图片/PDF",
+          target: "evidence"
+        })
+      ]),
+      [makePreflightCheckItem({ code: "high_risk", title: "高风险", status: "block", count: 2 })]
+    );
+
+    expect(actions.slice(0, 2).map((item) => item.key)).toEqual([
+      "preflight:high_risk",
+      "quality:coverage.disqualifying_gaps"
+    ]);
+    expect(actions.slice(2).map((item) => item.key)).toEqual([
+      "quality:pricing.blocking_issues",
+      "quality:export_materials.not_embeddable"
+    ]);
+  });
+
+  it("同状态同业务优先级时按数量降序，再按 key 稳定排序", () => {
+    const actions = buildProjectTodoActions(
+      makeQualitySummary([
+        makeQualityCheck({
+          code: "draft_blocks.pending",
+          title: "草稿审阅",
+          status: "warn",
+          count: 2,
+          message: "草稿块待处理"
+        }),
+        makeQualityCheck({
+          code: "draft_facts.pending",
+          title: "草稿事实校验",
+          status: "warn",
+          count: 4,
+          message: "事实待核验"
+        })
+      ]),
+      []
+    );
+
+    expect(actions.map((item) => item.key)).toEqual(["quality:draft_facts.pending", "quality:draft_blocks.pending"]);
+  });
+
+  it("优先使用结构化 category/code 排序，标题关键词只作未知项兜底", () => {
+    const actions = buildProjectTodoActions(
+      makeQualitySummary([
+        makeQualityCheck({
+          code: "custom.general_notice",
+          title: "附件标题提到废标/报价/导出但只是普通提醒",
+          category: "draft",
+          status: "warn",
+          count: 1,
+          message: "标题关键词不应把 draft 类待办提到最高优先级"
+        }),
+        makeQualityCheck({
+          code: "pricing.pending",
+          title: "L3 报价校验",
+          category: "pricing",
+          status: "warn",
+          count: 1,
+          message: "报价待补字段"
+        })
+      ]),
+      [
+        makePreflightCheckItem({
+          code: "unknown_followup",
+          title: "标题提到废标但 preflight code 未登记",
+          status: "warn",
+          count: 1,
+          message: "未知 code 仍允许用标题兜底"
+        })
+      ]
+    );
+
+    expect(actions.map((item) => item.key)).toEqual([
+      "preflight:unknown_followup",
+      "quality:pricing.pending",
+      "quality:custom.general_notice"
+    ]);
   });
 });
 

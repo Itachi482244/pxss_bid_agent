@@ -256,7 +256,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     handleImportDraftUrl,
     handleOpenOutlineEditor,
     handleOpenRevisionDrawer,
-    handlePreflightCheckAction,
+    handleProjectTodoAction,
     handlePreviewContextPack,
     handlePublicUrlAcquisition,
     handlePublishManualRevision,
@@ -286,7 +286,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     handleUploadDocument,
     handleWaiveEvidenceRequirement,
     Header,
-    hiddenPreflightCheckCount,
+    hiddenProjectTodoActionCount,
     highlightedRowKey,
     HighlightOutlined,
     historyExtractActive,
@@ -450,11 +450,8 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     plainTerm,
     PlusOutlined,
     Popover,
-    preflightActionText,
     preflightCheck,
-    preflightChecksForDisplay,
     preflightColor,
-    preflightExpanded,
     preflightLabel,
     preflightStatusForDisplay,
     preflightWorkflowTargets,
@@ -470,6 +467,8 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     projectGroupCounts,
     projectGroupLabels,
     projectGroupOrder,
+    projectTodoActions,
+    projectTodoStatusForDisplay,
     projectImportDraft,
     projectImportError,
     projectNavCollapsed,
@@ -685,7 +684,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     setOutlineSeed,
     setOwnerFilter,
     setPreflightCheck,
-    setPreflightExpanded,
+    setTodoExpanded,
     setPrioritySortEnabled,
     setProfileDraft,
     setProjectCreateMode,
@@ -780,6 +779,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     TextArea,
     Title,
     toggleDraftBlockExpanded,
+    todoExpanded,
     Tooltip,
     Tree,
     truncateText,
@@ -812,7 +812,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     viewedDraftBlockIds,
     viewMode,
     visibleChapterBlocks,
-    visiblePreflightChecks,
+    visibleProjectTodoActions,
     waiveComplianceEvidenceRequirement,
     waivingEvidenceItemId,
     WarningOutlined,
@@ -845,7 +845,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                         size="small"
                         aria-label="新建项目"
                         icon={<PlusOutlined />}
-                        onClick={() => openCreateProjectModal("manual")}
+                        onClick={() => openCreateProjectModal()}
                       />
                     </Tooltip>
                   )}
@@ -859,7 +859,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                       size="small"
                       aria-label="新建项目"
                       icon={<PlusOutlined />}
-                      onClick={() => openCreateProjectModal("manual")}
+                      onClick={() => openCreateProjectModal()}
                     />
                   </Tooltip>
                   <Tooltip title="项目导航已收起">
@@ -1023,7 +1023,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                 </section>
               )}
 
-              <section className={preflightCheck ? "command-center" : "command-center command-center-single"}>
+              <section className={preflightCheck || sectionQualitySummary ? "command-center" : "command-center command-center-single"}>
                 <div className="workflow-guide">
                   {recommendedStep && (
                     <div className="next-action-card">
@@ -1046,12 +1046,11 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                               提交前核验·{preflightLabel(preflightStatusForDisplay)}
                             </Tag>
                           )}
-                          {visiblePreflightChecks
-                            .filter((item) => item.status !== "pass")
+                          {projectTodoActions
                             .slice(0, 3)
                             .map((item) => (
-                              <Tag key={item.code} color={preflightColor(item.status)}>
-                                {item.title} {item.count}
+                              <Tag key={item.key} color={preflightColor(item.status)}>
+                                {item.count > 0 ? `${item.title} ${item.count}` : item.title}
                               </Tag>
                             ))}
                         </div>
@@ -1232,42 +1231,51 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                   </section>
                 </div>
 
-                {preflightCheck && (
+                {(preflightCheck || sectionQualitySummary) && (
                   <div className="preflight-panel">
                     <div className="preflight-header">
                       <Space wrap>
                         <Text strong>待办队列</Text>
-                        <Tag color={preflightColor(preflightStatusForDisplay)}>{preflightLabel(preflightStatusForDisplay)}</Tag>
-                        {preflightCheck.matrix_outdated && <Tag color="red">矩阵已过期</Tag>}
+                        <Tag color={preflightColor(projectTodoStatusForDisplay)}>
+                          {preflightLabel(projectTodoStatusForDisplay)}
+                        </Tag>
+                        {preflightCheck?.matrix_outdated && <Tag color="red">矩阵已过期</Tag>}
                       </Space>
                       <Text type="secondary">
-                        {visiblePreflightChecks.some((item) => item.status !== "pass")
-                          ? "按卡片顺序处理；点击卡片会进入对应页面或执行对应操作。"
-                          : preflightCheck.summary}
+                        {projectTodoActions.length
+                          ? "默认突出最关键 3 项；点击进入对应页面。"
+                          : preflightCheck?.summary ?? sectionQualitySummary?.summary ?? "暂无阻断或需复核待办。"}
                       </Text>
                     </div>
                     <div className="preflight-checks">
-                      {visiblePreflightChecks.map((item) => (
-                        <button
-                          key={item.code}
-                          className={`preflight-check ${item.status}`}
-                          onClick={() => handlePreflightCheckAction(item)}
-                        >
-                          <Tag color={preflightColor(item.status)}>{item.title}</Tag>
-                          <strong>{item.status === "pass" ? "已通过" : item.count}</strong>
-                          <span>{item.message}</span>
-                          <span className="preflight-action-text">{preflightActionText(item)}</span>
-                        </button>
-                      ))}
+                      {visibleProjectTodoActions.length ? (
+                        visibleProjectTodoActions.map((item) => (
+                          <button
+                            key={item.key}
+                            className={`preflight-check ${item.status}`}
+                            onClick={() => handleProjectTodoAction(item)}
+                          >
+                            <div className="project-todo-labels">
+                              <Tag color={preflightColor(item.status)}>{item.sourceLabel}</Tag>
+                              <Tag>{item.title}</Tag>
+                            </div>
+                            <strong>{item.count > 0 ? item.count : preflightLabel(item.status)}</strong>
+                            <span>{item.message}</span>
+                            <span className="preflight-action-text">{item.actionLabel}</span>
+                          </button>
+                        ))
+                      ) : (
+                        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无阻断或需复核待办" />
+                      )}
                     </div>
-                    {preflightChecksForDisplay.length > 4 && (
+                    {projectTodoActions.length > 3 && (
                       <Button
                         type="text"
                         size="small"
                         className="preflight-expand-button"
-                        onClick={() => setPreflightExpanded((value) => !value)}
+                        onClick={() => setTodoExpanded((value) => !value)}
                       >
-                        {preflightExpanded ? "收起待办" : `展开全部（还有 ${hiddenPreflightCheckCount} 项）`}
+                        {todoExpanded ? "收起待办" : `展开全部（还有 ${hiddenProjectTodoActionCount} 项）`}
                       </Button>
                     )}
                   </div>

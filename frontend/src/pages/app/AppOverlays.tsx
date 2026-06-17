@@ -853,17 +853,17 @@ export function AppOverlays({ app }: { app: BidAppController }) {
         title="新建投标项目"
         open={newProjectOpen}
         width={760}
-        okText={savingProject ? "创建中..." : projectCreateMode === "manual" ? "创建项目" : "确认导入并创建"}
+        okText={savingProject ? "创建中..." : "确认导入并创建"}
         cancelText="取消"
         confirmLoading={savingProject}
-        okButtonProps={{ disabled: savingProject || importingProjectDraft || (projectCreateMode !== "manual" && !projectImportDraft) }}
+        okButtonProps={{ disabled: savingProject || importingProjectDraft || !projectImportDraft }}
         onOk={handleCreateProject}
         onCancel={() => {
           if (!savingProject) setNewProjectOpen(false);
         }}
       >
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
-          {savingProject && projectCreateMode !== "manual" && (
+          {savingProject && (
             <Alert
               type="info"
               showIcon
@@ -881,11 +881,6 @@ export function AppOverlays({ app }: { app: BidAppController }) {
               setProjectImportError("");
             }}
             items={[
-              {
-                key: "manual",
-                label: "手工新建",
-                children: <Text type="secondary">录入项目基础信息后创建空项目。</Text>
-              },
               {
                 key: "file",
                 label: "从文件导入",
@@ -943,7 +938,7 @@ export function AppOverlays({ app }: { app: BidAppController }) {
             ]}
           />
 
-          {projectImportError && projectCreateMode !== "manual" && (
+          {projectImportError && (
             <Alert
               type="error"
               showIcon
@@ -1005,83 +1000,6 @@ export function AppOverlays({ app }: { app: BidAppController }) {
               </div>
               <div className="import-preview-text">{projectImportDraft.preview_text}</div>
             </div>
-          )}
-
-          {projectCreateMode === "manual" && (
-            <>
-              <Input
-                placeholder="项目名称"
-                value={newProjectDraft.name}
-                onChange={(event) =>
-                  setNewProjectDraft((draft) => ({ ...draft, name: event.target.value }))
-                }
-              />
-              <Input
-                placeholder="采购人"
-                value={newProjectDraft.purchaser}
-                onChange={(event) =>
-                  setNewProjectDraft((draft) => ({ ...draft, purchaser: event.target.value }))
-                }
-              />
-              <Input
-                placeholder="代理机构"
-                value={newProjectDraft.agency}
-                onChange={(event) =>
-                  setNewProjectDraft((draft) => ({ ...draft, agency: event.target.value }))
-                }
-              />
-              <Space.Compact style={{ width: "100%" }}>
-                <Input
-                  placeholder="预算金额"
-                  value={newProjectDraft.budgetAmount}
-                  onChange={(event) =>
-                    setNewProjectDraft((draft) => ({ ...draft, budgetAmount: event.target.value }))
-                  }
-                />
-                <Input
-                  placeholder="标段名称"
-                  value={newProjectDraft.sectionName}
-                  onChange={(event) =>
-                    setNewProjectDraft((draft) => ({ ...draft, sectionName: event.target.value }))
-                  }
-                />
-              </Space.Compact>
-              <Space.Compact style={{ width: "100%" }}>
-                <Input
-                  placeholder="地区编码"
-                  value={newProjectDraft.regionCode}
-                  onChange={(event) =>
-                    setNewProjectDraft((draft) => ({ ...draft, regionCode: event.target.value }))
-                  }
-                />
-                <Input
-                  placeholder="行业编码"
-                  value={newProjectDraft.industryCode}
-                  onChange={(event) =>
-                    setNewProjectDraft((draft) => ({ ...draft, industryCode: event.target.value }))
-                  }
-                />
-              </Space.Compact>
-              <Input
-                placeholder="公告链接"
-                value={newProjectDraft.noticeUrl}
-                onChange={(event) =>
-                  setNewProjectDraft((draft) => ({ ...draft, noticeUrl: event.target.value }))
-                }
-              />
-              <DatePicker
-                showTime
-                style={{ width: "100%" }}
-                placeholder="投标截止时间"
-                value={newProjectDraft.bidDeadlineAt ? dayjs(newProjectDraft.bidDeadlineAt) : null}
-                onChange={(value) =>
-                  setNewProjectDraft((draft) => ({
-                    ...draft,
-                    bidDeadlineAt: value ? value.toISOString() : null
-                  }))
-                }
-              />
-            </>
           )}
         </Space>
       </Modal>
@@ -1751,6 +1669,12 @@ export function AppOverlays({ app }: { app: BidAppController }) {
             />
             <EvidenceCandidatePanel
               candidates={evidenceCandidates}
+              target={{
+                requirement: evidenceDrawer.requirement,
+                chapter: evidenceDrawer.chapter,
+                risk: evidenceDrawer.risk,
+                mandatory: evidenceDrawer.mandatory
+              }}
               loading={loadingEvidenceCandidates}
               boundMaterialIds={evidenceBindings.map((binding) => binding.enterprise_material_id)}
               bindingMaterialId={bindingMaterialId}

@@ -1,6 +1,13 @@
 import dayjs, { type Dayjs } from "dayjs";
 
-import type { DraftBlock, EnterpriseMaterial, ProjectSummary } from "../api/bid";
+import type {
+  DraftBlock,
+  EnterpriseMaterial,
+  PreflightCheckItem,
+  ProjectSummary,
+  SectionQualityCheck,
+  SectionQualitySummary
+} from "../api/bid";
 
 // 首页项目分组（互斥取一）。
 export type ProjectGroup = "needs_me" | "in_progress" | "done";
@@ -20,6 +27,135 @@ export function sectionQualityStatusColor(status: string): string {
   if (status === "block") return "red";
   if (status === "warn") return "gold";
   return "green";
+}
+
+export type ProjectTodoSource = "quality" | "preflight";
+
+export interface ProjectTodoAction {
+  key: string;
+  source: ProjectTodoSource;
+  sourceLabel: string;
+  code: string;
+  title: string;
+  status: SectionQualityStatus;
+  count: number;
+  message: string;
+  actionLabel: string;
+  target: string | null;
+  priority: number;
+}
+
+const todoStatusRank: Record<SectionQualityStatus, number> = {
+  block: 0,
+  warn: 1,
+  pass: 2
+};
+
+function normalizeTodoStatus(status: string): SectionQualityStatus {
+  if (status === "block" || status === "warn") return status;
+  return "pass";
+}
+
+const preflightTodoPriorityByCode: Record<string, number> = {
+  high_risk: 0,
+  matrix_version: 10,
+  technical: 30,
+  mandatory_evidence: 40,
+  draft_block_review: 50,
+  draft_exists: 50,
+  draft_facts: 50,
+  qualification: 60,
+  qualification_decision: 60,
+  deadline: 70,
+  approvals: 80
+};
+
+const qualityTodoPriorityByCategory: Record<string, number> = {
+  source: 10,
+  pricing: 20,
+  export: 20,
+  coverage: 30,
+  draft: 50,
+  context_pack: 60
+};
+
+function fallbackTodoPriority(code: string, target: string | null, title: string) {
+  const haystack = `${code}:${target ?? ""}:${title}`;
+  if (/disqualifying|high_risk|废标|高风险/.test(haystack)) return 0;
+  if (/source\.no_tender_text|directory\.unavailable|matrix_version/.test(haystack)) return 10;
+  if (/submission|export|pricing\.blocking|正式|导出|报价/.test(haystack)) return 20;
+  if (/coverage\.gaps|technical|scoring|评分|技术响应/.test(haystack)) return 30;
+  if (/mandatory_evidence|needs_evidence|evidence|缺证据|材料/.test(haystack)) return 40;
+  if (/draft_facts|draft_block|draft_coverage|facts|草稿|事实/.test(haystack)) return 50;
+  if (/context_pack|qualification_decision|qualification|资格|参标/.test(haystack)) return 60;
+  if (/deadline|日期|截止/.test(haystack)) return 70;
+  if (/approval|审批/.test(haystack)) return 80;
+  return 90;
+}
+
+function qualityTodoPriority(check: SectionQualityCheck) {
+  if (/disqualifying|high_risk/.test(check.code)) return 0;
+  if (check.code === "directory.unavailable") return 10;
+  return (
+    qualityTodoPriorityByCategory[check.category] ??
+    fallbackTodoPriority(check.code, check.target, check.title)
+  );
+}
+
+function preflightTodoPriority(item: PreflightCheckItem) {
+  return preflightTodoPriorityByCode[item.code] ?? fallbackTodoPriority(item.code, item.target, item.title);
+}
+
+function qualityTodoAction(check: SectionQualityCheck): ProjectTodoAction {
+  const status = normalizeTodoStatus(check.status);
+  return {
+    key: `quality:${check.code}`,
+    source: "quality",
+    sourceLabel: "质量体检",
+    code: check.code,
+    title: check.title,
+    status,
+    count: check.count,
+    message: check.message,
+    actionLabel: check.action_label || "查看处理项",
+    target: check.target,
+    priority: qualityTodoPriority(check)
+  };
+}
+
+function preflightTodoAction(item: PreflightCheckItem): ProjectTodoAction {
+  const status = normalizeTodoStatus(item.status);
+  return {
+    key: `preflight:${item.code}`,
+    source: "preflight",
+    sourceLabel: "提交前核验",
+    code: item.code,
+    title: item.title,
+    status,
+    count: item.count,
+    message: item.message,
+    actionLabel: item.action_label || "查看处理项",
+    target: item.target,
+    priority: preflightTodoPriority(item)
+  };
+}
+
+export function buildProjectTodoActions(
+  qualitySummary: SectionQualitySummary | null | undefined,
+  preflightChecks: PreflightCheckItem[]
+): ProjectTodoAction[] {
+  const actions = [
+    ...(qualitySummary?.checks ?? []).filter((check) => check.status !== "pass").map(qualityTodoAction),
+    ...preflightChecks.filter((item) => item.status !== "pass").map(preflightTodoAction)
+  ];
+
+  return actions.sort((left, right) => {
+    const statusDiff = todoStatusRank[left.status] - todoStatusRank[right.status];
+    if (statusDiff !== 0) return statusDiff;
+    if (left.priority !== right.priority) return left.priority - right.priority;
+    if (right.count !== left.count) return right.count - left.count;
+    return left.key.localeCompare(right.key);
+  });
 }
 
 // 项目分组：终态归"已完成"，需要人工动作归"待我处理"，其余归"进行中"。

@@ -819,7 +819,7 @@ export function HomePage({ app }: { app: BidAppController }) {
                 <Text type="secondary">集中查看待办、风险、截止时间和审批任务，再进入具体项目工作台处理。</Text>
               </div>
               <Space wrap>
-                <Button icon={<PlusOutlined />} onClick={() => openCreateProjectModal("manual")}>
+                <Button icon={<PlusOutlined />} onClick={() => openCreateProjectModal()}>
                   新建项目
                 </Button>
                 <Button type="primary" onClick={() => openWorkspace("matrix")} disabled={!selectedProjectId}>

@@ -204,6 +204,7 @@ import type {
 import { ContextPackPreviewDrawer } from "../../components/ContextPackPreviewDrawer";
 import { EvidenceCandidatePanel } from "../../components/EvidenceCandidatePanel";
 import {
+  buildProjectTodoActions,
   classifyProjectGroup,
   computeDashboardStats,
   computeDraftBlockFilterCounts,
@@ -213,7 +214,8 @@ import {
   sectionQualityStatusColor,
   sectionQualityStatusLabel,
   type DraftBlockFilter,
-  type ProjectGroup
+  type ProjectGroup,
+  type ProjectTodoAction
 } from "../../pages/selectors";
 import { OutlineEditorModal, type OutlineSeedChapter } from "../../components/OutlineEditorModal";
 import { plainTerm } from "../../i18n/glossary";
@@ -296,7 +298,7 @@ type KeyInfoDraft = {
   reason: string;
 };
 
-export type ProjectCreateMode = "manual" | "file" | "url";
+export type ProjectCreateMode = "file" | "url";
 export type WorkflowStepKey =
   | "documents"
   | "tasks"
@@ -1363,7 +1365,7 @@ export function useBidAppController() {
   const [unbindingId, setUnbindingId] = useState("");
   const [editDraft, setEditDraft] = useState<EditMatrixDraft | null>(null);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
-  const [projectCreateMode, setProjectCreateMode] = useState<ProjectCreateMode>("manual");
+  const [projectCreateMode, setProjectCreateMode] = useState<ProjectCreateMode>("file");
   const [projectImportDraft, setProjectImportDraft] = useState<ProjectImportDraft | null>(null);
   const [projectImportError, setProjectImportError] = useState("");
   const [importUrl, setImportUrl] = useState("");
@@ -1407,6 +1409,7 @@ export function useBidAppController() {
   const [homeProjectPageSize, setHomeProjectPageSize] = useState(8);
   const [preflightCheck, setPreflightCheck] = useState<PreflightCheck | null>(null);
   const [preflightExpanded, setPreflightExpanded] = useState(false);
+  const [todoExpanded, setTodoExpanded] = useState(false);
   const [qualificationEvaluations, setQualificationEvaluations] = useState<QualificationEvaluation[]>([]);
   const [qualificationDecision, setQualificationDecision] = useState<QualificationDecision | null>(null);
   const [businessDraftChapters, setBusinessDraftChapters] = useState<BusinessDraftChapter[]>([]);
@@ -2115,7 +2118,8 @@ export function useBidAppController() {
   }, [matrixRows]);
   useEffect(() => {
     setPreflightExpanded(false);
-  }, [selectedProjectId, selectedSectionId, preflightCheck?.status]);
+    setTodoExpanded(false);
+  }, [selectedProjectId, selectedSectionId, preflightCheck?.status, sectionQualitySummary?.status]);
 
   const preflightChecksForDisplay = useMemo(() => {
     if (!preflightCheck) return [];
@@ -2138,6 +2142,20 @@ export function useBidAppController() {
     [preflightChecksForDisplay, preflightExpanded]
   );
   const hiddenPreflightCheckCount = Math.max(0, preflightChecksForDisplay.length - visiblePreflightChecks.length);
+  const projectTodoActions = useMemo(
+    () => buildProjectTodoActions(sectionQualitySummary, preflightChecksForDisplay),
+    [preflightChecksForDisplay, sectionQualitySummary]
+  );
+  const projectTodoStatusForDisplay = useMemo(() => {
+    if (projectTodoActions.some((item) => item.status === "block")) return "block";
+    if (projectTodoActions.some((item) => item.status === "warn")) return "warn";
+    return "pass";
+  }, [projectTodoActions]);
+  const visibleProjectTodoActions = useMemo(
+    () => (todoExpanded ? projectTodoActions : projectTodoActions.slice(0, 3)),
+    [projectTodoActions, todoExpanded]
+  );
+  const hiddenProjectTodoActionCount = Math.max(0, projectTodoActions.length - visibleProjectTodoActions.length);
   const primaryBlockingPreflightCheck =
     preflightChecksForDisplay.find((item) => item.status === "block" && workflowStepForPreflightCheck(item)) ?? null;
   const primaryBlockingPreflightTarget = primaryBlockingPreflightCheck
@@ -5158,6 +5176,21 @@ export function useBidAppController() {
     activateWorkflowStep(target);
   };
 
+  const handleProjectTodoAction = (item: ProjectTodoAction) => {
+    if (item.source === "preflight") {
+      const preflightItem = preflightChecksForDisplay.find((check) => check.code === item.code);
+      if (preflightItem) {
+        handlePreflightCheckAction(preflightItem);
+        return;
+      }
+    }
+    if (!isWorkflowStepKey(item.target)) {
+      appendLog("该质量待办暂未绑定处理页面");
+      return;
+    }
+    activateWorkflowStep(item.target);
+  };
+
   const handleConfirmQualificationDecision = () => {
     if (!selectedProjectId || !selectedSectionId || !qualificationDecision) return;
     let reason = "人工确认参标建议";
@@ -5846,7 +5879,7 @@ export function useBidAppController() {
     setImportUrlSite("");
   };
 
-  const openCreateProjectModal = (mode: ProjectCreateMode = "manual") => {
+  const openCreateProjectModal = (mode: ProjectCreateMode = "file") => {
     resetNewProjectDraft();
     setProjectCreateMode(mode);
     setNewProjectOpen(true);
@@ -6027,69 +6060,47 @@ export function useBidAppController() {
 
   const handleCreateProject = async () => {
     if (savingProject) return;
-    if (projectCreateMode !== "manual" && !projectImportDraft) {
+    if (!projectImportDraft) {
       Modal.warning({ title: projectCreateMode === "file" ? "请先上传招标文件并完成识别" : "请先完成导入识别" });
-      return;
-    }
-    if (projectCreateMode === "manual" && !newProjectDraft.name.trim()) {
-      Modal.warning({ title: "请填写项目名称" });
       return;
     }
     setSavingProject(true);
     try {
-      if (projectCreateMode !== "manual" && projectImportDraft) {
-        const result = await confirmProjectImportDraft({
-          source: projectImportDraft.source,
-          project: projectImportDraft.project,
-          sections: projectImportDraft.sections,
-          auto_parse: true,
-          auto_generate_matrix: true,
-          async_processing: true
-        });
-        appendLog(
-          result.parse_task_id
-            ? `导入创建项目：${result.project.name}，后台解析任务 ${result.parse_task_id.slice(0, 8)} 已启动`
-            : `导入创建项目：${result.project.name}`
-        );
-        if (result.parse_task_id || result.matrix_task_id) {
-          setImportProcessing({
-            projectId: result.project.id,
-            sectionId: result.section_id,
-            parseTaskId: result.parse_task_id,
-            matrixTaskId: result.matrix_task_id,
-            parseTask: null,
-            matrixTask: null
-          });
-        }
-        setNewProjectOpen(false);
-        await activateProjectWorkspace(result.project.id, result.section_id);
-        Modal.info({
-          title: "项目已创建",
-          content: result.parse_task_id
-            ? "文件解析和合规矩阵生成已转入后台处理。工作台顶部会持续显示后台任务状态，完成后自动刷新。"
-            : "项目已创建完成。"
-        });
-        window.setTimeout(() => {
-          activateProjectWorkspace(result.project.id, result.section_id).catch(() => undefined);
-          reloadAuditLogs().catch(() => undefined);
-        }, 1800);
-        return;
-      }
-
-      const project = await createProject({
-        name: newProjectDraft.name.trim(),
-        purchaser: newProjectDraft.purchaser || null,
-        agency: newProjectDraft.agency || null,
-        budget_amount: newProjectDraft.budgetAmount || null,
-        region_code: newProjectDraft.regionCode || null,
-        industry_code: newProjectDraft.industryCode || null,
-        notice_url: newProjectDraft.noticeUrl || null,
-        bid_deadline_at: newProjectDraft.bidDeadlineAt,
-        section_name: newProjectDraft.sectionName || "一标段"
+      const result = await confirmProjectImportDraft({
+        source: projectImportDraft.source,
+        project: projectImportDraft.project,
+        sections: projectImportDraft.sections,
+        auto_parse: true,
+        auto_generate_matrix: true,
+        async_processing: true
       });
-      appendLog(`新建项目：${project.name}`);
+      appendLog(
+        result.parse_task_id
+          ? `导入创建项目：${result.project.name}，后台解析任务 ${result.parse_task_id.slice(0, 8)} 已启动`
+          : `导入创建项目：${result.project.name}`
+      );
+      if (result.parse_task_id || result.matrix_task_id) {
+        setImportProcessing({
+          projectId: result.project.id,
+          sectionId: result.section_id,
+          parseTaskId: result.parse_task_id,
+          matrixTaskId: result.matrix_task_id,
+          parseTask: null,
+          matrixTask: null
+        });
+      }
       setNewProjectOpen(false);
-      await activateProjectWorkspace(project.id);
+      await activateProjectWorkspace(result.project.id, result.section_id);
+      Modal.info({
+        title: "项目已创建",
+        content: result.parse_task_id
+          ? "文件解析和合规矩阵生成已转入后台处理。工作台顶部会持续显示后台任务状态，完成后自动刷新。"
+          : "项目已创建完成。"
+      });
+      window.setTimeout(() => {
+        activateProjectWorkspace(result.project.id, result.section_id).catch(() => undefined);
+        reloadAuditLogs().catch(() => undefined);
+      }, 1800);
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "项目创建失败");
     } finally {
@@ -6839,6 +6850,7 @@ export function useBidAppController() {
     handleOpenOutlineEditor,
     handleOpenRevisionDrawer,
     handlePreflightCheckAction,
+    handleProjectTodoAction,
     handlePreviewContextPack,
     handlePublicUrlAcquisition,
     handlePublishManualRevision,
@@ -6870,6 +6882,7 @@ export function useBidAppController() {
     handleWaiveEvidenceRequirement,
     Header,
     hiddenPreflightCheckCount,
+    hiddenProjectTodoActionCount,
     highlightedRowKey,
     HighlightOutlined,
     historyExtractActive,
@@ -7054,6 +7067,8 @@ export function useBidAppController() {
     projectGroupCounts,
     projectGroupLabels,
     projectGroupOrder,
+    projectTodoActions,
+    projectTodoStatusForDisplay,
     projectImportDraft,
     projectImportError,
     projectNavCollapsed,
@@ -7273,6 +7288,7 @@ export function useBidAppController() {
     setOwnerFilter,
     setPreflightCheck,
     setPreflightExpanded,
+    setTodoExpanded,
     setPrioritySortEnabled,
     setProfileDraft,
     setProjectCreateMode,
@@ -7367,6 +7383,7 @@ export function useBidAppController() {
     TextArea,
     Title,
     toggleDraftBlockExpanded,
+    todoExpanded,
     Tooltip,
     Tree,
     truncateText,
@@ -7400,6 +7417,7 @@ export function useBidAppController() {
     viewMode,
     visibleChapterBlocks,
     visiblePreflightChecks,
+    visibleProjectTodoActions,
     waiveComplianceEvidenceRequirement,
     waivingEvidenceItemId,
     WarningOutlined,

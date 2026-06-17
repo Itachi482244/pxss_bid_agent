@@ -7,7 +7,8 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:mvp155-browser": "node scripts/mvp155-browser-regression.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^5.5.0",
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
+    "playwright": "^1.61.0",
     "typescript": "^5.6.0",
     "vite": "^5.4.0",
     "vitest": "^4.1.8"

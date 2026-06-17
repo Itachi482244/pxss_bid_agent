@@ -1,7 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Alert, Button, Checkbox, Empty, Space, Table, Tag, Tooltip, Typography } from "antd";
 
 import type { EnterpriseMaterialSearchResult } from "../api/bid";
+import {
+  buildEvidenceCandidateExplanation,
+  type EvidenceCandidateTarget
+} from "../features/bid/evidenceCandidateExplanation";
 import { formatEvidenceSnippet, stripGeneratedIdSuffix } from "../features/bid/evidenceText";
 
 const { Text, Title } = Typography;
@@ -11,6 +15,7 @@ const LOW_RELEVANCE_THRESHOLD = 0.3;
 
 type Props = {
   candidates: EnterpriseMaterialSearchResult[];
+  target: EvidenceCandidateTarget;
   loading: boolean;
   boundMaterialIds: string[];
   bindingMaterialId: string;
@@ -32,6 +37,7 @@ type Props = {
  */
 export function EvidenceCandidatePanel({
   candidates,
+  target,
   loading,
   boundMaterialIds,
   bindingMaterialId,
@@ -61,7 +67,17 @@ export function EvidenceCandidatePanel({
     return () => window.clearInterval(timer);
   }, [loading]);
 
-  const boundSet = new Set(boundMaterialIds);
+  const boundSet = useMemo(() => new Set(boundMaterialIds), [boundMaterialIds]);
+  const explanationsById = useMemo(
+    () =>
+      new Map(
+        candidates.map((candidate) => [
+          candidate.id,
+          buildEvidenceCandidateExplanation(candidate, target, { verificationStatusLabels })
+        ])
+      ),
+    [candidates, target, verificationStatusLabels]
+  );
   const degraded = candidates.some(
     (item) => item.rerank_fallback_used || Boolean(item.rerank_error)
   );
@@ -78,6 +94,11 @@ export function EvidenceCandidatePanel({
       : item.confidence_score;
   const isLowRelevance = (item: EnterpriseMaterialSearchResult) =>
     relevanceScore(item) < LOW_RELEVANCE_THRESHOLD;
+  const riskToneColor = (tone: ReturnType<typeof buildEvidenceCandidateExplanation>["riskTone"]) => {
+    if (tone === "danger") return "red";
+    if (tone === "warning") return "gold";
+    return "green";
+  };
 
   return (
     <div className="evidence-candidate-panel">
@@ -167,15 +188,44 @@ export function EvidenceCandidatePanel({
             )
           },
           {
-            title: "推荐理由与来源",
+            title: "推荐解释",
             dataIndex: "recommend_reason",
             render: (_: string | null, record) => (
-              <Space direction="vertical" size={4}>
-                {record.recommend_reason && (
-                  <Text type="secondary" className="recommend-reason">
-                    推荐原因：{record.recommend_reason}
-                  </Text>
-                )}
+              <Space direction="vertical" size={6}>
+                {(() => {
+                  const explanation =
+                    explanationsById.get(record.id) ??
+                    buildEvidenceCandidateExplanation(record, target, { verificationStatusLabels });
+                  return (
+                    <div className="candidate-explanation-list">
+                      <div>
+                        <Text type="secondary">为什么推荐</Text>
+                        <span>{explanation.recommendationReason}</span>
+                      </div>
+                      <div>
+                        <Text type="secondary">来源在哪里</Text>
+                        <span>{explanation.sourceReference}</span>
+                      </div>
+                      <div>
+                        <Text type="secondary">风险是什么</Text>
+                        <span>
+                          <Tag color={riskToneColor(explanation.riskTone)}>
+                            {explanation.riskTone === "danger"
+                              ? "不可直接采纳"
+                              : explanation.riskTone === "warning"
+                                ? "需复核"
+                                : "可采纳"}
+                          </Tag>
+                          {explanation.riskNote}
+                        </span>
+                      </div>
+                      <div>
+                        <Text type="secondary">采纳后覆盖</Text>
+                        <span>{explanation.coverageText}</span>
+                      </div>
+                    </div>
+                  );
+                })()}
                 <Text className="evidence-snippet">{formatEvidenceSnippet(record)}</Text>
                 <Space size={6} wrap>
                   <Text type="secondary">匹配度 {Math.round(record.confidence_score * 100)}%</Text>
