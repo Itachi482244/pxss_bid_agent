@@ -815,7 +815,7 @@ export function DocumentsTab({ app }: { app: BidAppController }) {
                         <div className="document-actions">
                           <Upload
                             showUploadList={false}
-                            accept=".docx,.pdf"
+                            accept=".doc,.docx,.pdf"
                             customRequest={handleUploadDocument}
                             disabled={documentBusy}
                           >

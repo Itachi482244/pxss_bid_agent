@@ -81,6 +81,7 @@ from app.schemas.project import (
     ComplianceItemConfirmRequest,
     ComplianceItemFromSourceRequest,
     ComplianceItemFromSourceResult,
+    ComplianceMatrixAutoResolveRequest,
     ComplianceMatrixGenerateRequest,
     DraftBlockRead,
     DraftBlockUpdateRequest,
@@ -139,7 +140,11 @@ from app.services.context_pack import (
     generate_draft_from_context_pack,
     update_context_pack_directives,
 )
-from app.services.compliance_generation import execute_compliance_matrix_generation_task
+from app.services.compliance_generation import (
+    execute_compliance_matrix_generation_task,
+    execute_matrix_auto_resolve_task,
+)
+from app.services.document_conversion import LegacyDocConversionError
 from app.services.document_utils import TENDER_DOCUMENT_FILE_MAX_BYTES, readable_file_size
 from app.services.tender_outline import derive_project_directory
 from app.services.tender_format_export import TenderFormatExportError, export_tender_format_docx
@@ -1792,6 +1797,11 @@ async def create_project_import_draft_from_upload(
                 "图片型或扫描件 PDF 请先走 OCR 资料抽取流程。"
             ),
         ) from exc
+    except LegacyDocConversionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{exc}；旧版 Word 自动转换失败，请手工转换为 .docx 后重新上传。",
+        ) from exc
     return project_import_draft_read(draft)
 
 
@@ -1824,6 +1834,11 @@ def create_project_import_draft_from_public_url(
                 f"{exc}；项目招标文件导入当前只支持可复制文本的 PDF/Word/HTML，"
                 "图片型或扫描件 PDF 请先走 OCR 资料抽取流程。"
             ),
+        ) from exc
+    except LegacyDocConversionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{exc}；旧版 Word 自动转换失败，请手工转换为 .docx 后重新上传。",
         ) from exc
     return project_import_draft_read(draft)
 
@@ -2205,6 +2220,91 @@ def create_compliance_matrix_generation_task(
 def _execute_matrix_generation_background(task_id: uuid.UUID) -> None:
     with SessionLocal() as db:
         execute_compliance_matrix_generation_task(db, task_id)
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/compliance-items/auto-resolve",
+    response_model=AsyncTaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_compliance_matrix_auto_resolve_task(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: ComplianceMatrixAutoResolveRequest,
+    background_tasks: BackgroundTasks,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> AsyncTaskRead:
+    """让 Agent 自动处理质量门禁阻断：自主决定定向重抽 / 重排重抽，并复检收敛。"""
+    get_section_or_404(db, ctx, project_id, section_id)
+    input_payload = {
+        "document_id": str(payload.document_id) if payload.document_id else None,
+        "document_version_id": str(payload.document_version_id)
+        if payload.document_version_id
+        else None,
+    }
+    idempotency_key = "matrix-auto-resolve:" + hashlib.sha256(
+        f"{section_id}:{input_payload}:{uuid.uuid4().hex}".encode("utf-8")
+    ).hexdigest()
+    task = AsyncTask(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        task_type="matrix_auto_resolve",
+        status="pending",
+        idempotency_key=idempotency_key,
+        progress=0,
+        input_json=input_payload,
+        retry_count=0,
+        max_retries=0,
+        created_by=ctx.user_id,
+    )
+    db.add(task)
+    db.flush()
+    db.add(
+        AuditLog(
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=ctx.user_id,
+            actor_type="user",
+            action="compliance.matrix_auto_resolve_requested",
+            object_type="async_task",
+            object_id=task.id,
+            after_json=task.input_json,
+            reason="用户请求让 Agent 自动处理质量门禁阻断",
+            severity="info",
+        )
+    )
+    db.commit()
+    db.refresh(task)
+
+    if payload.async_processing and settings.run_tasks_inline:
+        background_tasks.add_task(_execute_matrix_auto_resolve_background, task.id)
+    elif settings.run_tasks_inline:
+        execute_matrix_auto_resolve_task(db, task.id)
+        db.refresh(task)
+    else:
+        from app.worker import run_matrix_auto_resolve_task
+
+        try:
+            enqueue_celery_task(
+                db,
+                task,
+                lambda: run_matrix_auto_resolve_task.delay(str(task.id)),
+            )
+        except TaskDispatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"质量门禁自动处理任务派发失败：{exc}",
+            ) from exc
+        db.refresh(task)
+    return AsyncTaskRead.model_validate(task)
+
+
+def _execute_matrix_auto_resolve_background(task_id: uuid.UUID) -> None:
+    with SessionLocal() as db:
+        execute_matrix_auto_resolve_task(db, task_id)
 
 
 @router.post(

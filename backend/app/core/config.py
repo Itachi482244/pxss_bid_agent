@@ -80,6 +80,20 @@ class Settings(BaseSettings):
     source_page_image_jpeg_quality: int = Field(default=70, alias="SOURCE_PAGE_IMAGE_JPEG_QUALITY")
     source_page_image_render_scale: float = Field(default=2.0, alias="SOURCE_PAGE_IMAGE_RENDER_SCALE")
 
+    legacy_doc_conversion_enabled: bool = Field(default=True, alias="LEGACY_DOC_CONVERSION_ENABLED")
+    # 默认 http：与 docker 优先的部署取向一致，调用 libreoffice-converter sidecar。
+    # subprocess: 调用本机/镜像内置 soffice（需后端环境自带 LibreOffice）。
+    legacy_doc_converter_mode: str = Field(default="http", alias="LEGACY_DOC_CONVERTER_MODE")
+    legacy_doc_converter_path: str = Field(default="", alias="LEGACY_DOC_CONVERTER_PATH")
+    legacy_doc_converter_url: str = Field(
+        default="http://localhost:2004",
+        alias="LEGACY_DOC_CONVERTER_URL",
+    )
+    legacy_doc_conversion_timeout_seconds: float = Field(
+        default=60.0,
+        alias="LEGACY_DOC_CONVERSION_TIMEOUT_SECONDS",
+    )
+
     run_tasks_inline: bool = Field(default=True, alias="RUN_TASKS_INLINE")
     matrix_fork_join_enabled: bool = Field(default=True, alias="MATRIX_FORK_JOIN_ENABLED")
     matrix_fork_join_max_workers: int = Field(default=4, alias="MATRIX_FORK_JOIN_MAX_WORKERS")

@@ -21,7 +21,6 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     activePackDirectiveCount,
     activeReviewItemId,
     activeTab,
-    Alert,
     allMatrixReviewRows,
     apiError,
     appendLog,
@@ -39,8 +38,6 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     ASYNC_TASK_STALE_AFTER_MS,
     asyncTaskEtaText,
     asyncTaskProgress,
-    asyncTaskStatusColors,
-    asyncTaskStatusLabels,
     asyncTaskStatusText,
     auditActionText,
     auditContentText,
@@ -406,7 +403,6 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     matrixRowsById,
     matrixTaskActive,
     matrixTaskOutput,
-    matrixTaskStageTitle,
     MenuFoldOutlined,
     MenuUnfoldOutlined,
     missingKeyInfo,
@@ -767,7 +763,6 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     Tabs,
     Tag,
     taskOutputText,
-    taskProgressMessage,
     taskShortId,
     taskTimeRange,
     TeamOutlined,
@@ -822,6 +817,39 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     workflowStepKeys,
     workflowSteps
   } = app;
+
+  const [commandDetailsOpen, setCommandDetailsOpen] = useState(false);
+  // Hero 已经承载“最该做的一件事”，待办队列里去掉与它指向同一步骤的那条，避免重复。
+  const heroStepKey = recommendedStep?.key ?? null;
+  const commandTodoActions = useMemo(
+    () => (heroStepKey ? projectTodoActions.filter((item) => item.target !== heroStepKey) : projectTodoActions),
+    [projectTodoActions, heroStepKey]
+  );
+  const visibleCommandTodoActions = todoExpanded ? commandTodoActions : commandTodoActions.slice(0, 3);
+  const hiddenCommandTodoCount = Math.max(0, commandTodoActions.length - visibleCommandTodoActions.length);
+  const hasCommandTodos = commandTodoActions.length > 0;
+  const onRecommendedTab = Boolean(recommendedStep && recommendedStep.key === activeTab);
+  // 「完成这一步之后去哪」：定位推荐步骤所属阶段，取其后第一个尚未完成的阶段作为下一站。
+  const heroGroupIndex = recommendedStep
+    ? simpleWorkflowSteps.findIndex((group) => group.activeKeys.includes(recommendedStep.key))
+    : -1;
+  const followingStep =
+    heroGroupIndex >= 0
+      ? simpleWorkflowSteps.slice(heroGroupIndex + 1).find((group) => group.status !== "done") ?? null
+      : null;
+  const sectionQualityStatus = sectionQualitySummary?.status ?? null;
+  const submissionBlocked = sectionQualitySummary?.export_preview.submission_allowed === false;
+  const complianceTotal = currentSection?.compliance_item_count ?? matrixRows.length;
+  const confirmedCount = matrixRows.length
+    ? matrixRows.filter((row) => row.statusCode === "confirmed").length
+    : knownConfirmedMatrixCount;
+  const needsMaterialCount = matrixRows.filter((row) => row.statusCode === "needs_material").length;
+  const highRiskTotal = currentSection?.high_risk_count ?? 0;
+  const approvalPendingCount = mvp13DraftWorkflowAvailable
+    ? approvalTasks.filter((task) => task.status === "pending").length
+    : activeContextPack
+      ? 1
+      : 0;
 
   return (
           <Layout className={projectNavCollapsed ? "workspace-layout project-nav-collapsed" : "workspace-layout"}>
@@ -932,28 +960,10 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
 
               {importProcessingVisible && importProcessing && (
                 <section className="background-task-panel">
-                  <Alert
-                    showIcon
-                    type={importProcessingFailed ? "error" : importProcessingDone ? "success" : "info"}
-                    message={importProcessingStageTitle}
-                    description={
-                      importProcessingQualityBlocked
-                        ? "系统已暂停本轮写入，上一版矩阵仍保留。请进入质量门禁页按建议处理阻断项。"
-                        : importProcessingParseFailed
-                        ? "文件解析失败，请在文件解析页重新解析；如果原文件异常，可重新上传后再生成矩阵。"
-                        : importProcessingMatrixFailed
-                        ? "矩阵生成失败，请查看矩阵任务错误后重新生成；如果被质量门禁拦截，先处理质检阻断。"
-                        : importProcessingFailed
-                        ? "解析或矩阵生成失败，请查看下方任务状态后重新解析或重新生成矩阵。"
-                        : importProcessingDone
-                          ? "文件解析和合规矩阵已刷新，可继续处理风险、证据和确认项。"
-                          : "这是后台异步任务，可以切换页面继续查看项目；完成后会自动刷新。"
-                    }
-                  />
                   <div className="background-task-overview">
                     <div className="background-task-overview-header">
                       <div>
-                        <Text strong>后台解析/生成进度</Text>
+                        <Text strong>{importProcessingStageTitle}</Text>
                         <Text type="secondary">{importProcessingStageMessage}</Text>
                       </div>
                       <Tag color={importProcessingFailed ? "red" : importProcessingDone ? "green" : "blue"}>
@@ -965,11 +975,19 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                       status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : "active"}
                       showInfo={false}
                     />
-                    {!importProcessingDone && !importProcessingFailed && (
-                      <Text type="secondary" className="background-task-hint">
-                        当前不需要人工操作；如果质量门禁拦截，系统会在完成后引导到专门处理页。
-                      </Text>
-                    )}
+                    <Text type="secondary" className="background-task-hint">
+                      {importProcessingQualityBlocked
+                        ? "系统已暂停本轮写入，上一版矩阵仍保留。请进入质量门禁页按建议处理阻断项。"
+                        : importProcessingParseFailed
+                        ? "文件解析失败，请在文件解析页重新解析；如果原文件异常，可重新上传后再生成矩阵。"
+                        : importProcessingMatrixFailed
+                        ? "矩阵生成失败，请查看矩阵任务错误后重新生成；如果被质量门禁拦截，先处理质检阻断。"
+                        : importProcessingFailed
+                        ? "解析或矩阵生成失败，请进入任务中心查看后重新解析或重新生成矩阵。"
+                        : importProcessingDone
+                        ? "文件解析和合规矩阵已刷新，可继续处理风险、证据和确认项。"
+                        : "当前不需要人工操作；这是后台异步任务，可以切换页面继续处理，完成后会自动刷新。"}
+                    </Text>
                     {(importProcessingInProgress || importProcessingQualityBlocked || importProcessingFailed) && (
                       <Space className="background-task-actions" wrap>
                         <Button onClick={() => openWorkspace("tasks")}>
@@ -983,136 +1001,55 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                       </Space>
                     )}
                   </div>
-                  <div className="background-task-grid">
-                    {importProcessing.parseTaskId && (
-                      <div className="background-task-card">
-                        <div className="background-task-title">
-                          <Text strong>文件解析</Text>
-                          <Tag color={asyncTaskStatusColors[importProcessing.parseTask?.status ?? "pending"]}>
-                            {asyncTaskStatusLabels[importProcessing.parseTask?.status ?? "pending"] ?? "处理中"}
-                          </Tag>
-                        </div>
-                        <Text type="secondary">
-                          {taskProgressMessage(
-                            importProcessing.parseTask,
-                            "正在读取文件并切分条款...",
-                            "解析版本已生成。"
-                          )}
-                        </Text>
-                      </div>
-                    )}
-                    {importProcessing.matrixTaskId && (
-                      <div className="background-task-card">
-                        <div className="background-task-title">
-                          <Text strong>合规矩阵</Text>
-                          <Tag color={asyncTaskStatusColors[importProcessing.matrixTask?.status ?? "pending"]}>
-                            {asyncTaskStatusLabels[importProcessing.matrixTask?.status ?? "pending"] ?? "处理中"}
-                          </Tag>
-                        </div>
-                        <Text type="secondary">{matrixTaskStageTitle(importProcessing.matrixTask)}</Text>
-                        <Text type="secondary">
-                          {taskProgressMessage(
-                            importProcessing.matrixTask,
-                            "正在抽取资格项、强制响应项和风险点...",
-                            "矩阵已生成并刷新。"
-                          )}
-                        </Text>
-                      </div>
-                    )}
-                  </div>
                 </section>
               )}
 
-              <section className={preflightCheck || sectionQualitySummary ? "command-center" : "command-center command-center-single"}>
-                <div className="workflow-guide">
-                  {recommendedStep && (
-                    <div className="next-action-card">
-                      <div className="next-action-copy">
-                        <Text type="secondary" className="next-action-eyebrow">
-                          现在先做
-                        </Text>
-                        <Text strong>当前任务：{recommendedStep.title}</Text>
-                        <Text type="secondary">
-                          {recommendedPreflightCheck
-                            ? recommendedPreflightCheck.message
-                            : recommendedStep.reason}
-                        </Text>
-                        <div className="next-action-tags">
-                          {extractionQualityReport?.status === "passed" && (
-                            <Tag color="green">抽取质量门禁已通过</Tag>
-                          )}
-                          {preflightStatusForDisplay !== "pass" && (
-                            <Tag color={preflightColor(preflightStatusForDisplay)}>
-                              提交前核验·{preflightLabel(preflightStatusForDisplay)}
-                            </Tag>
-                          )}
-                          {projectTodoActions
-                            .slice(0, 3)
-                            .map((item) => (
-                              <Tag key={item.key} color={preflightColor(item.status)}>
-                                {item.count > 0 ? `${item.title} ${item.count}` : item.title}
-                              </Tag>
-                            ))}
-                        </div>
-                      </div>
-                      <Button type="primary" onClick={() => runWorkflowPrimaryAction(recommendedStep.key)}>
-                        {recommendedStep.actionText}
-                      </Button>
+              <section className="command-center">
+                {recommendedStep && (
+                  <div className={onRecommendedTab ? "next-step-bar is-current" : "next-step-bar"}>
+                    <div className="next-step-main">
+                      <span className="next-step-eyebrow">{onRecommendedTab ? "当前步骤" : "下一步"}</span>
+                      <Text strong className="next-step-title">
+                        {recommendedStep.title}
+                      </Text>
+                      <Text type="secondary" className="next-step-reason">
+                        {recommendedPreflightCheck ? recommendedPreflightCheck.message : recommendedStep.reason}
+                      </Text>
                     </div>
-                  )}
-                  {(sectionQualitySummary || loadingSectionQuality) && (
-                    <section className={`section-quality-strip ${sectionQualitySummary?.status ?? "loading"}`}>
-                      <div className="section-quality-main">
-                        <Space wrap>
-                          <Text strong>标书质量体检</Text>
-                          <Tag color={sectionQualityStatusColor(sectionQualitySummary?.status ?? "pass")}>
-                            {sectionQualitySummary
-                              ? sectionQualitySummary.status_label || sectionQualityStatusLabel(sectionQualitySummary.status)
-                              : "加载中"}
-                          </Tag>
-                          {sectionQualitySummary?.export_preview.submission_allowed === false && (
-                            <Tag color="red">正式版不可导出</Tag>
-                          )}
-                        </Space>
-                        <Text type="secondary">
-                          {sectionQualitySummary?.summary ?? "正在汇总覆盖、报价、草稿事实和导出材料状态。"}
-                        </Text>
-                        {sectionQualitySummary && (
-                          <div className="section-quality-tags">
-                            <Tag color="red">
-                              阻断 {sectionQualitySummary.checks.filter((check) => check.status === "block").length}
-                            </Tag>
-                            <Tag color="gold">
-                              复核 {sectionQualitySummary.checks.filter((check) => check.status === "warn").length}
-                            </Tag>
-                            <Tag color="blue">
-                              评分索引 {summaryNumber(sectionQualitySummary.export_preview, "scoring_index_count")}
-                            </Tag>
-                            <Tag color="blue">
-                              占位 {summaryNumber(sectionQualitySummary.export_preview, "placeholder_count")}
-                            </Tag>
-                            <Tag color="green">
-                              材料 {summaryNumber(sectionQualitySummary.material_summary, "embeddable_count")}/
-                              {summaryNumber(sectionQualitySummary.material_summary, "selected_count")}
-                            </Tag>
-                          </div>
-                        )}
-                      </div>
-                      <Space wrap>
+                    <div className="next-step-actions">
+                      {onRecommendedTab ? (
+                        <Tag color={workflowStatusColor(recommendedStep.status)}>{recommendedStep.statusText}</Tag>
+                      ) : (
                         <Button
-                          size="small"
-                          loading={loadingSectionQuality}
-                          onClick={() => void reloadSectionQualitySummary()}
+                          type="primary"
+                          className="next-step-button"
+                          onClick={() => runWorkflowPrimaryAction(recommendedStep.key)}
                         >
-                          刷新体检
+                          {recommendedStep.actionText}
                         </Button>
-                        <Button size="small" onClick={() => activateWorkflowStep("documents")}>
-                          去导出
-                        </Button>
-                      </Space>
-                    </section>
-                  )}
-                  <div className="workflow-steps" aria-label="项目简化流程">
+                      )}
+                      {followingStep ? (
+                        <button
+                          type="button"
+                          className="next-step-after"
+                          onClick={() => activateWorkflowStep(followingStep.targetKey)}
+                          disabled={followingStep.disabled}
+                          title={
+                            followingStep.disabled
+                              ? followingStep.disabledReason ?? "完成当前步骤后解锁"
+                              : `前往「${followingStep.title}」`
+                          }
+                        >
+                          完成后 <span aria-hidden>→</span> <strong>{followingStep.title}</strong>
+                        </button>
+                      ) : (
+                        <span className="next-step-after is-final">完成后即可导出投标素材包</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="workflow-steps cc-rail" aria-label="项目简化流程">
                     {simpleWorkflowSteps.map((step, index) => (
                       <Tooltip
                         key={step.key}
@@ -1158,81 +1095,173 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                     ))}
                   </div>
 
-                  {currentProject && currentSection && missingKeyInfo.length > 0 && (
-                    <section className="key-info-panel">
-                      <div className="key-info-header">
-                        <Space wrap>
-                          <Text strong>项目关键信息</Text>
-                          {missingKeyInfo.length ? (
-                            <Tag color="orange">缺失 {missingKeyInfo.join("、")}</Tag>
-                          ) : (
-                            <Tag color="green">关键字段已填写</Tag>
-                          )}
-                        </Space>
-                        <Button size="small" onClick={openKeyInfoModal}>
-                          编辑/确认
-                        </Button>
-                      </div>
-                      <div className="key-info-grid">
-                        <div>
-                          <Text type="secondary">招标人</Text>
-                          <strong>{currentProject.purchaser || "未填写"}</strong>
-                        </div>
-                        <div>
-                          <Text type="secondary">预算/限价</Text>
-                          <strong>{currentSection.budget_amount || currentProject.budget_amount || "未填写"}</strong>
-                        </div>
-                        <div>
-                          <Text type="secondary">投标截止</Text>
-                          <strong>{formatDateTime(currentSection.bid_deadline_at ?? currentProject.bid_deadline_at)}</strong>
-                        </div>
-                        <div>
-                          <Text type="secondary">地区/行业</Text>
-                          <strong>{[currentProject.region_code, currentProject.industry_code].filter(Boolean).join(" / ") || "未填写"}</strong>
-                        </div>
-                      </div>
-                    </section>
-                  )}
+                  <div className="cc-overview-line">
+                    <div className="cc-chips">
+                      <span className="cc-chip">
+                        <span className="cc-chip-label">待确认</span>
+                        <strong>{unresolvedMatrixRows.length || knownPendingMatrixCount}</strong>
+                      </span>
+                      <span className="cc-chip is-risk">
+                        <span className="cc-chip-label">高风险</span>
+                        <strong>{unresolvedHighRiskRows.length || highRiskTotal}</strong>
+                      </span>
+                      <span className="cc-chip is-warn">
+                        <span className="cc-chip-label">缺项</span>
+                        <strong>{needsMaterialCount}</strong>
+                      </span>
+                      {mvp13DraftWorkflowAvailable && approvalPendingCount > 0 && (
+                        <span className="cc-chip">
+                          <span className="cc-chip-label">待审批</span>
+                          <strong>{approvalPendingCount}</strong>
+                        </span>
+                      )}
+                      {sectionQualityStatus && sectionQualityStatus !== "pass" && (
+                        <Tag color={sectionQualityStatusColor(sectionQualityStatus)}>
+                          质检·{sectionQualitySummary?.status_label || sectionQualityStatusLabel(sectionQualityStatus)}
+                        </Tag>
+                      )}
+                      {submissionBlocked && <Tag color="red">正式版不可导出</Tag>}
+                      {currentProject && currentSection && missingKeyInfo.length > 0 && (
+                        <Tag color="orange">关键信息缺 {missingKeyInfo.length}</Tag>
+                      )}
+                    </div>
+                    <Button
+                      type="text"
+                      size="small"
+                      className="cc-overview-toggle"
+                      aria-expanded={commandDetailsOpen}
+                      onClick={() => setCommandDetailsOpen((value) => !value)}
+                    >
+                      {commandDetailsOpen
+                        ? "收起概览"
+                        : hasCommandTodos
+                          ? `项目概览 · 待办 ${commandTodoActions.length}`
+                          : "项目概览"}
+                    </Button>
+                  </div>
 
-                  <section className="status-grid">
-                    <div className="metric-item">
-                      <Text type="secondary">合规项</Text>
-                      <strong>{currentSection?.compliance_item_count ?? matrixRows.length}</strong>
-                      <Text type="secondary">{unresolvedMatrixRows.length ? `${unresolvedMatrixRows.length} 条待确认` : "已全部确认"}</Text>
-                    </div>
-                    <div className="metric-item">
-                      <Text type="secondary">缺项</Text>
-                      <strong>{matrixRows.filter((row) => row.statusCode === "needs_material").length}</strong>
-                      <Text type="secondary">需要补资料或说明</Text>
-                    </div>
-	                    <div className="metric-item">
-	                      <Text type="secondary">已确认</Text>
-	                      <strong>{matrixRows.length ? matrixRows.filter((row) => row.statusCode === "confirmed").length : knownConfirmedMatrixCount}</strong>
-	                      <Text type="secondary">人工核对完成</Text>
-	                    </div>
-                    <div className="metric-item">
-                      <Text type="secondary">高风险</Text>
-                      <strong>{currentSection?.high_risk_count ?? 0}</strong>
-                      <Text type="secondary">{unresolvedHighRiskRows.length ? `${unresolvedHighRiskRows.length} 条待处理` : "暂无待处理"}</Text>
-                    </div>
-                    <div className="metric-item approval-metric">
-                      <Text type="secondary">{mvp13DraftWorkflowAvailable ? "待审批" : "投标素材包"}</Text>
-                      <strong>
-                        {mvp13DraftWorkflowAvailable
-                          ? approvalTasks.filter((task) => task.status === "pending").length
-                          : activeContextPack
-                            ? 1
-                            : 0}
-                      </strong>
-                      <Button size="small" onClick={() => activateWorkflowStep(mvp13DraftWorkflowAvailable ? "tasks" : "chapter")}>
-                        {mvp13DraftWorkflowAvailable ? "进入任务中心" : "查看投标素材包"}
-                      </Button>
-                    </div>
-                  </section>
-                </div>
+                  {commandDetailsOpen && (
+                    <div className="cc-overview-panel">
+                      <div className="cc-metric-grid">
+                        <div className="cc-metric">
+                          <span className="cc-metric-label">合规项</span>
+                          <strong>{complianceTotal}</strong>
+                          <span className="cc-metric-sub">
+                            {unresolvedMatrixRows.length ? `${unresolvedMatrixRows.length} 待确认` : "已全部确认"}
+                          </span>
+                        </div>
+                        <div className="cc-metric">
+                          <span className="cc-metric-label">缺项</span>
+                          <strong className={needsMaterialCount ? "is-warn" : ""}>{needsMaterialCount}</strong>
+                          <span className="cc-metric-sub">需补资料/说明</span>
+                        </div>
+                        <div className="cc-metric">
+                          <span className="cc-metric-label">已确认</span>
+                          <strong>{confirmedCount}</strong>
+                          <span className="cc-metric-sub">人工核对完成</span>
+                        </div>
+                        <div className="cc-metric">
+                          <span className="cc-metric-label">高风险</span>
+                          <strong className={highRiskTotal ? "is-risk" : ""}>{highRiskTotal}</strong>
+                          <span className="cc-metric-sub">
+                            {unresolvedHighRiskRows.length ? `${unresolvedHighRiskRows.length} 待处理` : "暂无待处理"}
+                          </span>
+                        </div>
+                        <div className="cc-metric">
+                          <span className="cc-metric-label">{mvp13DraftWorkflowAvailable ? "待审批" : "素材包"}</span>
+                          <strong>{approvalPendingCount}</strong>
+                          <span className="cc-metric-sub">{mvp13DraftWorkflowAvailable ? "审批任务" : "投标素材包"}</span>
+                        </div>
+                      </div>
 
-                {(preflightCheck || sectionQualitySummary) && (
-                  <div className="preflight-panel">
+                      {currentProject && currentSection && (
+                        <section className="key-info-panel">
+                          <div className="key-info-header">
+                            <Space wrap>
+                              <Text strong>项目关键信息</Text>
+                              {missingKeyInfo.length ? (
+                                <Tag color="orange">缺失 {missingKeyInfo.join("、")}</Tag>
+                              ) : (
+                                <Tag color="green">关键字段已填写</Tag>
+                              )}
+                            </Space>
+                            <Button size="small" onClick={openKeyInfoModal}>
+                              编辑/确认
+                            </Button>
+                          </div>
+                          <div className="key-info-grid">
+                            <div>
+                              <Text type="secondary">招标人</Text>
+                              <strong>{currentProject.purchaser || "未填写"}</strong>
+                            </div>
+                            <div>
+                              <Text type="secondary">预算/限价</Text>
+                              <strong>{currentSection.budget_amount || currentProject.budget_amount || "未填写"}</strong>
+                            </div>
+                            <div>
+                              <Text type="secondary">投标截止</Text>
+                              <strong>{formatDateTime(currentSection.bid_deadline_at ?? currentProject.bid_deadline_at)}</strong>
+                            </div>
+                            <div>
+                              <Text type="secondary">地区/行业</Text>
+                              <strong>{[currentProject.region_code, currentProject.industry_code].filter(Boolean).join(" / ") || "未填写"}</strong>
+                            </div>
+                          </div>
+                        </section>
+                      )}
+
+                      {(sectionQualitySummary || loadingSectionQuality) && (
+                        <section className={`section-quality-strip ${sectionQualitySummary?.status ?? "loading"}`}>
+                          <div className="section-quality-main">
+                            <Space wrap>
+                              <Text strong>标书质量体检</Text>
+                              <Tag color={sectionQualityStatusColor(sectionQualitySummary?.status ?? "pass")}>
+                                {sectionQualitySummary
+                                  ? sectionQualitySummary.status_label || sectionQualityStatusLabel(sectionQualitySummary.status)
+                                  : "加载中"}
+                              </Tag>
+                              {submissionBlocked && <Tag color="red">正式版不可导出</Tag>}
+                            </Space>
+                            <Text type="secondary">
+                              {sectionQualitySummary?.summary ?? "正在汇总覆盖、报价、草稿事实和导出材料状态。"}
+                            </Text>
+                            {sectionQualitySummary && (
+                              <div className="section-quality-tags">
+                                <Tag color="red">
+                                  阻断 {sectionQualitySummary.checks.filter((check) => check.status === "block").length}
+                                </Tag>
+                                <Tag color="gold">
+                                  复核 {sectionQualitySummary.checks.filter((check) => check.status === "warn").length}
+                                </Tag>
+                                <Tag color="blue">
+                                  评分索引 {summaryNumber(sectionQualitySummary.export_preview, "scoring_index_count")}
+                                </Tag>
+                                <Tag color="blue">
+                                  占位 {summaryNumber(sectionQualitySummary.export_preview, "placeholder_count")}
+                                </Tag>
+                                <Tag color="green">
+                                  材料 {summaryNumber(sectionQualitySummary.material_summary, "embeddable_count")}/
+                                  {summaryNumber(sectionQualitySummary.material_summary, "selected_count")}
+                                </Tag>
+                              </div>
+                            )}
+                          </div>
+                          <Space wrap>
+                            <Button
+                              size="small"
+                              loading={loadingSectionQuality}
+                              onClick={() => void reloadSectionQualitySummary()}
+                            >
+                              刷新体检
+                            </Button>
+                            <Button size="small" onClick={() => activateWorkflowStep("documents")}>
+                              去导出
+                            </Button>
+                          </Space>
+                        </section>
+                      )}
+                      {hasCommandTodos && (
+                        <div className="preflight-panel">
                     <div className="preflight-header">
                       <Space wrap>
                         <Text strong>待办队列</Text>
@@ -1241,45 +1270,39 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                         </Tag>
                         {preflightCheck?.matrix_outdated && <Tag color="red">矩阵已过期</Tag>}
                       </Space>
-                      <Text type="secondary">
-                        {projectTodoActions.length
-                          ? "默认突出最关键 3 项；点击进入对应页面。"
-                          : preflightCheck?.summary ?? sectionQualitySummary?.summary ?? "暂无阻断或需复核待办。"}
-                      </Text>
+                      <Text type="secondary">除“下一步”外的阻断/复核项；点击进入对应页面。</Text>
                     </div>
                     <div className="preflight-checks">
-                      {visibleProjectTodoActions.length ? (
-                        visibleProjectTodoActions.map((item) => (
-                          <button
-                            key={item.key}
-                            className={`preflight-check ${item.status}`}
-                            onClick={() => handleProjectTodoAction(item)}
-                          >
-                            <div className="project-todo-labels">
-                              <Tag color={preflightColor(item.status)}>{item.sourceLabel}</Tag>
-                              <Tag>{item.title}</Tag>
-                            </div>
-                            <strong>{item.count > 0 ? item.count : preflightLabel(item.status)}</strong>
-                            <span>{item.message}</span>
-                            <span className="preflight-action-text">{item.actionLabel}</span>
-                          </button>
-                        ))
-                      ) : (
-                        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无阻断或需复核待办" />
-                      )}
+                      {visibleCommandTodoActions.map((item) => (
+                        <button
+                          key={item.key}
+                          className={`preflight-check ${item.status}`}
+                          onClick={() => handleProjectTodoAction(item)}
+                        >
+                          <div className="project-todo-labels">
+                            <Tag color={preflightColor(item.status)}>{item.sourceLabel}</Tag>
+                            <Tag>{item.title}</Tag>
+                          </div>
+                          <strong>{item.count > 0 ? item.count : preflightLabel(item.status)}</strong>
+                          <span>{item.message}</span>
+                          <span className="preflight-action-text">{item.actionLabel}</span>
+                        </button>
+                      ))}
                     </div>
-                    {projectTodoActions.length > 3 && (
+                    {commandTodoActions.length > 3 && (
                       <Button
                         type="text"
                         size="small"
                         className="preflight-expand-button"
                         onClick={() => setTodoExpanded((value) => !value)}
                       >
-                        {todoExpanded ? "收起待办" : `展开全部（还有 ${hiddenProjectTodoActionCount} 项）`}
+                        {todoExpanded ? "收起待办" : `展开全部（还有 ${hiddenCommandTodoCount} 项）`}
                       </Button>
-                    )}
-                  </div>
-                )}
+                        )}
+                        </div>
+                      )}
+                    </div>
+                  )}
               </section>
 
               <Tabs
@@ -1351,7 +1374,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                     <Avatar icon={<RobotOutlined />} className="assistant-avatar" />
                     <div>
                       <Text strong>流程助手</Text>
-                      <div className="assistant-subtitle">按当前阻断项提示下一步</div>
+                      <div className="assistant-subtitle">操作日志与流程备注</div>
                     </div>
                   </Space>
                 )}
@@ -1378,19 +1401,6 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
               ) : (
                 <>
                   <div className="assistant-feed">
-                    {recommendedStep && (
-                      <div className="assistant-message primary-next">
-                        <div className="message-title-row">
-                          <Text strong>当前建议：{recommendedStep.title}</Text>
-                          <Tag color={workflowStatusColor(recommendedStep.status)}>{recommendedStep.statusText}</Tag>
-                        </div>
-                        <p>{recommendedStep.reason}</p>
-                        <Button type="primary" onClick={() => runWorkflowPrimaryAction(recommendedStep.key)}>
-                          {recommendedStep.actionText}
-                        </Button>
-                      </div>
-                    )}
-
                     {!focusQualityAssistant && (
                       <div className="quick-prompts compact">
                         {quickPrompts.map((prompt) => (

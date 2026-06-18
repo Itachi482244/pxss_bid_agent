@@ -36,6 +36,8 @@ export function QualityTab({ app }: { app: BidAppController }) {
     auditContentText,
     auditLogs,
     AuditOutlined,
+    autoResolveActive,
+    autoResolveResult,
     Avatar,
     Badge,
     BarChartOutlined,
@@ -217,6 +219,7 @@ export function QualityTab({ app }: { app: BidAppController }) {
     handleApplyDirectives,
     handleApplyOutline,
     handleApplySimilarCandidates,
+    handleAutoResolveMatrix,
     handleAssignItem,
     handleAssistantMessageAction,
     handleBatchAssign,
@@ -808,6 +811,74 @@ export function QualityTab({ app }: { app: BidAppController }) {
     workflowSteps
   } = app;
 
+  // Agent 自动复检后仍未解决 → 进入“转人工”状态，展示手动处理入口。
+  const autoHandedToManual = Boolean(autoResolveResult && !autoResolveResult.resolved);
+
+  // 质量报告里后端落下的自动处理痕迹（刷新/重进后仍可见，作为本会话 autoResolveResult 的兜底）。
+  const reportSummary = (extractionQualityReport?.summary_json ?? {}) as Record<string, unknown>;
+  const reportAutoResolved =
+    reportSummary.auto_resolve === true && extractionQualityReport?.status === "passed";
+  const reportRound = typeof reportSummary.round === "number" ? reportSummary.round : null;
+  const reportReextractedSections = Array.isArray(reportSummary.reextracted_sections)
+    ? (reportSummary.reextracted_sections as unknown[]).filter((value): value is string => typeof value === "string")
+    : [];
+
+  // Agent 处理日志（含每一轮策略/涉及章节/结果），通过与未通过都展示，保留可追溯的处理过程。
+  const autoResolveReport = autoResolveResult ? (
+    <div
+      className={`auto-resolve-report ${
+        autoResolveResult.resolved ? "auto-resolve-report-ok" : "auto-resolve-report-warn"
+      }`}
+    >
+      <div className="auto-resolve-report-head">
+        <Tag color={autoResolveResult.resolved ? "green" : "orange"}>
+          {autoResolveResult.resolved ? "已解决" : "仍有阻断"}
+        </Tag>
+        <Text strong>Agent 自动处理报告 · 共 {autoResolveResult.round_count} 轮</Text>
+      </div>
+      <ol className="auto-resolve-rounds">
+        {autoResolveResult.rounds.map((round) => (
+          <li key={round.round}>
+            <Tag color={round.strategy === "replan_regen" ? "purple" : "blue"}>
+              {round.strategy === "replan_regen" ? "重排重抽" : "定向重抽"}
+            </Tag>
+            <span className="auto-resolve-round-reason">{round.reason}</span>
+            {round.reextracted_sections && round.reextracted_sections.length > 0 && (
+              <span className="auto-resolve-round-sections">涉及：{round.reextracted_sections.join("、")}</span>
+            )}
+            <Tag color={round.resolved ? "green" : "default"}>{round.resolved ? "本轮通过" : "未通过"}</Tag>
+          </li>
+        ))}
+      </ol>
+      {!autoResolveResult.resolved && autoResolveResult.remaining_issues.length > 0 && (
+        <div className="auto-resolve-remaining">
+          <Text type="secondary">
+            仍剩 {autoResolveResult.remaining_count} 处需人工确认，详见下方“原文定位与逐条明细”：
+          </Text>
+          <ul>
+            {autoResolveResult.remaining_issues.slice(0, 5).map((issue, index) => (
+              <li key={`${issue.code}-${issue.section_id ?? "unknown"}-${index}`}>
+                <Tag color={qualityIssueSeverityColor(issue.severity)}>{issue.severity}</Tag>
+                <span className="quality-recommendation-issue-where">{issue.section_title ?? "未定位章节"}</span>
+                <span className="quality-recommendation-issue-msg">{issue.message}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  ) : reportAutoResolved ? (
+    <div className="auto-resolve-report auto-resolve-report-ok">
+      <div className="auto-resolve-report-head">
+        <Tag color="green">已解决</Tag>
+        <Text strong>本次质量门禁由 Agent 自动处理通过{reportRound ? ` · 第 ${reportRound} 轮` : ""}</Text>
+      </div>
+      {reportReextractedSections.length > 0 && (
+        <div className="auto-resolve-round-sections">定向重抽章节：{reportReextractedSections.join("、")}</div>
+      )}
+    </div>
+  ) : null;
+
   return (
                       <div className="workspace-panel quality-gate-panel">
                         <div className="tab-intro">
@@ -815,7 +886,9 @@ export function QualityTab({ app }: { app: BidAppController }) {
                             <Text strong>{extractionBlocked ? "处理质量门禁" : "抽取质量门禁"}</Text>
                             <p>
                               {extractionBlocked
-                                ? "系统已拦截本轮生成结果，按建议重新生成即可。"
+                                ? autoHandedToManual
+                                  ? "Agent 自动处理已达上限，仍有阻断项，请人工处理。"
+                                  : "已检测到阻断项，Agent 正在自动处理，无需手动操作。"
                                 : "生成矩阵时自动检查章节规划、来源回链和关键条款覆盖。"}
                             </p>
                           </div>
@@ -841,63 +914,124 @@ export function QualityTab({ app }: { app: BidAppController }) {
                             }
                           />
                         ) : extractionQualityReport.status === "passed" ? (
-                          <Alert
-                            type="success"
-                            showIcon
-                            message="质量门禁已通过"
-                            description={
-                              <Space direction="vertical" size={8}>
-                                <Text>最近一次抽取未发现阻断项，可以继续处理合规矩阵。</Text>
-                                <Button type="primary" icon={<FileSearchOutlined />} onClick={() => activateWorkflowStep("matrix")}>
-                                  进入合规矩阵
-                                </Button>
-                              </Space>
-                            }
-                          />
+                          <>
+                            <Alert
+                              type="success"
+                              showIcon
+                              message="质量门禁已通过"
+                              description={
+                                <Space direction="vertical" size={8}>
+                                  <Text>
+                                    {autoResolveReport
+                                      ? "Agent 已自动处理并复检通过，处理过程见下方日志，可继续处理合规矩阵。"
+                                      : "最近一次抽取未发现阻断项，可以继续处理合规矩阵。"}
+                                  </Text>
+                                  <Button type="primary" icon={<FileSearchOutlined />} onClick={() => activateWorkflowStep("matrix")}>
+                                    进入合规矩阵
+                                  </Button>
+                                </Space>
+                              }
+                            />
+                            {autoResolveReport}
+                          </>
                         ) : (
                           <>
                             <div className="quality-recommendation-card">
                               <div className="quality-recommendation-main">
                                 <span className="quality-recommendation-icon">
-                                  <WarningOutlined />
+                                  {autoHandedToManual ? <WarningOutlined /> : <RobotOutlined />}
                                 </span>
                                 <div>
-                                  <Text strong>现在只需要做一件事</Text>
+                                  <Text strong>
+                                    {autoHandedToManual ? "Agent 已尽力，仍需人工处理" : "Agent 正在自动处理阻断项"}
+                                  </Text>
                                   <p>
-                                    点击“按建议处理”，系统会用已补齐的漏抽规则重新生成全量矩阵。通过后再回到矩阵审阅。
+                                    {autoHandedToManual
+                                      ? `Agent 自动复检 ${autoResolveResult?.round_count ?? 0} 轮后仍有 ${
+                                          autoResolveResult?.remaining_count ?? extractionQualityIssueCount
+                                        } 处无法自动消除，请用下面的方式人工处理；人工已确认/编辑过的条目全程受保护。`
+                                      : "已检测到阻断项，Agent 自动接手：漏抽集中在个别章节就只定向重抽这几段，存在结构性问题则重排章节后整体重抽，并自动复检收敛（最多 2 轮）。无需手动操作，完成后会在下方给出明细报告；仍有阻断时再交还你处理。"}
                                   </p>
                                 </div>
                               </div>
-                              <div className="quality-recommendation-actions">
-                                <Button
-                                  type="primary"
-                                  icon={<RobotOutlined />}
-                                  loading={loadingMatrix || matrixTaskActive}
-                                  disabled={matrixTaskActive}
-                                  onClick={() => handleGenerateMatrix(reviewDocument)}
-                                >
-                                  {matrixTaskActive ? "正在重新生成" : "按建议处理"}
-                                </Button>
-                                <Button
-                                  icon={<FileSearchOutlined />}
-                                  disabled={!matrixRows.length}
-                                  onClick={() => activateWorkflowStep("matrix")}
-                                >
-                                  查看上一版矩阵
-                                </Button>
-                              </div>
+                              {extractionQualityIssues.length > 0 && (
+                                <div className="quality-recommendation-issues">
+                                  <div className="quality-recommendation-issues-label">
+                                    {autoHandedToManual
+                                      ? `仍需人工处理以下 ${extractionQualityIssueCount} 处：`
+                                      : `Agent 正在重点补抽以下 ${extractionQualityIssueCount} 处：`}
+                                  </div>
+                                  <ul>
+                                    {extractionQualityIssues.slice(0, 3).map((issue, index) => (
+                                      <li key={`${issue.code}-${issue.section_id ?? "unknown"}-${index}`}>
+                                        <Tag color={qualityIssueSeverityColor(issue.severity)}>{issue.severity}</Tag>
+                                        <span className="quality-recommendation-issue-where">
+                                          {issue.section_title ??
+                                            semanticSections.find((section) => section.id === issue.section_id)?.title ??
+                                            "未定位章节"}
+                                        </span>
+                                        <span className="quality-recommendation-issue-msg">{issue.message}</span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                  {extractionQualityIssues.length > 3 && (
+                                    <Text type="secondary" className="quality-recommendation-issues-more">
+                                      还有 {extractionQualityIssues.length - 3} 处，展开下方“原文定位与逐条明细”查看。
+                                    </Text>
+                                  )}
+                                </div>
+                              )}
+                              {autoHandedToManual ? (
+                                <div className="quality-recommendation-actions">
+                                  <Button
+                                    type="primary"
+                                    icon={<RobotOutlined />}
+                                    loading={loadingMatrix || matrixTaskActive}
+                                    disabled={autoResolveActive || matrixTaskActive}
+                                    onClick={() => handleGenerateMatrix(reviewDocument)}
+                                  >
+                                    {matrixTaskActive ? "正在整体重抽" : "整体重抽（手动）"}
+                                  </Button>
+                                  <Button
+                                    icon={<RobotOutlined />}
+                                    loading={autoResolveActive}
+                                    disabled={autoResolveActive || matrixTaskActive}
+                                    onClick={() => handleAutoResolveMatrix(reviewDocument)}
+                                  >
+                                    {autoResolveActive ? "Agent 处理中…" : "让 Agent 再试一次"}
+                                  </Button>
+                                  <Button
+                                    icon={<FileSearchOutlined />}
+                                    disabled={!matrixRows.length}
+                                    onClick={() => activateWorkflowStep("matrix")}
+                                  >
+                                    查看上一版矩阵
+                                  </Button>
+                                </div>
+                              ) : (
+                                <div className="quality-auto-running">
+                                  <Spin />
+                                  <Text type="secondary">
+                                    {autoResolveActive
+                                      ? "Agent 正在自动处理中，可切换页面继续其它工作，完成后这里会自动更新…"
+                                      : "正在唤起 Agent 自动处理…"}
+                                  </Text>
+                                </div>
+                              )}
                               <div className="quality-safety-notes">
+                                <span>人工确认项受保护</span>
                                 <span>失败结果未写入</span>
                                 <span>上一版矩阵保留</span>
                                 <span>{extractionQualityIssueCount} 个阻断会重新校验</span>
                               </div>
                             </div>
+                            {autoResolveReport}
                             <details className="quality-details">
-                              <summary>技术诊断（可选）：查看 {extractionQualityIssueCount} 个阻断</summary>
+                              <summary>原文定位与逐条明细：{extractionQualityIssueCount} 处漏抽</summary>
                               <div className="quality-detail-intro">
                                 <Text strong>系统定位到的漏抽位置</Text>
                                 <p>
-                                  这些内容只用于核查原因。正常处理时不需要逐条操作，直接使用上方“按建议处理”即可。
+                                  下面是每处漏抽的原文定位与原因，便于你核对。Agent 会自动整体/定向重抽；若已转人工，也可对单处点“只重抽这一段”。
                                 </p>
                               </div>
                               <Spin spinning={loadingQualityChunks}>

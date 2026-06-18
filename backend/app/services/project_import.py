@@ -30,6 +30,7 @@ from app.parsers.html import html_bytes_to_text, parse_html_bytes
 from app.parsers.pdf import parse_pdf_bytes
 from app.parsers.word import parse_docx_bytes
 from app.services.compliance_generation import execute_compliance_matrix_generation_task
+from app.services.document_conversion import convert_legacy_doc_to_docx
 from app.services.document_parse import execute_document_parse_task
 from app.services.document_utils import file_extension, infer_parser_type, safe_filename
 from app.services.file_acquisition import fetch_public_file
@@ -297,7 +298,8 @@ def extract_project_draft(text: str, *, fallback_name: str, source_url: str | No
 def _text_from_source(data: bytes, *, filename: str, content_type: str | None) -> str:
     ext = file_extension(filename)
     if ext == "doc":
-        return ""
+        data = convert_legacy_doc_to_docx(data, filename=filename)
+        return "\n".join(chunk.content_text for chunk in parse_docx_bytes(data))
     if ext == "docx":
         return "\n".join(chunk.content_text for chunk in parse_docx_bytes(data))
     if ext == "pdf":
@@ -855,4 +857,53 @@ def execute_import_processing_background(
         else:
             project.status = "pending_files"
             section.status = "pending_files"
+            if matrix_task_id is not None:
+                _fail_matrix_task_due_to_parse_failure(
+                    db,
+                    matrix_task_id=matrix_task_id,
+                    parse_task=task,
+                )
             db.commit()
+
+
+def _fail_matrix_task_due_to_parse_failure(
+    db: Session,
+    *,
+    matrix_task_id: uuid.UUID,
+    parse_task: AsyncTask,
+) -> None:
+    matrix_task = db.get(AsyncTask, matrix_task_id)
+    if matrix_task is None or matrix_task.status in {"succeeded", "failed", "canceled"}:
+        return
+
+    reason = parse_task.error_message or parse_task.error_code or "未知解析错误"
+    now = datetime.now(UTC)
+    matrix_task.status = "failed"
+    matrix_task.progress = 100
+    matrix_task.error_code = "TENDER_PARSE_FAILED"
+    matrix_task.error_message = f"招标文件解析失败，矩阵生成未执行：{reason}"
+    matrix_task.finished_at = now
+    matrix_task.output_json = {
+        **(matrix_task.output_json or {}),
+        "blocked_by_task_id": str(parse_task.id),
+        "blocked_by_error_code": parse_task.error_code,
+    }
+    db.add(
+        AuditLog(
+            tenant_id=matrix_task.tenant_id,
+            project_id=matrix_task.project_id,
+            section_id=matrix_task.section_id,
+            actor_user_id=matrix_task.created_by,
+            actor_type="worker",
+            action="compliance.matrix_generate_failed",
+            object_type="async_task",
+            object_id=matrix_task.id,
+            after_json={
+                "error_code": matrix_task.error_code,
+                "error_message": matrix_task.error_message,
+                "blocked_by_task_id": str(parse_task.id),
+            },
+            reason="招标文件解析失败，矩阵生成未执行",
+            severity="warning",
+        )
+    )

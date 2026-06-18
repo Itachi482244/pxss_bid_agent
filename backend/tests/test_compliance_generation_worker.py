@@ -1952,6 +1952,141 @@ def test_compliance_matrix_generation_creates_items_from_word_chunks(monkeypatch
     assert blocked_bulk_response.status_code == 409
 
 
+def test_matrix_generation_keeps_candidates_when_coverage_review_blocks(monkeypatch) -> None:
+    settings.run_tasks_inline = False
+    monkeypatch.setattr(settings, "llm_provider", "mock")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+
+    def fake_chat_completion(db, **kwargs):  # noqa: ANN001, ARG001
+        prompt_version = kwargs["prompt_version"]
+        if prompt_version == "document_section_plan@1.1.0":
+            user_content = kwargs["messages"][-1]["content"]
+            pages = json.loads(user_content.rsplit("pages:\n", 1)[1])
+            content = {
+                "sections": [
+                    {
+                        "section_index": 1,
+                        "title": "资格要求",
+                        "section_type": "announcement",
+                        "start_page": 1,
+                        "end_page": max(page["page_no"] for page in pages),
+                        "confidence_score": 0.9,
+                        "evidence": "覆盖全部测试分块。",
+                    }
+                ]
+            }
+        elif prompt_version == "compliance_extract_by_section@1.1.0":
+            user_content = kwargs["messages"][-1]["content"]
+            chunks = json.loads(user_content.rsplit("chunks:\n", 1)[1])
+            chunk = next(item for item in chunks if (item.get("text") or "").strip())
+            source_quote = " ".join((chunk.get("text") or "").split())[:80]
+            content = {
+                "items": [
+                    {
+                        "source_chunk_index": chunk["chunk_index"],
+                        "item_type": "qualification",
+                        "requirement_text": f"覆盖复核测试合规要求：{source_quote}",
+                        "normalized_requirement": f"coverage_blocked_requirement_{chunk['chunk_index']}",
+                        "response_suggestion": "按来源条款准备响应材料。",
+                        "risk_level": "high",
+                        "is_mandatory": True,
+                        "source_quote": source_quote,
+                        "confidence_score": 0.92,
+                    }
+                ]
+            }
+        elif prompt_version == "section_coverage_review@1.1.0":
+            content = {
+                "status": "blocked",
+                "issues": [
+                    {
+                        "severity": "high",
+                        "code": "COVERAGE_REVIEW_ISSUE",
+                        "message": "疑似漏抽投标保证金要求，需人工复核。",
+                        "source_chunk_index": 1,
+                    }
+                ],
+            }
+        else:
+            raise AssertionError(prompt_version)
+        return SimpleNamespace(
+            content=json.dumps(content, ensure_ascii=False),
+            provider="fake",
+            model_name="unit-test",
+            log_id=None,
+            usage={},
+        )
+
+    monkeypatch.setattr("app.services.compliance_generation.chat_completion", fake_chat_completion)
+
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    filename = f"覆盖复核阻断-{uuid4().hex}.docx"
+    upload_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/upload",
+        data={"doc_type": "tender", "title": "覆盖复核阻断测试"},
+        files={
+            "file": (
+                filename,
+                build_qualification_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert upload_response.status_code == 201
+    document = upload_response.json()
+
+    parse_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document['id']}/parse-tasks",
+        json={"parser_name": "word-parser", "parser_version": "0.1.0"},
+    )
+    with SessionLocal() as db:
+        assert execute_document_parse_task(db, UUID(parse_response.json()["task"]["id"]))["status"] == "succeeded"
+
+    generate_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/generate",
+        json={"document_version_id": document["current_version_id"], "force": True},
+    )
+    assert generate_response.status_code == 202
+
+    with SessionLocal() as db:
+        task = db.get(AsyncTask, UUID(generate_response.json()["id"]))
+        assert task is not None
+        task.error_code = "COVERAGE_REVIEW_ISSUE"
+        task.error_message = "旧失败信息应在重跑成功后清空"
+        db.commit()
+
+        result = execute_compliance_matrix_generation_task(db, UUID(generate_response.json()["id"]))
+        assert result["status"] == "succeeded"
+
+        task = db.get(AsyncTask, UUID(generate_response.json()["id"]))
+        assert task is not None
+        assert task.status == "succeeded"
+        assert task.error_code is None
+        assert task.error_message is None
+        assert task.output_json is not None
+        assert task.output_json["created_count"] >= 1
+        assert task.output_json["quality_report_status"] == "blocked"
+        assert task.output_json["quality_high_issue_count"] >= 1
+
+        items = db.scalars(
+            select(ComplianceItem).where(
+                ComplianceItem.source_version_id == UUID(document["current_version_id"]),
+                ComplianceItem.deleted_at.is_(None),
+            )
+        ).all()
+        assert any("覆盖复核测试合规要求" in item.requirement_text for item in items)
+
+        report = db.scalar(
+            select(DocumentExtractionQualityReport)
+            .where(DocumentExtractionQualityReport.task_id == UUID(generate_response.json()["id"]))
+            .order_by(DocumentExtractionQualityReport.created_at.desc())
+        )
+        assert report is not None
+        assert report.status == "blocked"
+        assert report.issues_json[0]["code"] == "COVERAGE_REVIEW_ISSUE"
+
+
 def test_compliance_matrix_generation_uses_fork_join_for_semantic_sections(monkeypatch) -> None:
     settings.run_tasks_inline = False
     monkeypatch.setattr(settings, "llm_provider", "mock")

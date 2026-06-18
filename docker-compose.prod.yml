@@ -71,10 +71,49 @@ services:
       mc anonymous set none local/$$MINIO_BUCKET;
       "
 
+  # Embedding + Rerank 推理服务（Infinity，OpenAI 风格 /embeddings 与 /rerank）。
+  # 生产环境为 Linux / x86_64：官方镜像原生 amd64，无模拟问题，rerank 正常。
+  # GPU 部署在 command 末尾追加 --device cuda（需 nvidia container runtime）。
+  # ⚠️ 不要在 Apple Silicon(Mac) 上跑本服务（模拟运行 reranker 会卡死）；Mac 本地用原生 Infinity（infra/infinity-local）。
+  infinity:
+    image: ${INFINITY_IMAGE:-michaelf34/infinity:latest}
+    container_name: pxss-bid-agent-infinity
+    restart: unless-stopped
+    environment:
+      HF_HOME: /app/.cache/huggingface
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+    command:
+      - v2
+      - --model-id
+      - ${INFINITY_EMBEDDING_MODEL:-BAAI/bge-base-zh-v1.5}
+      - --model-id
+      - ${INFINITY_RERANK_MODEL:-BAAI/bge-reranker-base}
+      - --engine
+      - torch
+      # reranker 启动预热前向在部分环境会崩，跳过预热；真实推理正常。
+      - --no-model-warmup
+      - --port
+      - "7997"
+    ports:
+      - "${INFINITY_PORT:-7997}:7997"
+    volumes:
+      - infinity_hf_cache:/app/.cache/huggingface
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:7997/health').status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 600s
+
   backend:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # 国内网络可设 APT_MIRROR=mirrors.aliyun.com 加速 LibreOffice 下载。
+        APT_MIRROR: ${APT_MIRROR:-}
     container_name: pxss-bid-agent-backend
     restart: unless-stopped
     depends_on:
@@ -86,6 +125,8 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      infinity:
+        condition: service_started
     environment:
       APP_NAME: pxss-bid-agent
       APP_ENV: production
@@ -97,11 +138,18 @@ services:
       MINIO_ROOT_USER: pxss_minio
       MINIO_ROOT_PASSWORD: pxss_minio_password
       MINIO_BUCKET: bid-agent
+      # embedding/rerank 走内网 infinity 服务（不是 localhost：容器里 localhost 指向自身）。
+      EMBEDDING_BASE_URL: http://infinity:7997
+      RERANK_BASE_URL: http://infinity:7997
       LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
       FRONTEND_DIST_DIR: /app/frontend/dist
+      # backend 镜像（Dockerfile）已内置 libreoffice-writer，旧版 .doc 直接走本机 soffice，
+      # 无需再常驻 libreoffice-converter sidecar。若改用 sidecar，则设为 http 并提供
+      # LEGACY_DOC_CONVERTER_URL=http://libreoffice-converter:2004。
+      LEGACY_DOC_CONVERTER_MODE: subprocess
     ports:
       - "5173:8000"
 
@@ -109,3 +157,4 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+  infinity_hf_cache:

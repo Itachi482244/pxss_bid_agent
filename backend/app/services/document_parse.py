@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, select
@@ -11,6 +12,11 @@ from app.core.observability import observed_task
 from app.models import AsyncTask, AuditLog, Document, DocumentChunk, DocumentVersion, ParseTask
 from app.parsers.pdf import PdfTextEmptyError, parse_pdf_bytes
 from app.parsers.word import parse_docx_bytes
+from app.services.document_conversion import (
+    DOCX_CONTENT_TYPE,
+    LegacyDocConversionError,
+    convert_legacy_doc_to_docx,
+)
 from app.services.storage import get_object_bytes
 
 
@@ -18,6 +24,12 @@ class DocumentParseError(Exception):
     def __init__(self, message: str, *, code: str = "DOCUMENT_PARSE_FAILED") -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass
+class ParsedDocumentPayload:
+    chunks: list
+    normalization_json: dict[str, str] = field(default_factory=dict)
 
 
 def _coerce_task_id(task_id: uuid.UUID | str) -> uuid.UUID:
@@ -56,12 +68,12 @@ def _add_parse_audit(
     )
 
 
-def _parse_document_bytes(parse_task: ParseTask, document: Document, data: bytes):
+def _parse_document_bytes(parse_task: ParseTask, document: Document, data: bytes) -> ParsedDocumentPayload:
     if parse_task.parser_type == "pdf_text":
         if document.file_ext != "pdf":
             raise DocumentParseError("PDF 文本解析器仅支持 .pdf 文件", code="PDF_FILE_REQUIRED")
         try:
-            return parse_pdf_bytes(data)
+            return ParsedDocumentPayload(chunks=parse_pdf_bytes(data))
         except PdfTextEmptyError as exc:
             raise DocumentParseError(str(exc), code=exc.code) from exc
     if parse_task.parser_type != "word":
@@ -70,10 +82,22 @@ def _parse_document_bytes(parse_task: ParseTask, document: Document, data: bytes
             code="UNSUPPORTED_PARSER_TYPE",
         )
     if document.file_ext == "doc":
-        raise DocumentParseError("暂不支持旧版 .doc 文件，请先转换为 .docx", code="LEGACY_DOC_UNSUPPORTED")
+        try:
+            data = convert_legacy_doc_to_docx(data, filename=document.original_filename)
+        except LegacyDocConversionError as exc:
+            raise DocumentParseError(str(exc), code=exc.code) from exc
+        return ParsedDocumentPayload(
+            chunks=parse_docx_bytes(data),
+            normalization_json={
+                "source_format": "doc",
+                "converted_format": "docx",
+                "converter": "libreoffice",
+                "content_type": DOCX_CONTENT_TYPE,
+            },
+        )
     if document.file_ext != "docx":
         raise DocumentParseError("Word 解析器仅支持 .docx 文件", code="WORD_FILE_REQUIRED")
-    return parse_docx_bytes(data)
+    return ParsedDocumentPayload(chunks=parse_docx_bytes(data))
 
 
 def _load_parse_context(
@@ -125,7 +149,8 @@ def execute_document_parse_task(db: Session, task_id: uuid.UUID | str) -> dict[s
 
     try:
         data = get_object_bytes(bucket=document.bucket, object_key=version.object_key)
-        parsed_chunks = _parse_document_bytes(parse_task, document, data)
+        parsed_payload = _parse_document_bytes(parse_task, document, data)
+        parsed_chunks = parsed_payload.chunks
 
         db.execute(
             delete(DocumentChunk).where(
@@ -157,11 +182,15 @@ def execute_document_parse_task(db: Session, task_id: uuid.UUID | str) -> dict[s
             "document_version_id": str(version.id),
             "chunk_count": len(parsed_chunks),
         }
+        if parsed_payload.normalization_json:
+            task.output_json["normalization"] = parsed_payload.normalization_json
         task.finished_at = datetime.now(UTC)
         parse_task.result_summary_json = {
             "chunk_count": len(parsed_chunks),
             "parser_type": parse_task.parser_type,
         }
+        if parsed_payload.normalization_json:
+            parse_task.result_summary_json["normalization"] = parsed_payload.normalization_json
         document.status = "available"
         version.parse_status = "succeeded"
         version.parser_name = parse_task.parser_name

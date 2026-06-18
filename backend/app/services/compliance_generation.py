@@ -1965,17 +1965,57 @@ def _section_chunk_payload(chunks: list[DocumentChunk]) -> list[dict[str, Any]]:
     return payload
 
 
+def _section_focus_hints(prior_issues: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """把上一轮该段的残留 issue 收敛为下一轮抽取的“重点复查清单”。
+
+    仅保留对模型定位漏抽有用的字段，去掉与抽取无关的内部元数据，避免污染 prompt。
+    """
+    hints: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for issue in prior_issues or []:
+        message = str(issue.get("message") or "").strip()
+        suggested = str(issue.get("suggested_requirement") or "").strip()
+        if not message and not suggested:
+            continue
+        dedupe_key = f"{message}|{suggested}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        hint: dict[str, Any] = {}
+        if message:
+            hint["message"] = message
+        if suggested:
+            hint["suggested_requirement"] = suggested
+        page_no = issue.get("page_no")
+        if page_no is not None:
+            hint["page_no"] = page_no
+        source_chunk_index = issue.get("source_chunk_index")
+        if source_chunk_index is not None:
+            hint["source_chunk_index"] = source_chunk_index
+        hints.append(hint)
+    return hints
+
+
 def _call_section_llm(
     db: Session,
     task: AsyncTask,
     semantic_section: DocumentSemanticSection,
     chunks: list[DocumentChunk],
+    *,
+    prior_issues: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[ComplianceCandidate]]:
-    prompt = get_prompt("compliance_extract_by_section", "1.1.0")
-    messages = prompt.render(
-        section_json=json.dumps(_section_record_payload(semantic_section), ensure_ascii=False),
-        chunks_json=json.dumps(_section_chunk_payload(chunks), ensure_ascii=False),
+    focus_hints = _section_focus_hints(prior_issues)
+    prompt = get_prompt(
+        "compliance_extract_by_section",
+        "1.2.0" if focus_hints else "1.1.0",
     )
+    render_kwargs = {
+        "section_json": json.dumps(_section_record_payload(semantic_section), ensure_ascii=False),
+        "chunks_json": json.dumps(_section_chunk_payload(chunks), ensure_ascii=False),
+    }
+    if focus_hints:
+        render_kwargs["focus_hints_json"] = json.dumps(focus_hints, ensure_ascii=False)
+    messages = prompt.render(**render_kwargs)
     char_count = sum(len(chunk.content_text or "") for chunk in chunks)
     result = chat_completion(
         db,
@@ -2252,9 +2292,10 @@ def _call_section_llm_resilient(
     progress: int,
     retry_depth: int = 0,
     progress_updates: bool = True,
+    prior_issues: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[ComplianceCandidate]]:
     try:
-        return _call_section_llm(db, task, semantic_section, chunks)
+        return _call_section_llm(db, task, semantic_section, chunks, prior_issues=prior_issues)
     except (LLMGatewayError, json.JSONDecodeError, ValidationError) as exc:
         if not _is_retriable_llm_response_error(exc) or len(chunks) <= 1:
             raise
@@ -2299,6 +2340,7 @@ def _call_section_llm_resilient(
             progress=progress,
             retry_depth=retry_depth + 1,
             progress_updates=progress_updates,
+            prior_issues=prior_issues,
         )
         providers.append(provider)
         candidates.extend(batch_candidates)
@@ -3979,20 +4021,20 @@ def _extract_sectioned_compliance_candidates_serial(
         "high_issue_count": len(high_issues),
         "sections": section_summaries,
     }
-    if high_issues:
-        high_issue_codes = {
-            str(issue.get("code") or "").strip()
-            for issue in high_issues
-            if str(issue.get("code") or "").strip()
-        }
-        gate_code = next(iter(high_issue_codes)) if len(high_issue_codes) == 1 else "QUALITY_GATE_BLOCKED"
-        raise ComplianceQualityGateError(
-            "覆盖性复核发现严重漏抽或来源质量问题",
-            code=gate_code,
-            issues=issues,
-            summary=summary,
-        )
     if not all_candidates:
+        if high_issues:
+            high_issue_codes = {
+                str(issue.get("code") or "").strip()
+                for issue in high_issues
+                if str(issue.get("code") or "").strip()
+            }
+            gate_code = next(iter(high_issue_codes)) if len(high_issue_codes) == 1 else "QUALITY_GATE_BLOCKED"
+            raise ComplianceQualityGateError(
+                "章节抽取未生成可入库候选项，且质量复核发现严重问题",
+                code=gate_code,
+                issues=issues,
+                summary=summary,
+            )
         raise ComplianceQualityGateError(
             "章节抽取未生成合规矩阵候选项",
             code="NO_COMPLIANCE_CANDIDATES",
@@ -4368,20 +4410,20 @@ def _extract_sectioned_compliance_candidates_fork_join(
         "execution_mode": "fork_join",
         "fork_join_max_workers": max_workers,
     }
-    if high_issues:
-        high_issue_codes = {
-            str(issue.get("code") or "").strip()
-            for issue in high_issues
-            if str(issue.get("code") or "").strip()
-        }
-        gate_code = next(iter(high_issue_codes)) if len(high_issue_codes) == 1 else "QUALITY_GATE_BLOCKED"
-        raise ComplianceQualityGateError(
-            "覆盖性复核发现严重漏抽或来源质量问题",
-            code=gate_code,
-            issues=issues,
-            summary=summary,
-        )
     if not all_candidates:
+        if high_issues:
+            high_issue_codes = {
+                str(issue.get("code") or "").strip()
+                for issue in high_issues
+                if str(issue.get("code") or "").strip()
+            }
+            gate_code = next(iter(high_issue_codes)) if len(high_issue_codes) == 1 else "QUALITY_GATE_BLOCKED"
+            raise ComplianceQualityGateError(
+                "章节抽取未生成可入库候选项，且质量复核发现严重问题",
+                code=gate_code,
+                issues=issues,
+                summary=summary,
+            )
         raise ComplianceQualityGateError(
             "章节抽取未生成合规矩阵候选项",
             code="NO_COMPLIANCE_CANDIDATES",
@@ -4558,6 +4600,8 @@ def execute_compliance_matrix_generation_task(
     task.status = "running"
     task.started_at = task.started_at or now
     task.progress = 20
+    task.error_code = None
+    task.error_message = None
     db.commit()
 
     document: Document | None = None
@@ -4719,12 +4763,17 @@ def execute_compliance_matrix_generation_task(
                 "provider": provider,
             }
         )
+        report_status = (
+            "blocked"
+            if any(issue.get("severity") == "high" for issue in quality_issues)
+            else "passed"
+        )
         report = _write_quality_report(
             db,
             task,
             document,
             version,
-            status="passed",
+            status=report_status,
             issues=quality_issues,
             summary=quality_summary,
         )
@@ -4742,6 +4791,9 @@ def execute_compliance_matrix_generation_task(
             "skipped_count": skipped_count,
             "superseded_count": superseded_count,
             "quality_report_id": str(report.id),
+            "quality_report_status": report.status,
+            "quality_issue_count": len(quality_issues),
+            "quality_high_issue_count": quality_summary.get("high_issue_count", 0),
             "section_count": quality_summary.get("section_count"),
         }
         task.finished_at = datetime.now(UTC)
@@ -4814,6 +4866,159 @@ def execute_compliance_matrix_generation_task(
         return {"status": "failed", "error_code": error_code}
 
 
+@dataclass(frozen=True)
+class SectionExtractionResult:
+    provider: str
+    candidate_count: int
+    issues: list[dict[str, Any]]
+    created: int
+    updated: int
+    skipped: int
+    superseded: int
+
+
+def _apply_section_extraction(
+    db: Session,
+    task: AsyncTask,
+    document: Document,
+    version: DocumentVersion,
+    chunks: list[DocumentChunk],
+    semantic_section: DocumentSemanticSection,
+    *,
+    current_chunks: list[DocumentChunk],
+    now: datetime,
+    prior_issues: list[dict[str, Any]] | None = None,
+) -> SectionExtractionResult:
+    """重抽单个语义段：模型抽取 + 表格守卫补全 + 覆盖复核 + 候选项入库（保护人工触碰项）。
+
+    仅落库与复核，不写质量报告、不抛门禁错误——由调用方决定如何处置 issues 与门禁状态，
+    以便编排器在多段定向重抽后统一写一份覆盖全文的权威报告（避免单段“通过”报告遮蔽其它段漏抽）。
+    `chunks` 须为该版本完整分块列表，`current_chunks` 为该语义段页码范围内的分块。
+    `prior_issues` 为上一轮该段的残留漏抽，作为本轮抽取的“重点复查清单”注入 prompt，使每次重试都
+    基于上一轮的不足之处而非盲抽。
+    """
+    provider, candidates = _call_section_llm(
+        db, task, semantic_section, current_chunks, prior_issues=prior_issues
+    )
+    candidates = _augment_section_candidates_from_table_guards(
+        current_chunks,
+        candidates,
+        extraction_provider=f"{provider}:table_guard",
+    )
+    issues = _review_section_coverage(db, task, semantic_section, current_chunks, candidates)
+
+    chunk_by_index = {chunk.chunk_index: chunk for chunk in chunks}
+    created_count = 0
+    updated_count = 0
+    skipped_count = 0
+    superseded_count = 0
+    section_marker = str(semantic_section.id)
+    stale_items = db.scalars(
+        select(ComplianceItem).where(
+            ComplianceItem.tenant_id == task.tenant_id,
+            ComplianceItem.project_id == task.project_id,
+            ComplianceItem.section_id == task.section_id,
+            ComplianceItem.source_version_id == version.id,
+            ComplianceItem.deleted_at.is_(None),
+        )
+    ).all()
+    for item in stale_items:
+        if (item.explanation_json or {}).get("semantic_section_id") != section_marker:
+            continue
+        if _is_human_touched_compliance_item(item):
+            skipped_count += 1
+            continue
+        item.status = "superseded"
+        item.deleted_at = now
+        item.modified_by = task.created_by
+        item.modified_at = now
+        item.modify_reason = "强制重新生成合规矩阵，旧候选项自动淘汰"
+        superseded_count += 1
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.normalized_requirement in seen:
+            continue
+        seen.add(candidate.normalized_requirement)
+        chunk = chunk_by_index.get(candidate.source_chunk_index)
+        if chunk is None:
+            skipped_count += 1
+            continue
+        existing = db.scalar(
+            select(ComplianceItem).where(
+                ComplianceItem.tenant_id == task.tenant_id,
+                ComplianceItem.project_id == task.project_id,
+                ComplianceItem.section_id == task.section_id,
+                ComplianceItem.source_version_id == version.id,
+                ComplianceItem.normalized_requirement == candidate.normalized_requirement,
+                ComplianceItem.deleted_at.is_(None),
+            )
+        )
+        is_batch_confirm_allowed = candidate.risk_level != "high" and not candidate.is_mandatory
+        source_quote = str(candidate.explanation_json.get("source_quote") or "").strip()
+        evidence_text = source_quote or chunk.content_text
+        if existing is None:
+            db.add(
+                ComplianceItem(
+                    tenant_id=task.tenant_id,
+                    project_id=task.project_id,
+                    section_id=task.section_id,
+                    source_document_id=document.id,
+                    source_version_id=version.id,
+                    source_chunk_id=chunk.id,
+                    source_page_no=chunk.page_no,
+                    item_type=candidate.item_type,
+                    requirement_text=candidate.requirement_text,
+                    normalized_requirement=candidate.normalized_requirement,
+                    dedup_key=candidate.normalized_requirement[:160],
+                    response_suggestion=candidate.response_suggestion,
+                    evidence_text=evidence_text,
+                    explanation_json=candidate.explanation_json,
+                    source_create_method=_source_create_method(candidate.explanation_json, "ai_sectioned"),
+                    status="pending_confirm",
+                    risk_level=candidate.risk_level,
+                    is_mandatory=candidate.is_mandatory,
+                    is_batch_confirm_allowed=is_batch_confirm_allowed,
+                    confidence_score=candidate.confidence_score,
+                    created_by=task.created_by,
+                )
+            )
+            created_count += 1
+        else:
+            if _is_human_touched_compliance_item(existing):
+                skipped_count += 1
+                continue
+            existing.source_chunk_id = chunk.id
+            existing.source_page_no = chunk.page_no
+            existing.item_type = candidate.item_type
+            existing.requirement_text = candidate.requirement_text
+            existing.dedup_key = candidate.normalized_requirement[:160]
+            existing.response_suggestion = candidate.response_suggestion
+            existing.evidence_text = evidence_text
+            existing.explanation_json = candidate.explanation_json
+            existing.source_create_method = _source_create_method(candidate.explanation_json, "ai_sectioned")
+            existing.status = "pending_confirm"
+            existing.deleted_at = None
+            existing.risk_level = candidate.risk_level
+            existing.is_mandatory = candidate.is_mandatory
+            existing.is_batch_confirm_allowed = is_batch_confirm_allowed
+            existing.confidence_score = candidate.confidence_score
+            existing.modified_by = task.created_by
+            existing.modified_at = datetime.now(UTC)
+            existing.modify_reason = "重新生成合规矩阵候选项"
+            updated_count += 1
+
+    return SectionExtractionResult(
+        provider=provider,
+        candidate_count=len(candidates),
+        issues=issues,
+        created=created_count,
+        updated=updated_count,
+        skipped=skipped_count,
+        superseded=superseded_count,
+    )
+
+
 @observed_task("section_compliance_extract")
 def execute_section_compliance_extract_task(
     db: Session,
@@ -4873,132 +5078,37 @@ def execute_section_compliance_extract_task(
                 summary={"semantic_section_id": str(semantic_section.id)},
             )
 
-        provider, candidates = _call_section_llm(db, task, semantic_section, current_chunks)
-        candidates = _augment_section_candidates_from_table_guards(
-            current_chunks,
-            candidates,
-            extraction_provider=f"{provider}:table_guard",
+        write_started = True
+        result = _apply_section_extraction(
+            db,
+            task,
+            document,
+            version,
+            list(chunks),
+            semantic_section,
+            current_chunks=current_chunks,
+            now=now,
         )
-        issues = _review_section_coverage(db, task, semantic_section, current_chunks, candidates)
-        high_issues = [issue for issue in issues if issue.get("severity") == "high"]
+        high_issues = [issue for issue in result.issues if issue.get("severity") == "high"]
         if high_issues:
             raise ComplianceQualityGateError(
                 "单段覆盖性复核发现严重漏抽",
                 code="QUALITY_GATE_BLOCKED",
-                issues=issues,
-                summary={"semantic_section_id": str(semantic_section.id), "candidate_count": len(candidates)},
+                issues=result.issues,
+                summary={
+                    "semantic_section_id": str(semantic_section.id),
+                    "candidate_count": result.candidate_count,
+                },
             )
-
-        chunk_by_index = {chunk.chunk_index: chunk for chunk in chunks}
-        created_count = 0
-        updated_count = 0
-        skipped_count = 0
-        superseded_count = 0
-        section_marker = str(semantic_section.id)
-        write_started = True
-        stale_items = db.scalars(
-            select(ComplianceItem).where(
-                ComplianceItem.tenant_id == task.tenant_id,
-                ComplianceItem.project_id == task.project_id,
-                ComplianceItem.section_id == task.section_id,
-                ComplianceItem.source_version_id == version.id,
-                ComplianceItem.deleted_at.is_(None),
-            )
-        ).all()
-        for item in stale_items:
-            if (item.explanation_json or {}).get("semantic_section_id") != section_marker:
-                continue
-            if _is_human_touched_compliance_item(item):
-                skipped_count += 1
-                continue
-            item.status = "superseded"
-            item.deleted_at = now
-            item.modified_by = task.created_by
-            item.modified_at = now
-            item.modify_reason = "强制重新生成合规矩阵，旧候选项自动淘汰"
-            superseded_count += 1
-
-        seen: set[str] = set()
-        for candidate in candidates:
-            if candidate.normalized_requirement in seen:
-                continue
-            seen.add(candidate.normalized_requirement)
-            chunk = chunk_by_index.get(candidate.source_chunk_index)
-            if chunk is None:
-                skipped_count += 1
-                continue
-            existing = db.scalar(
-                select(ComplianceItem).where(
-                    ComplianceItem.tenant_id == task.tenant_id,
-                    ComplianceItem.project_id == task.project_id,
-                    ComplianceItem.section_id == task.section_id,
-                    ComplianceItem.source_version_id == version.id,
-                    ComplianceItem.normalized_requirement == candidate.normalized_requirement,
-                    ComplianceItem.deleted_at.is_(None),
-                )
-            )
-            is_batch_confirm_allowed = candidate.risk_level != "high" and not candidate.is_mandatory
-            source_quote = str(candidate.explanation_json.get("source_quote") or "").strip()
-            evidence_text = source_quote or chunk.content_text
-            if existing is None:
-                db.add(
-                    ComplianceItem(
-                        tenant_id=task.tenant_id,
-                        project_id=task.project_id,
-                        section_id=task.section_id,
-                        source_document_id=document.id,
-                        source_version_id=version.id,
-                        source_chunk_id=chunk.id,
-                        source_page_no=chunk.page_no,
-                        item_type=candidate.item_type,
-                        requirement_text=candidate.requirement_text,
-                        normalized_requirement=candidate.normalized_requirement,
-                        dedup_key=candidate.normalized_requirement[:160],
-                        response_suggestion=candidate.response_suggestion,
-                        evidence_text=evidence_text,
-                        explanation_json=candidate.explanation_json,
-                        source_create_method=_source_create_method(candidate.explanation_json, "ai_sectioned"),
-                        status="pending_confirm",
-                        risk_level=candidate.risk_level,
-                        is_mandatory=candidate.is_mandatory,
-                        is_batch_confirm_allowed=is_batch_confirm_allowed,
-                        confidence_score=candidate.confidence_score,
-                        created_by=task.created_by,
-                    )
-                )
-                created_count += 1
-            else:
-                if _is_human_touched_compliance_item(existing):
-                    skipped_count += 1
-                    continue
-                existing.source_chunk_id = chunk.id
-                existing.source_page_no = chunk.page_no
-                existing.item_type = candidate.item_type
-                existing.requirement_text = candidate.requirement_text
-                existing.dedup_key = candidate.normalized_requirement[:160]
-                existing.response_suggestion = candidate.response_suggestion
-                existing.evidence_text = evidence_text
-                existing.explanation_json = candidate.explanation_json
-                existing.source_create_method = _source_create_method(candidate.explanation_json, "ai_sectioned")
-                existing.status = "pending_confirm"
-                existing.deleted_at = None
-                existing.risk_level = candidate.risk_level
-                existing.is_mandatory = candidate.is_mandatory
-                existing.is_batch_confirm_allowed = is_batch_confirm_allowed
-                existing.confidence_score = candidate.confidence_score
-                existing.modified_by = task.created_by
-                existing.modified_at = datetime.now(UTC)
-                existing.modify_reason = "重新生成合规矩阵候选项"
-                updated_count += 1
 
         summary = {
-            "provider": provider,
+            "provider": result.provider,
             "semantic_section_id": str(semantic_section.id),
-            "candidate_count": len(candidates),
-            "created_count": created_count,
-            "updated_count": updated_count,
-            "skipped_count": skipped_count,
-            "superseded_count": superseded_count,
+            "candidate_count": result.candidate_count,
+            "created_count": result.created,
+            "updated_count": result.updated,
+            "skipped_count": result.skipped,
+            "superseded_count": result.superseded,
         }
         report = _write_quality_report(
             db,
@@ -5006,7 +5116,7 @@ def execute_section_compliance_extract_task(
             document,
             version,
             status="passed",
-            issues=issues,
+            issues=result.issues,
             summary=summary,
         )
         task.status = "succeeded"
@@ -5042,6 +5152,272 @@ def execute_section_compliance_extract_task(
                 issues=issues,
                 summary=summary,
             )
+        task.status = "failed"
+        task.progress = 100
+        task.error_code = error_code
+        task.error_message = str(exc)
+        task.finished_at = datetime.now(UTC)
+        db.commit()
+        return {"status": "failed", "error_code": error_code}
+
+
+# 自动处理：结构性/全局问题须重排章节后整体重抽才能权威复检；以下编码归类为结构性。
+AUTO_RESOLVE_STRUCTURAL_CODES = {
+    "NO_COMPLIANCE_CANDIDATES",
+    "NO_DOCUMENT_CHUNKS",
+    "SECTION_HAS_NO_CHUNKS",
+    "SECTION_PLAN_EMPTY",
+    "SECTION_PLAN_INVALID",
+    "DOCUMENT_SECTION_PLAN_FAILED",
+}
+AUTO_RESOLVE_MAX_ROUNDS = 2
+
+
+def _high_issues(issues: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [issue for issue in (issues or []) if str(issue.get("severity")) == "high"]
+
+
+def _run_authoritative_matrix_regen(
+    db: Session,
+    parent_task: AsyncTask,
+    document: Document,
+    version: DocumentVersion,
+) -> str:
+    """内联执行一次 force 全量重抽（重排章节 + 整体重抽 + 写权威门禁报告）。返回子任务最终状态。"""
+    child = AsyncTask(
+        tenant_id=parent_task.tenant_id,
+        project_id=parent_task.project_id,
+        section_id=parent_task.section_id,
+        task_type="matrix_generate",
+        status="pending",
+        idempotency_key="matrix-generate:auto-resolve:" + uuid.uuid4().hex,
+        progress=0,
+        input_json={
+            "document_id": str(document.id),
+            "document_version_id": str(version.id),
+            "force": True,
+        },
+        retry_count=0,
+        max_retries=0,
+        created_by=parent_task.created_by,
+    )
+    db.add(child)
+    db.commit()
+    try:
+        result = execute_compliance_matrix_generation_task(db, child.id)
+    except Exception:  # noqa: BLE001 - 编排层兜底，子任务失败不应中断整个自动处理
+        if not db.is_active:
+            db.rollback()
+        return "failed"
+    return str((result or {}).get("status") or "unknown")
+
+
+@observed_task("matrix_auto_resolve")
+def execute_matrix_auto_resolve_task(
+    db: Session,
+    task_id: uuid.UUID | str,
+) -> dict[str, Any]:
+    """让 Agent 自动处理质量门禁阻断：按阻断画像自主决策——
+
+    - 漏抽集中在个别语义段（局部）→ 只定向重抽这几段，再合并未触碰段的既有判定，写一份覆盖全文的权威报告；
+    - 存在结构性/全局问题（章节规划、无候选项等）→ 重排章节 + 整体重抽；
+    - 复检循环最多 AUTO_RESOLVE_MAX_ROUNDS 轮，仍阻断则收敛并把残留项交还人工。
+    人工已确认/编辑过的条目全程受保护，不会被覆盖。
+    """
+    task_uuid = _coerce_task_id(task_id)
+    task = db.get(AsyncTask, task_uuid)
+    if task is None or task.task_type != "matrix_auto_resolve":
+        raise ComplianceGenerationError("自动处理任务不存在", code="TASK_NOT_FOUND")
+
+    now = datetime.now(UTC)
+    task.status = "running"
+    task.started_at = task.started_at or now
+    task.progress = 5
+    db.commit()
+
+    try:
+        document, version = _select_document_version(db, task)
+        chunks = list(
+            db.scalars(
+                select(DocumentChunk)
+                .where(
+                    DocumentChunk.tenant_id == task.tenant_id,
+                    DocumentChunk.document_version_id == version.id,
+                )
+                .order_by(DocumentChunk.chunk_index)
+            ).all()
+        )
+        if not chunks:
+            raise ComplianceGenerationError("文档版本没有解析分块", code="NO_DOCUMENT_CHUNKS")
+
+        rounds: list[dict[str, Any]] = []
+        report = latest_extraction_quality_report(
+            db, tenant_id=task.tenant_id, document_version_id=version.id
+        )
+
+        for round_no in range(1, AUTO_RESOLVE_MAX_ROUNDS + 1):
+            current_issues = list(report.issues_json or []) if report is not None else []
+            blocking = _high_issues(current_issues)
+            if report is not None and report.status != "blocked":
+                break
+            if not blocking:
+                break
+
+            sections = list(
+                db.scalars(
+                    select(DocumentSemanticSection)
+                    .where(
+                        DocumentSemanticSection.tenant_id == task.tenant_id,
+                        DocumentSemanticSection.document_version_id == version.id,
+                    )
+                    .order_by(DocumentSemanticSection.section_index)
+                ).all()
+            )
+            sections_by_id = {str(section.id): section for section in sections}
+
+            targetable_ids: list[str] = []
+            structural = False
+            for issue in blocking:
+                sid = str(issue.get("section_id") or "")
+                code = str(issue.get("code") or "")
+                if sid and sid in sections_by_id and code not in AUTO_RESOLVE_STRUCTURAL_CODES:
+                    if sid not in targetable_ids:
+                        targetable_ids.append(sid)
+                else:
+                    structural = True
+
+            task.progress = min(90, 10 + round_no * 35)
+            db.commit()
+
+            if structural or not targetable_ids:
+                regen_status = _run_authoritative_matrix_regen(db, task, document, version)
+                report = latest_extraction_quality_report(
+                    db, tenant_id=task.tenant_id, document_version_id=version.id
+                )
+                rounds.append(
+                    {
+                        "round": round_no,
+                        "strategy": "replan_regen",
+                        "reason": "存在结构性/全局问题，已重排章节并整体重抽",
+                        "regen_status": regen_status,
+                        "resolved": bool(report is not None and report.status == "passed"),
+                    }
+                )
+            else:
+                issues_by_section: dict[str, list[dict[str, Any]]] = {}
+                for issue in current_issues:
+                    sid = str(issue.get("section_id") or "")
+                    issues_by_section.setdefault(sid, []).append(issue)
+
+                reextracted: list[str] = []
+                for sid in targetable_ids:
+                    section = sections_by_id[sid]
+                    section_chunks = _section_chunks(section, chunks)
+                    if not section_chunks:
+                        issues_by_section[sid] = [
+                            _quality_issue(
+                                code="SECTION_HAS_NO_CHUNKS",
+                                message=f"章节“{section.title}”页码范围内没有解析分块。",
+                                severity="high",
+                                semantic_section=section,
+                            )
+                        ]
+                        continue
+                    prior_section_issues = list(issues_by_section.get(sid, []))
+                    res = _apply_section_extraction(
+                        db,
+                        task,
+                        document,
+                        version,
+                        chunks,
+                        section,
+                        current_chunks=section_chunks,
+                        now=datetime.now(UTC),
+                        prior_issues=prior_section_issues,
+                    )
+                    issues_by_section[sid] = res.issues
+                    reextracted.append(section.title)
+
+                combined_issues = [issue for issues in issues_by_section.values() for issue in issues]
+                combined_high = _high_issues(combined_issues)
+                status = "passed" if not combined_high else "blocked"
+                report = _write_quality_report(
+                    db,
+                    task,
+                    document,
+                    version,
+                    status=status,
+                    issues=combined_issues,
+                    summary={
+                        "document_id": str(document.id),
+                        "document_version_id": str(version.id),
+                        "auto_resolve": True,
+                        "round": round_no,
+                        "reextracted_sections": reextracted,
+                        "issue_count": len(combined_issues),
+                        "high_issue_count": len(combined_high),
+                    },
+                )
+                db.commit()
+                rounds.append(
+                    {
+                        "round": round_no,
+                        "strategy": "targeted",
+                        "reason": "漏抽集中在个别章节，已定向重抽并复检全文",
+                        "reextracted_sections": reextracted,
+                        "resolved": status == "passed",
+                    }
+                )
+
+            if report is not None and report.status == "passed":
+                break
+
+        remaining = _high_issues(list(report.issues_json or [])) if report is not None else []
+        resolved = bool(report is not None and report.status == "passed")
+        remaining_summary = [
+            {
+                "severity": str(issue.get("severity") or "high"),
+                "code": str(issue.get("code") or ""),
+                "section_title": issue.get("section_title"),
+                "section_id": issue.get("section_id"),
+                "message": str(issue.get("message") or ""),
+            }
+            for issue in remaining
+        ]
+        output: dict[str, Any] = {
+            "resolved": resolved,
+            "rounds": rounds,
+            "round_count": len(rounds),
+            "remaining_count": len(remaining_summary),
+            "remaining_issues": remaining_summary,
+            "quality_report_id": str(report.id) if report is not None else None,
+            "quality_status": report.status if report is not None else "unknown",
+        }
+        _add_generation_audit(
+            db,
+            task,
+            action="compliance.matrix_auto_resolved",
+            after_json={
+                "resolved": resolved,
+                "round_count": len(rounds),
+                "remaining_count": len(remaining_summary),
+            },
+            severity="info" if resolved else "warning",
+        )
+        task.status = "succeeded"
+        task.progress = 100
+        task.output_json = output
+        task.finished_at = datetime.now(UTC)
+        db.commit()
+        return {
+            "status": "succeeded",
+            "resolved": resolved,
+            "remaining_count": len(remaining_summary),
+        }
+    except Exception as exc:
+        if not db.is_active:
+            db.rollback()
+        error_code = getattr(exc, "code", "MATRIX_AUTO_RESOLVE_FAILED")
         task.status = "failed"
         task.progress = 100
         task.error_code = error_code

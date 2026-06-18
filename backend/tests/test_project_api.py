@@ -33,6 +33,7 @@ from app.models import (
     ProjectMember,
     User,
 )
+from app.services.document_conversion import LegacyDocConversionError
 from app.services.file_acquisition import DownloadedFile
 from scripts.seed_dev_data import seed
 
@@ -477,6 +478,63 @@ def test_project_import_from_uploaded_document_creates_project_document_and_matr
     assert items_response.status_code == 200
     items = items_response.json()
     assert any("营业执照" in item["requirement_text"] for item in items)
+
+
+def test_project_import_upload_legacy_doc_uses_conversion_for_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = TestClient(app)
+    project_name = f"旧版导入项目 {uuid4().hex}"
+    conversion_calls: list[dict[str, object]] = []
+
+    def fake_convert_legacy_doc_to_docx(data: bytes, *, filename: str) -> bytes:
+        conversion_calls.append({"data": data, "filename": filename})
+        return build_import_docx_bytes(project_name)
+
+    monkeypatch.setattr(
+        "app.services.project_import.convert_legacy_doc_to_docx",
+        fake_convert_legacy_doc_to_docx,
+    )
+
+    response = client.post(
+        "/api/v1/projects/import-drafts/upload",
+        files={"file": (f"{project_name}.doc", b"legacy-word-binary", "application/msword")},
+    )
+
+    assert response.status_code == 201
+    draft = response.json()
+    assert draft["source"]["file_ext"] == "doc"
+    assert conversion_calls == [{"data": b"legacy-word-binary", "filename": draft["source"]["original_filename"]}]
+    assert draft["project"]["name"] == project_name
+    assert draft["project"]["purchaser"] == "岳阳市君山区城市管理局"
+    assert draft["project"]["budget_amount"] == "13490900.00"
+    assert "营业执照" in draft["preview_text"]
+
+
+def test_project_import_upload_legacy_doc_conversion_failure_returns_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = TestClient(app)
+
+    def fake_convert_legacy_doc_to_docx(data: bytes, *, filename: str) -> bytes:  # noqa: ARG001
+        raise LegacyDocConversionError(
+            "旧版 .doc 自动转换依赖 LibreOffice/soffice，当前环境未安装转换器",
+            code="LEGACY_DOC_CONVERTER_UNAVAILABLE",
+        )
+
+    monkeypatch.setattr(
+        "app.services.project_import.convert_legacy_doc_to_docx",
+        fake_convert_legacy_doc_to_docx,
+    )
+
+    response = client.post(
+        "/api/v1/projects/import-drafts/upload",
+        files={"file": ("转换失败.doc", b"legacy-word-binary", "application/msword")},
+    )
+
+    assert response.status_code == 422
+    assert "旧版 .doc 自动转换依赖 LibreOffice/soffice" in response.json()["detail"]
+    assert "请手工转换为 .docx" in response.json()["detail"]
 
 
 def test_project_import_confirm_accepts_async_processing(

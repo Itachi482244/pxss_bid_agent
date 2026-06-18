@@ -295,13 +295,14 @@
 | TECH-005 | 使用 MinIO 或云对象存储管理文件资产 | MVP | P0 |
 | TECH-006 | 使用 Celery 或同类任务队列处理长任务 | MVP | P0 |
 | TECH-007 | 提供 LLM Provider 抽象层，支持国内主流模型和合规配置 | MVP | P0 |
-| TECH-008 | 文档解析采用 PyMuPDF、pdfplumber、python-docx、openpyxl 等组合；扫描件识别专项进入长期规划 | MVP | P0 |
+| TECH-008 | 文档解析采用 PyMuPDF、pdfplumber、python-docx、openpyxl 等组合；旧版 `.doc` 在 worker 内通过 LibreOffice 自动转 `.docx` 后解析；扫描件识别专项进入长期规划 | MVP | P0 |
 | TECH-009 | 规则引擎早期采用 Python 模块 + JSON/YAML 配置 | MVP | P0 |
 | TECH-010 | 提供 Docker Compose 本地开发环境 | MVP | P0 |
 | TECH-011 | 提供数据库迁移机制 | MVP | P0 |
 | TECH-012 | 提供结构化日志和基础健康检查 | MVP | P0 |
 | TECH-013 | 生产阶段支持监控、告警、备份、容灾和私有化部署 | 生产化 | P1 |
 | TECH-014 | 规则配置应支持热加载或版本刷新机制，不应要求重启服务才能生效 | MVP | P1 |
+| TECH-015 | 文档规范化能力后续可拆为独立转换 worker/sidecar，统一处理 Office 转换、并发限流、资源隔离、转换产物复用和质量审计 | 长期规划 | P2 |
 
 ## 19. 非功能需求
 

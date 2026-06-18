@@ -314,6 +314,38 @@ _PROMPTS: dict[str, PromptDefinition] = {
             "chunks:\n{chunks_json}"
         ),
     ),
+    "compliance_extract_by_section@1.2.0": PromptDefinition(
+        prompt_id="compliance_extract_by_section",
+        version="1.2.0",
+        input_variables=("section_json", "chunks_json", "focus_hints_json"),
+        output_schema=COMPLIANCE_EXTRACT_SCHEMA,
+        safety_boundary=(
+            "只允许基于当前语义段 chunks 抽取；不得跨段猜测、不得编造；"
+            "不得输出未勾选 □ 选项、说明文字、联系方式、模板占位符。"
+            "focus_hints 仅用于提示重点核对方向，不得据此编造原文中不存在的条款。"
+        ),
+        fallback_note="生产流程不静默降级；模型、JSON、schema 或来源校验失败会阻断矩阵生成。",
+        system_template=(
+            "你是招投标合规矩阵抽取助手。你只能输出 JSON。"
+            "你需要从一个章节/语义段中抽取最小可审核合规项，并给出可回链的 source_quote。"
+        ),
+        user_template=(
+            "请从当前语义段抽取合规矩阵候选项。规则：\n"
+            "1. 每个 item 必须有 source_chunk_index、source_quote，source_quote 必须能在对应 chunk 文本或表格行中找到。\n"
+            "2. 抽取发包/招标范围、承包方式、评审办法/交易方式、最高限价、工期、资格资质、项目负责人资格、在建限制、联合体/分包限制、保证金、截止时间、强制响应、评分和技术硬指标。\n"
+            "3. 不要输出项目名称、建设地点、资金来源、联系人、电话、地址、纯说明文字。\n"
+            "4. 不要输出未选中的 □ 选项；遇到 ☑/√/✓ 选项只抽选中项。\n"
+            "5. 过滤 `/ 年 / 月 / 日`、`发包人需要增加...`、`说明：`、空白占位和模板提示。\n"
+            "6. 多个要求必须拆成最小原子项，但保持每项有清晰来源摘录。\n"
+            "7. item_type 只能取 qualification、mandatory_response、format、deadline、scoring、reference_info、technical_response、other。\n"
+            "8. focus_hints 是上一轮疑似被漏抽的条款清单（含 message/suggested_requirement/page_no）。"
+            "请在当前 chunks 中重点核对这些方向：若原文确有对应要求但上一轮遗漏，必须补齐并给出 source_quote；"
+            "若 focus_hints 在本段原文中确实不存在，则不要编造，按真实情况照常抽取即可。\n\n"
+            "focus_hints（重点复查清单，可能为空）:\n{focus_hints_json}\n\n"
+            "section:\n{section_json}\n\n"
+            "chunks:\n{chunks_json}"
+        ),
+    ),
     "section_coverage_review@1.1.0": PromptDefinition(
         prompt_id="section_coverage_review",
         version="1.1.0",

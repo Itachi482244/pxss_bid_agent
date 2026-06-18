@@ -77,6 +77,7 @@ import {
   createBusinessDraftContextPack,
   updateBusinessDraftContextPackDirectives,
   type AuthorDirectiveInput,
+  autoResolveComplianceMatrix,
   createComplianceItemFromSource,
   createEnterpriseMaterialsHistoryExtractTask,
   createParseTask,
@@ -521,6 +522,8 @@ type ImportProcessingState = {
 const IMPORT_PROCESSING_STORAGE_KEY = "pxss_bid_agent_import_processing";
 const ASYNC_TASK_STALE_AFTER_MS = 60 * 60 * 1000;
 const COMPLIANCE_ITEM_FETCH_LIMIT = 500;
+// 质检阻断时，每个标段自动唤起 Agent 自处理的最大次数；超出后转人工。
+const AUTO_RESOLVE_AUTO_ATTEMPT_LIMIT = 1;
 const LARGE_TABLE_PAGINATION = {
   defaultPageSize: 25,
   pageSizeOptions: ["25", "50", "100"],
@@ -600,6 +603,32 @@ const projectGroupLabels: Record<ProjectGroup, string> = {
 const projectGroupOrder: ProjectGroup[] = ["needs_me", "in_progress", "done"];
 
 type ProjectNextStep = { text: string; tab?: string; actionable: boolean };
+
+type MatrixAutoResolveRound = {
+  round: number;
+  strategy: "targeted" | "replan_regen" | string;
+  reason?: string;
+  resolved?: boolean;
+  reextracted_sections?: string[];
+  regen_status?: string;
+};
+
+type MatrixAutoResolveRemainingIssue = {
+  severity: string;
+  code: string;
+  section_title?: string | null;
+  section_id?: string | null;
+  message: string;
+};
+
+type MatrixAutoResolveResult = {
+  resolved: boolean;
+  rounds: MatrixAutoResolveRound[];
+  round_count: number;
+  remaining_count: number;
+  remaining_issues: MatrixAutoResolveRemainingIssue[];
+  quality_status?: string;
+};
 
 // MVP1.4 决策：不改后端，"下一步"从 ProjectSummary 既有字段前端推导。
 function deriveProjectNextStep(project: ProjectSummary): ProjectNextStep {
@@ -1460,6 +1489,12 @@ export function useBidAppController() {
   const [extractionQualityReport, setExtractionQualityReport] = useState<DocumentExtractionQualityReport | null>(null);
   const [sectionPlanLoading, setSectionPlanLoading] = useState(false);
   const [sectionExtractingId, setSectionExtractingId] = useState("");
+  const [autoResolveActive, setAutoResolveActive] = useState(false);
+  const [autoResolveResult, setAutoResolveResult] = useState<MatrixAutoResolveResult | null>(null);
+  const autoResolveInFlightRef = useRef(false);
+  const autoResolveAutoAttemptsRef = useRef<Record<string, number>>({});
+  // 记录上一次的推荐（当前阻塞）步骤 key，用于「步骤通过后自动前进到下一个阻塞步骤」。
+  const prevRecommendedStepKeyRef = useRef<string | null>(null);
   const [revisionDrawerOpen, setRevisionDrawerOpen] = useState(false);
   const [revisionDocument, setRevisionDocument] = useState<ProjectDocument | null>(null);
   const [revisionChunks, setRevisionChunks] = useState<DocumentChunk[]>([]);
@@ -3232,6 +3267,7 @@ export function useBidAppController() {
           reloadDocumentsAndExports(),
           reloadMatrix(),
           reloadPreflightCheck(),
+          reloadSectionQualitySummary({ silent: true }),
           reloadAuditLogs()
         ]);
       }
@@ -3265,6 +3301,7 @@ export function useBidAppController() {
     reloadDocumentsAndExports,
     reloadMatrix,
     reloadPreflightCheck,
+    reloadSectionQualitySummary,
     reloadWorkspaceSummary
   ]);
 
@@ -6284,6 +6321,120 @@ export function useBidAppController() {
     }
   };
 
+  const runAutoResolveMatrix = async (options?: { source?: ProjectDocument | null; auto?: boolean }) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    if (autoResolveInFlightRef.current) return;
+    const projectId = selectedProjectId;
+    const sectionId = selectedSectionId;
+    const source = options?.source ?? null;
+    const auto = options?.auto ?? false;
+    const version = source?.current_version;
+    autoResolveInFlightRef.current = true;
+    setAutoResolveActive(true);
+    setAutoResolveResult(null);
+    try {
+      let task = await autoResolveComplianceMatrix(projectId, sectionId, {
+        document_id: source?.id,
+        document_version_id: version?.id,
+        async_processing: true
+      });
+      appendLog(`${auto ? "自动触发" : "手动触发"} Agent 自处理任务：${task.id.slice(0, 8)}`);
+      const deadline = Date.now() + 15 * 60 * 1000;
+      while (!isAsyncTaskTerminalStatus(task.status) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        try {
+          task = await getTask(task.id);
+        } catch {
+          // 单次轮询失败忽略，下次重试
+        }
+      }
+      if (task.status === "failed") {
+        throw new Error(task.error_message || "自动处理失败");
+      }
+      const output = (task.output_json ?? {}) as Partial<MatrixAutoResolveResult>;
+      const result: MatrixAutoResolveResult = {
+        resolved: Boolean(output.resolved),
+        rounds: Array.isArray(output.rounds) ? (output.rounds as MatrixAutoResolveRound[]) : [],
+        round_count: typeof output.round_count === "number" ? output.round_count : 0,
+        remaining_count: typeof output.remaining_count === "number" ? output.remaining_count : 0,
+        remaining_issues: Array.isArray(output.remaining_issues)
+          ? (output.remaining_issues as MatrixAutoResolveRemainingIssue[])
+          : [],
+        quality_status: output.quality_status
+      };
+      setAutoResolveResult(result);
+      const [items] = await Promise.all([
+        listComplianceItems(projectId, sectionId, { limit: COMPLIANCE_ITEM_FETCH_LIMIT }),
+        reloadExtractionQuality(),
+        reloadDocumentsAndExports(),
+        reloadAuditLogs(),
+        getPreflightCheck(projectId, sectionId).then(setPreflightCheck).catch(() => undefined),
+        activeTab === "review" ? reloadMatrixReview() : Promise.resolve()
+      ]);
+      setComplianceItems(items);
+      if (result.resolved) {
+        Modal.success({
+          title: "Agent 已自动处理完成，质量门禁通过",
+          content: `共 ${result.round_count} 轮自动处理，已无阻断项，可继续进入合规矩阵。`
+        });
+      } else if (!auto) {
+        // 仅手动再试给出弹窗提示；自动模式失败时由页面内“转人工”区域承接，避免打断。
+        Modal.warning({
+          title: "Agent 已尽力处理，仍有阻断项需人工确认",
+          content: `共 ${result.round_count} 轮自动处理，仍剩 ${result.remaining_count} 处阻断。请在下方逐条核对或手动处理。`
+        });
+      }
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : "自动处理失败");
+      await reloadExtractionQuality();
+    } finally {
+      setAutoResolveActive(false);
+      autoResolveInFlightRef.current = false;
+    }
+  };
+
+  // 用户手动“再试一次”：直接跑一轮，不计入自动预算。
+  const handleAutoResolveMatrix = (source?: ProjectDocument | null) => {
+    void runAutoResolveMatrix({ source, auto: false });
+  };
+
+  // Loop engineering：当前标段存在阻断报告即自动唤起 Agent 处理，并把界面切到质检页，
+  // 让用户实时看到处理过程；每个标段最多自动尝试 AUTO_RESOLVE_AUTO_ATTEMPT_LIMIT 次
+  //（每次后端再内部复检至多 2 轮），超出后停手并把控制权交还用户手动处理。
+  useEffect(() => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    if (!extractionBlocked) return;
+    if (importProcessingInProgress) return;
+    if (autoResolveActive || autoResolveInFlightRef.current) return;
+    const sectionId = selectedSectionId;
+    const attempts = autoResolveAutoAttemptsRef.current[sectionId] ?? 0;
+    if (attempts >= AUTO_RESOLVE_AUTO_ATTEMPT_LIMIT) return;
+    autoResolveAutoAttemptsRef.current[sectionId] = attempts + 1;
+    // Agent 开始自动处理时自动跳到质检界面（如果还不在该页）。
+    if (activeTab !== "quality") {
+      activateWorkflowStep("quality");
+    }
+    void runAutoResolveMatrix({ auto: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, extractionBlocked, importProcessingInProgress, selectedProjectId, selectedSectionId, autoResolveActive]);
+
+  // 引导式推进：当用户正停在「当前阻塞步骤」上、且该步骤被解决（推荐步骤前移）时，
+  // 自动跳到新的阻塞步骤。仅在用户处于刚被清除的那一步时推进，避免在别处浏览时被打断。
+  useEffect(() => {
+    const prevKey = prevRecommendedStepKeyRef.current;
+    const nextKey = recommendedStep?.key ?? null;
+    prevRecommendedStepKeyRef.current = nextKey;
+    if (!nextKey || !prevKey || prevKey === nextKey) return;
+    // Agent 自动处理进行中时不抢跳，等其完成（完成后会重算推荐步骤再前进）。
+    if (autoResolveActive || autoResolveInFlightRef.current) return;
+    if (activeTab !== prevKey || activeTab === nextKey) return;
+    // 仅当用户所停的上一步确实已完成（done）才前进，避免数据刷新时推荐步骤瞬时抖动导致误跳。
+    const prevStep = workflowSteps.find((step) => step.key === prevKey);
+    if (prevStep?.status !== "done") return;
+    activateWorkflowStep(nextKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recommendedStep, activeTab, autoResolveActive, workflowSteps]);
+
   const handleOpenRevisionDrawer = async (document: ProjectDocument) => {
     if (!selectedProjectId || !selectedSectionId || !document.current_version_id) {
       Modal.warning({ title: "文件尚无可查看的解析版本" });
@@ -6841,6 +6992,9 @@ export function useBidAppController() {
     handleExportExcel,
     handleExportTenderFormatDocx,
     handleExtractSemanticSection,
+    handleAutoResolveMatrix,
+    autoResolveActive,
+    autoResolveResult,
     handleGenerateMatrix,
     handleGenerateQualificationDecision,
     handleHistoryMaterialUpload,

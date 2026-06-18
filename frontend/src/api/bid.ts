@@ -1988,6 +1988,23 @@ export async function generateComplianceMatrix(
   return response.data;
 }
 
+export async function autoResolveComplianceMatrix(
+  projectId: string,
+  sectionId: string,
+  payload?: {
+    document_id?: string;
+    document_version_id?: string;
+    async_processing?: boolean;
+  }
+) {
+  const response = await apiClient.post<AsyncTask>(
+    `/projects/${projectId}/sections/${sectionId}/compliance-items/auto-resolve`,
+    payload ?? {},
+    { timeout: 1500000 }
+  );
+  return response.data;
+}
+
 export async function exportComplianceMatrixExcel(
   projectId: string,
   sectionId: string,

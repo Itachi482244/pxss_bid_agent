@@ -2,9 +2,17 @@ FROM python:3.11-slim AS backend
 
 WORKDIR /app
 
-# Install system deps for psycopg
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev && \
+ARG APT_MIRROR=""
+
+# Install system deps for psycopg.
+# libreoffice-writer/fonts-noto-cjk 仅 LEGACY_DOC_CONVERTER_MODE=subprocess 时需要；
+# 若改用 libreoffice-converter sidecar（http 模式），可从这里移除以瘦身后端镜像。
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g; s|security.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g; s|security.debian.org|$APT_MIRROR|g" /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev libreoffice-writer fonts-noto-cjk && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy backend

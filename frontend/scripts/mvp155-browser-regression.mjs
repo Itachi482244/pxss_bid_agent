@@ -174,7 +174,10 @@ async function run() {
   const browser = await chromium.launch({ headless: process.env.HEADLESS !== "false" });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1100 } });
   try {
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    // domcontentloaded（不是 networkidle）：工作台加载会触发证据检索评估等真实推理请求，
+    // 接入 Infinity 后这些后台请求耗时可能 >30s，networkidle 永不空闲；后续步骤均有显式
+    // expectVisible 等待，不依赖网络空闲。
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await expectVisible(page.getByText("投标 Agent").first(), "app shell");
     await selectProject(page, project.name);
     await expectVisible(page.getByText("标书质量体检").first(), "section quality strip");

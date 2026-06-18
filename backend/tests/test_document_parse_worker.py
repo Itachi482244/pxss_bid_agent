@@ -19,7 +19,9 @@ from app.db.session import SessionLocal
 from app.main import app
 from app.models import AsyncTask, AuditLog, Document, DocumentChunk, DocumentVersion, ParseTask
 from app.parsers.pdf import PdfTextEmptyError, parse_pdf_bytes
+from app.services.document_conversion import LegacyDocConversionError
 from app.services.document_parse import execute_document_parse_task
+from app.services.project_import import execute_import_processing_background
 from scripts.seed_dev_data import seed
 
 
@@ -184,6 +186,212 @@ def test_word_parse_worker_extracts_paragraphs_and_tables(monkeypatch) -> None:
         repeated = execute_document_parse_task(db, task_id)
         assert repeated["status"] == "already_succeeded"
         assert repeated["chunk_count"] == 3
+
+
+def test_legacy_doc_parse_worker_auto_converts_to_docx(monkeypatch) -> None:
+    settings.run_tasks_inline = False
+    from app.worker import run_document_parse_task
+
+    monkeypatch.setattr(run_document_parse_task, "delay", lambda task_id: None)
+    conversion_calls: list[dict[str, object]] = []
+
+    def fake_convert_legacy_doc_to_docx(data: bytes, *, filename: str) -> bytes:
+        conversion_calls.append({"data": data, "filename": filename})
+        return build_docx_bytes()
+
+    monkeypatch.setattr(
+        "app.services.document_parse.convert_legacy_doc_to_docx",
+        fake_convert_legacy_doc_to_docx,
+    )
+
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    filename = f"旧版招标文件-{uuid4().hex}.doc"
+
+    upload_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/upload",
+        data={"doc_type": "tender", "title": "旧版 Word 招标文件"},
+        files={"file": (filename, b"legacy-word-binary", "application/msword")},
+    )
+    assert upload_response.status_code == 201
+    document_payload = upload_response.json()
+    assert document_payload["file_ext"] == "doc"
+
+    parse_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document_payload['id']}/parse-tasks",
+        json={"parser_name": "word-parser", "parser_version": "0.1.0"},
+    )
+    assert parse_response.status_code == 202
+    parse_payload = parse_response.json()
+    assert parse_payload["parser_type"] == "word"
+
+    task_id = UUID(parse_payload["task"]["id"])
+    version_id = UUID(document_payload["current_version_id"])
+
+    with SessionLocal() as db:
+        result = execute_document_parse_task(db, task_id)
+        assert result["status"] == "succeeded"
+        assert result["chunk_count"] == 3
+
+        assert conversion_calls == [{"data": b"legacy-word-binary", "filename": filename}]
+
+        task = db.get(AsyncTask, task_id)
+        assert task is not None
+        assert task.output_json is not None
+        assert task.output_json["normalization"]["source_format"] == "doc"
+        assert task.output_json["normalization"]["converted_format"] == "docx"
+
+        parse_task = db.scalar(select(ParseTask).where(ParseTask.task_id == task_id))
+        assert parse_task is not None
+        assert parse_task.result_summary_json is not None
+        assert parse_task.result_summary_json["normalization"]["source_format"] == "doc"
+
+        chunks = db.scalars(
+            select(DocumentChunk)
+            .where(DocumentChunk.document_version_id == version_id)
+            .order_by(DocumentChunk.chunk_index)
+        ).all()
+        assert len(chunks) == 3
+        assert "营业执照" in chunks[1].content_text
+
+
+def test_legacy_doc_parse_worker_reports_converter_unavailable(monkeypatch) -> None:
+    settings.run_tasks_inline = False
+    from app.worker import run_document_parse_task
+
+    monkeypatch.setattr(run_document_parse_task, "delay", lambda task_id: None)
+
+    def fake_convert_legacy_doc_to_docx(data: bytes, *, filename: str) -> bytes:  # noqa: ARG001
+        raise LegacyDocConversionError(
+            "旧版 .doc 自动转换依赖 LibreOffice/soffice，当前环境未安装转换器",
+            code="LEGACY_DOC_CONVERTER_UNAVAILABLE",
+        )
+
+    monkeypatch.setattr(
+        "app.services.document_parse.convert_legacy_doc_to_docx",
+        fake_convert_legacy_doc_to_docx,
+    )
+
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    filename = f"缺少转换器-{uuid4().hex}.doc"
+
+    upload_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/upload",
+        data={"doc_type": "tender", "title": "缺少转换器测试"},
+        files={"file": (filename, b"legacy-word-binary", "application/msword")},
+    )
+    assert upload_response.status_code == 201
+    document_payload = upload_response.json()
+
+    parse_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document_payload['id']}/parse-tasks",
+        json={"parser_name": "word-parser", "parser_version": "0.1.0"},
+    )
+    assert parse_response.status_code == 202
+    parse_payload = parse_response.json()
+
+    with SessionLocal() as db:
+        result = execute_document_parse_task(db, UUID(parse_payload["task"]["id"]))
+        assert result["status"] == "failed"
+        assert result["error_code"] == "LEGACY_DOC_CONVERTER_UNAVAILABLE"
+
+
+def test_import_background_marks_matrix_failed_when_parse_fails(monkeypatch) -> None:
+    settings.run_tasks_inline = False
+    from app.worker import run_document_parse_task
+
+    monkeypatch.setattr(run_document_parse_task, "delay", lambda task_id: None)
+
+    def fake_convert_legacy_doc_to_docx(data: bytes, *, filename: str) -> bytes:  # noqa: ARG001
+        raise LegacyDocConversionError(
+            "旧版 .doc 自动转换依赖 LibreOffice/soffice，当前环境未安装转换器",
+            code="LEGACY_DOC_CONVERTER_UNAVAILABLE",
+        )
+
+    monkeypatch.setattr(
+        "app.services.document_parse.convert_legacy_doc_to_docx",
+        fake_convert_legacy_doc_to_docx,
+    )
+
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    filename = f"导入失败联动矩阵-{uuid4().hex}.doc"
+
+    upload_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/upload",
+        data={"doc_type": "tender", "title": "导入失败联动矩阵测试"},
+        files={"file": (filename, b"legacy-word-binary", "application/msword")},
+    )
+    assert upload_response.status_code == 201
+    document_payload = upload_response.json()
+
+    parse_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document_payload['id']}/parse-tasks",
+        json={"parser_name": "word-parser", "parser_version": "0.1.0"},
+    )
+    assert parse_response.status_code == 202
+    parse_payload = parse_response.json()
+    parse_task_id = UUID(parse_payload["task"]["id"])
+
+    with SessionLocal() as db:
+        document = db.get(Document, UUID(document_payload["id"]))
+        assert document is not None
+        matrix_task = AsyncTask(
+            tenant_id=document.tenant_id,
+            project_id=UUID(project_id),
+            section_id=UUID(section_id),
+            task_type="matrix_generate",
+            status="pending",
+            idempotency_key=f"matrix-generate-test:{uuid4()}",
+            progress=0,
+            input_json={
+                "section_id": section_id,
+                "document_id": document_payload["id"],
+                "document_version_id": document_payload["current_version_id"],
+                "force": True,
+                "trigger": "project_import",
+            },
+            retry_count=0,
+            max_retries=3,
+            created_by=document.created_by,
+        )
+        db.add(matrix_task)
+        db.commit()
+        matrix_task_id = matrix_task.id
+
+    execute_import_processing_background(
+        parse_task_id=parse_task_id,
+        matrix_task_id=matrix_task_id,
+    )
+
+    with SessionLocal() as db:
+        parse_task = db.get(AsyncTask, parse_task_id)
+        matrix_task = db.get(AsyncTask, matrix_task_id)
+        assert parse_task is not None
+        assert parse_task.status == "failed"
+        assert parse_task.error_code == "LEGACY_DOC_CONVERTER_UNAVAILABLE"
+
+        assert matrix_task is not None
+        assert matrix_task.status == "failed"
+        assert matrix_task.progress == 100
+        assert matrix_task.error_code == "TENDER_PARSE_FAILED"
+        assert matrix_task.error_message is not None
+        assert "招标文件解析失败，矩阵生成未执行" in matrix_task.error_message
+        assert matrix_task.output_json is not None
+        assert matrix_task.output_json["blocked_by_task_id"] == str(parse_task_id)
+        assert matrix_task.output_json["blocked_by_error_code"] == "LEGACY_DOC_CONVERTER_UNAVAILABLE"
+
+        audit = db.scalar(
+            select(AuditLog).where(
+                AuditLog.action == "compliance.matrix_generate_failed",
+                AuditLog.object_id == matrix_task_id,
+            )
+        )
+        assert audit is not None
+        assert audit.after_json is not None
+        assert audit.after_json["error_code"] == "TENDER_PARSE_FAILED"
+        assert audit.after_json["blocked_by_task_id"] == str(parse_task_id)
 
 
 def test_pdf_text_parse_worker_extracts_pages(monkeypatch) -> None:
@@ -416,3 +624,169 @@ def test_manual_revision_creates_new_version_and_matrix_uses_revised_chunks(monk
             )
         ).all()
         assert logs
+
+
+def test_matrix_auto_resolve_targets_blocked_section_and_resolves(monkeypatch) -> None:
+    """Agent 自动处理：首轮漏抽形成阻断报告，定向重抽补齐后复检通过。"""
+    settings.run_tasks_inline = True
+    from app.worker import run_document_parse_task
+
+    monkeypatch.setattr(run_document_parse_task, "delay", lambda task_id: None)
+
+    state = {"extract_calls": 0, "found": False, "focus_hint_seen": False}
+
+    def fake_chat_completion(db, **kwargs):  # noqa: ANN001, ARG001
+        prompt_version = kwargs["prompt_version"]
+        if prompt_version == "document_section_plan@1.1.0":
+            user_content = kwargs["messages"][-1]["content"]
+            pages = json.loads(user_content.rsplit("pages:\n", 1)[1])
+            end_page = max(page["page_no"] for page in pages)
+            content = {
+                "sections": [
+                    {
+                        "section_index": 1,
+                        "title": "资格要求",
+                        "section_type": "announcement",
+                        "start_page": 1,
+                        "end_page": end_page,
+                        "confidence_score": 0.9,
+                        "evidence": "资格要求段落。",
+                    }
+                ]
+            }
+        elif prompt_version.startswith("compliance_extract_by_section@"):
+            state["extract_calls"] += 1
+            user_content = kwargs["messages"][-1]["content"]
+            # 自动处理触发的重抽必须携带上一轮漏抽线索（gap-aware 重抽），
+            # 即渲染 1.2.0 模板并注入「重点复查清单」。
+            if prompt_version == "compliance_extract_by_section@1.2.0":
+                assert "重点复查清单" in user_content
+                if "营业执照" in user_content:
+                    state["focus_hint_seen"] = True
+            chunks = json.loads(user_content.rsplit("chunks:\n", 1)[1])
+            # 首轮（matrix_generate）故意漏抽；自动处理触发的第二轮再补齐，
+            # 模拟「Agent 决定定向重抽这一段后修好」。
+            if state["extract_calls"] >= 2 and chunks:
+                state["found"] = True
+                content = {
+                    "items": [
+                        {
+                            "source_chunk_index": chunks[0]["chunk_index"],
+                            "item_type": "qualification",
+                            "requirement_text": "投标人须提供有效营业执照。",
+                            "risk_level": "high",
+                            "is_mandatory": True,
+                            "source_quote": "投标人须提供有效营业执照",
+                            "confidence_score": 0.9,
+                        }
+                    ]
+                }
+            else:
+                state["found"] = False
+                content = {"items": []}
+        else:
+            # 覆盖复核：未补齐时报高危阻断；补齐后通过。
+            if state["found"]:
+                content = {"status": "passed", "issues": []}
+            else:
+                content = {
+                    "status": "blocked",
+                    "issues": [
+                        {
+                            "severity": "high",
+                            "code": "SECTION_MISSING_KEY_CLAUSE",
+                            "message": "资格要求段落漏抽营业执照要求。",
+                        }
+                    ],
+                }
+        return SimpleNamespace(
+            content=json.dumps(content, ensure_ascii=False),
+            provider="fake",
+            model_name="unit-test",
+            log_id=None,
+            usage={},
+        )
+
+    monkeypatch.setattr("app.services.compliance_generation.chat_completion", fake_chat_completion)
+
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    filename = f"自动处理测试-{uuid4().hex}.docx"
+
+    upload_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/upload",
+        data={"doc_type": "tender", "title": "自动处理测试"},
+        files={
+            "file": (
+                filename,
+                build_docx_bytes(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert upload_response.status_code == 201
+    document_payload = upload_response.json()
+    document_id = document_payload["id"]
+    version_id = document_payload["current_version_id"]
+
+    parse_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document_id}/parse-tasks",
+        json={"parser_name": "word-parser", "parser_version": "0.1.0"},
+    )
+    assert parse_response.status_code == 202
+
+    matrix_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/generate",
+        json={
+            "document_id": document_id,
+            "document_version_id": version_id,
+            "force": True,
+            "async_processing": False,
+        },
+    )
+    assert matrix_response.status_code == 202
+
+    quality_response = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document_id}"
+        f"/versions/{version_id}/extraction-quality-report"
+    )
+    assert quality_response.status_code == 200
+    assert quality_response.json()["status"] == "blocked"
+    assert state["extract_calls"] == 1
+
+    resolve_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items/auto-resolve",
+        json={
+            "document_id": document_id,
+            "document_version_id": version_id,
+            "async_processing": False,
+        },
+    )
+    assert resolve_response.status_code == 202
+    resolve_task_id = resolve_response.json()["id"]
+
+    task_response = client.get(f"/api/v1/tasks/{resolve_task_id}")
+    assert task_response.status_code == 200
+    task_payload = task_response.json()
+    assert task_payload["status"] == "succeeded"
+    output = task_payload["output_json"]
+    assert output["resolved"] is True
+    assert output["remaining_count"] == 0
+    assert output["rounds"]
+    assert output["rounds"][0]["strategy"] == "targeted"
+    # gap-aware：自动处理重抽确实把上一轮漏抽的“营业执照”线索注入了 prompt。
+    assert state["focus_hint_seen"] is True
+
+    final_quality = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/documents/{document_id}"
+        f"/versions/{version_id}/extraction-quality-report"
+    )
+    assert final_quality.status_code == 200
+    assert final_quality.json()["status"] == "passed"
+
+    items_response = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/compliance-items",
+        params={"limit": 500},
+    )
+    assert items_response.status_code == 200
+    assert any("营业执照" in item["requirement_text"] for item in items_response.json())

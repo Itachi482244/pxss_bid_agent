@@ -71,42 +71,33 @@ services:
       mc anonymous set none local/$$MINIO_BUCKET;
       "
 
-  # Embedding + Rerank 推理服务（Infinity，OpenAI 风格 /embeddings 与 /rerank）。
-  # Mac 开发：CPU 自动；Linux/GPU 部署：command 末尾追加 --device cuda 即可复用同镜像。
-  infinity:
-    image: ${INFINITY_IMAGE:-michaelf34/infinity:latest}
-    container_name: pxss-bid-agent-infinity
+  # 旧版二进制 .doc -> .docx 转换 sidecar（headless LibreOffice + 标准库 HTTP）。
+  # 原生后端通过 LEGACY_DOC_CONVERTER_URL 调用，等同于访问 infinity 的方式。
+  # 本地/原生后端推荐用本服务；生产 compose 当前走 subprocess（backend 镜像内置 LibreOffice）。
+  libreoffice-converter:
+    image: ${LIBREOFFICE_CONVERTER_IMAGE:-pxss-bid-agent-libreoffice-converter:latest}
+    build:
+      context: ./infra/docker/libreoffice-converter
+      args:
+        # 国内网络可设 APT_MIRROR=mirrors.aliyun.com 加速 LibreOffice 下载。
+        APT_MIRROR: ${APT_MIRROR:-}
+    container_name: pxss-bid-agent-libreoffice-converter
     restart: unless-stopped
     environment:
-      HF_HOME: /app/.cache/huggingface
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
-    command:
-      - v2
-      - --model-id
-      - ${INFINITY_EMBEDDING_MODEL:-BAAI/bge-base-zh-v1.5}
-      - --model-id
-      - ${INFINITY_RERANK_MODEL:-BAAI/bge-reranker-base}
-      - --engine
-      - torch
-      # reranker 启动预热前向在部分环境会崩，跳过预热；真实推理正常。
-      - --no-model-warmup
-      - --port
-      - "7997"
+      PORT: "2004"
+      CONVERTER_TIMEOUT_SECONDS: ${LEGACY_DOC_CONVERSION_TIMEOUT_SECONDS:-120}
     ports:
-      - "${INFINITY_PORT:-7997}:7997"
-    volumes:
-      - infinity_hf_cache:/app/.cache/huggingface
+      - "${LIBREOFFICE_CONVERTER_PORT:-2004}:2004"
     healthcheck:
       test:
         - CMD-SHELL
-        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:7997/health').status==200 else 1)"
+        - python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:2004/health').status==200 else 1)"
       interval: 30s
       timeout: 10s
-      retries: 10
-      start_period: 600s
+      retries: 5
+      start_period: 30s
 
 volumes:
   postgres_data:
   redis_data:
   minio_data:
-  infinity_hf_cache:
