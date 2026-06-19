@@ -36,6 +36,8 @@ const agentActionLabels: Record<string, string> = {
   qualification_decision_preserved: "已确认参标建议",
   review_technical_response: "确认技术响应",
   review_draft_block: "审阅草稿",
+  ack_llm_technical_advice: "查看技术建议",
+  ack_llm_draft_advice: "查看草稿建议",
   agent_matrix_low_risk_pass: "自动核验"
 };
 

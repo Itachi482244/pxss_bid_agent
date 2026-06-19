@@ -23,6 +23,22 @@ from app.models import (
     QualificationDecision,
     QualificationEvaluation,
 )
+from app.services.agent.definitions import (
+    AssistPlan,
+    AssistStepDefinition,
+    StepContext,
+    base_step_context,
+)
+from app.services.agent.policy import (
+    DEFAULT_ACTION_POLICY,
+    AgentActionPolicy,
+    confirmation_requires_source_verified as policy_confirmation_requires_source_verified,
+    is_technical_item as policy_is_technical_item,
+    matrix_confidence as policy_matrix_confidence,
+    matrix_escalation_reasons as policy_matrix_escalation_reasons,
+    severity_for_compliance_item,
+)
+from app.services.agent.progress import ProgressReporter, budget_display_payload
 from app.services.evidence_policy import (
     enterprise_evidence_not_required,
     enterprise_evidence_not_required_reason,
@@ -183,66 +199,19 @@ def _active_evidence_counts(db: Session, tenant_id: uuid.UUID, item_ids: list[uu
 
 
 def _matrix_confidence(item: ComplianceItem, evidence_count: int) -> Decimal:
-    if item.confidence_score is not None:
-        return _decimal(item.confidence_score, Decimal("0.7000"))
-    score = Decimal("0.7200")
-    if item.source_chunk_id is not None:
-        score += Decimal("0.0800")
-    if item.status == "confirmed":
-        score += Decimal("0.1200")
-    if evidence_count:
-        score += Decimal("0.0400")
-    if item.risk_level == "high":
-        score -= Decimal("0.2200")
-    elif item.risk_level == "medium":
-        score -= Decimal("0.0700")
-    if item.is_mandatory:
-        score -= Decimal("0.1600")
-    if item.item_type in {"qualification", "deadline", "technical_response", "scoring"}:
-        score -= Decimal("0.1000")
-    return max(Decimal("0.0000"), min(Decimal("1.0000"), score)).quantize(Decimal("0.0001"))
+    return policy_matrix_confidence(item, evidence_count)
 
 
 def _is_technical_item(item: ComplianceItem) -> bool:
-    text = f"{item.requirement_text}\n{item.response_suggestion or ''}"
-    return item.item_type in {"technical_response", "scoring"} or (
-        item.item_type == "other"
-        and any(signal in text for signal in ("技术", "设备", "参数", "验收", "净化", "洁净"))
-    )
+    return policy_is_technical_item(item)
 
 
 def _matrix_escalation_reasons(item: ComplianceItem, evidence_count: int) -> list[str]:
-    reasons: list[str] = []
-    explanation = item.explanation_json or {}
-    if item.source_chunk_id is None:
-        reasons.append("缺少原文来源，不能自动放行")
-    if item.risk_level == "high":
-        reasons.append("高风险条款必须人工核验")
-    if item.is_mandatory:
-        reasons.append("强制响应项必须人工确认")
-    if item.item_type == "qualification":
-        reasons.append("资格类条款会影响参标结论")
-    if item.item_type == "deadline":
-        reasons.append("截止时间/关键日期类条款必须人工确认")
-    if _is_technical_item(item):
-        reasons.append("技术或评分项需要业务/技术人员复核")
-    if item.status == "needs_material":
-        reasons.append("当前标记为缺材料")
-    if requires_enterprise_evidence(item) and evidence_count == 0:
-        reasons.append("缺少企业资料证据")
-    if explanation.get("needs_human_review"):
-        reasons.append("抽取规则标记需要人工复核")
-    return list(dict.fromkeys(reasons))
+    return policy_matrix_escalation_reasons(item, evidence_count)
 
 
 def _severity_for_item(item: ComplianceItem, reasons: list[str]) -> str:
-    if item.risk_level == "high" and (item.is_mandatory or item.item_type == "qualification"):
-        return "critical"
-    if item.risk_level == "high" or item.is_mandatory or item.item_type in {"qualification", "deadline"}:
-        return "high"
-    if reasons or item.risk_level == "medium" or _is_technical_item(item):
-        return "medium"
-    return "low"
+    return severity_for_compliance_item(item, reasons)
 
 
 def _add_agent_audit(
@@ -316,13 +285,17 @@ def _supersede_previous_open_items(
     tenant_id: uuid.UUID,
     project_id: uuid.UUID,
     section_id: uuid.UUID,
+    steps: list[str],
 ) -> int:
+    if not steps:
+        return 0
     items = list(
         db.scalars(
             select(AgentReviewItem).where(
                 AgentReviewItem.tenant_id == tenant_id,
                 AgentReviewItem.project_id == project_id,
                 AgentReviewItem.section_id == section_id,
+                AgentReviewItem.step.in_(steps),
                 AgentReviewItem.status.in_(["open", "auto_passed"]),
             )
         ).all()
@@ -383,7 +356,9 @@ def _review_item(
         confidence_score=confidence_score,
         requires_human=requires_human,
         escalation_reasons=escalation_reasons,
-        recommendation_json=recommendation_json,
+        recommendation_json=budget_display_payload(recommendation_json)
+        if recommendation_json is not None
+        else None,
         source_ref_json=source_ref_json,
         triggered_by=triggered_by,
     )
@@ -468,13 +443,15 @@ def _add_matrix_review_items(
     run_key: str,
     async_task_id: uuid.UUID | None,
     actor_user_id: uuid.UUID,
+    policy: AgentActionPolicy = DEFAULT_ACTION_POLICY,
+    auto_pass_confidence: Decimal = AUTO_PASS_CONFIDENCE,
 ) -> list[AgentReviewItem]:
     review_items: list[AgentReviewItem] = []
     for item in items:
         evidence_count = evidence_counts.get(item.id, 0)
-        reasons = _matrix_escalation_reasons(item, evidence_count)
-        confidence = _matrix_confidence(item, evidence_count)
-        severity = _severity_for_item(item, reasons)
+        reasons = policy.matrix_escalation_reasons(item, evidence_count)
+        confidence = policy.matrix_confidence(item, evidence_count)
+        severity = policy.severity_for_compliance_item(item, reasons)
         if reasons:
             review_items.append(
                 _review_item(
@@ -494,7 +471,7 @@ def _add_matrix_review_items(
                     object_id=item.id,
                     compliance_item_id=item.id,
                     confidence_score=confidence,
-                    requires_human=True,
+                    requires_human=policy.requires_human("confirm_matrix_item", item),
                     escalation_reasons=reasons,
                     recommendation_json={
                         "agent_recommendation": "人工确认后再进入下游",
@@ -503,7 +480,7 @@ def _add_matrix_review_items(
                     source_ref_json=_item_source_ref(item),
                 )
             )
-        elif confidence >= AUTO_PASS_CONFIDENCE:
+        elif confidence >= auto_pass_confidence:
             review_items.append(
                 _review_item(
                     tenant_id=item.tenant_id,
@@ -522,7 +499,7 @@ def _add_matrix_review_items(
                     object_id=item.id,
                     compliance_item_id=item.id,
                     confidence_score=confidence,
-                    requires_human=False,
+                    requires_human=policy.requires_human("agent_matrix_low_risk_pass", item),
                     escalation_reasons=None,
                     recommendation_json={
                         "agent_recommendation": "低风险自动核验通过",
@@ -546,6 +523,7 @@ def _add_evidence_review_items(
     run_key: str,
     async_task_id: uuid.UUID | None,
     actor_user_id: uuid.UUID,
+    policy: AgentActionPolicy = DEFAULT_ACTION_POLICY,
 ) -> list[AgentReviewItem]:
     review_items: list[AgentReviewItem] = []
     for item in items:
@@ -561,7 +539,7 @@ def _add_evidence_review_items(
             limit=MAX_EVIDENCE_SUGGESTIONS_PER_ITEM,
         )
         if not hits:
-            severity = _severity_for_item(item, ["缺少企业资料证据"])
+            severity = policy.severity_for_compliance_item(item, ["缺少企业资料证据"])
             review_items.append(
                 _review_item(
                     tenant_id=item.tenant_id,
@@ -580,7 +558,7 @@ def _add_evidence_review_items(
                     object_id=item.id,
                     compliance_item_id=item.id,
                     confidence_score=Decimal("0.0000"),
-                    requires_human=True,
+                    requires_human=policy.requires_human("missing_evidence", item),
                     escalation_reasons=["缺少企业资料证据", "检索无可用候选"],
                     recommendation_json={
                         "agent_recommendation": "补充企业资料或人工标记无需证据",
@@ -595,7 +573,7 @@ def _add_evidence_review_items(
             confidence = _decimal(hit.confidence_score, DEFAULT_BIND_CONFIDENCE)
             reason = hit.recommend_reason or "与当前要求存在语义匹配，需人工核对后采纳。"
             evidence_text = hit.snippet or material.evidence_text or material.name
-            severity = _severity_for_item(item, ["证据绑定需人工采纳后生效"])
+            severity = policy.severity_for_compliance_item(item, ["证据绑定需人工采纳后生效"])
             review_items.append(
                 _review_item(
                     tenant_id=item.tenant_id,
@@ -615,7 +593,7 @@ def _add_evidence_review_items(
                     compliance_item_id=item.id,
                     enterprise_material_id=material.id,
                     confidence_score=confidence,
-                    requires_human=True,
+                    requires_human=policy.requires_human("accept_evidence_binding", material),
                     escalation_reasons=["证据绑定需人工采纳后生效"],
                     recommendation_json={
                         "candidate_rank": rank,
@@ -642,6 +620,7 @@ def _add_qualification_technical_review_items(
     run_key: str,
     async_task_id: uuid.UUID | None,
     actor_user_id: uuid.UUID,
+    policy: AgentActionPolicy = DEFAULT_ACTION_POLICY,
 ) -> list[AgentReviewItem]:
     review_items: list[AgentReviewItem] = []
     qualification_items = [item for item in items if item.item_type == "qualification"]
@@ -686,7 +665,10 @@ def _add_qualification_technical_review_items(
                         compliance_item_id=evaluation.compliance_item_id,
                         qualification_evaluation_id=evaluation.id,
                         confidence_score=Decimal("1.0000"),
-                        requires_human=False,
+                        requires_human=policy.requires_human(
+                            "qualification_evaluation_preserved",
+                            evaluation,
+                        ),
                         escalation_reasons=None,
                         recommendation_json={
                             "business_effect": "preserved_confirmed_evaluation",
@@ -700,21 +682,9 @@ def _add_qualification_technical_review_items(
                     )
                 )
                 continue
-            requires_human = (
-                evaluation.evaluation_status != "satisfied"
-                or evaluation.is_blocking
-                or evaluation.risk_level in {"medium", "high"}
-            )
+            requires_human = policy.requires_human("review_qualification_evaluation", evaluation)
             status = "open" if requires_human else "auto_passed"
-            severity = (
-                "critical"
-                if evaluation.is_blocking or evaluation.evaluation_status == "not_satisfied"
-                else "high"
-                if evaluation.risk_level == "high"
-                else "medium"
-                if requires_human
-                else "low"
-            )
+            severity = policy.qualification_evaluation_severity(evaluation)
             review_items.append(
                 _review_item(
                     tenant_id=evaluation.tenant_id,
@@ -760,7 +730,10 @@ def _add_qualification_technical_review_items(
                         object_id=decision.id,
                         qualification_decision_id=decision.id,
                         confidence_score=Decimal("1.0000"),
-                        requires_human=False,
+                        requires_human=policy.requires_human(
+                            "qualification_decision_preserved",
+                            decision,
+                        ),
                         escalation_reasons=None,
                         recommendation_json={
                             "business_effect": "preserved_confirmed_decision",
@@ -793,7 +766,10 @@ def _add_qualification_technical_review_items(
                         object_id=decision.id,
                         qualification_decision_id=decision.id,
                         confidence_score=Decimal("0.7000"),
-                        requires_human=True,
+                        requires_human=policy.requires_human(
+                            "confirm_qualification_decision",
+                            decision,
+                        ),
                         escalation_reasons=["Go/No-Go 参标建议必须人工确认"],
                         recommendation_json={
                             "recommendation": decision.recommendation,
@@ -829,7 +805,7 @@ def _add_qualification_technical_review_items(
                 object_id=item.id,
                 compliance_item_id=item.id,
                 confidence_score=_matrix_confidence(item, 0),
-                requires_human=True,
+                requires_human=policy.requires_human("review_technical_response", item),
                 escalation_reasons=["技术/评分项需要人工确认"],
                 recommendation_json={"agent_recommendation": "转交业务/技术人员确认响应策略"},
                 source_ref_json=_item_source_ref(item),
@@ -865,7 +841,7 @@ def _add_qualification_technical_review_items(
                 object_id=block.id,
                 draft_block_id=block.id,
                 confidence_score=Decimal("0.5000"),
-                requires_human=True,
+                requires_human=policy.requires_human("review_draft_block", block),
                 escalation_reasons=["生成式草稿内容必须人工审阅"],
                 recommendation_json={
                     "review_status": block.review_status,
@@ -902,6 +878,9 @@ def agent_assist_summary_from_items(
         suggested_actions.append("人工确认 Go/No-Go 参标建议")
     if open_action_counts["review_technical_response"]:
         suggested_actions.append(f"转交确认 {open_action_counts['review_technical_response']} 条技术/评分项")
+    llm_advice_count = open_action_counts["ack_llm_technical_advice"] + open_action_counts["ack_llm_draft_advice"]
+    if llm_advice_count:
+        suggested_actions.append(f"查看 {llm_advice_count} 条 LLM 只读建议")
     if not suggested_actions:
         suggested_actions.append("当前没有需要人工拍板的 Agent 例外项")
     return {
@@ -922,11 +901,83 @@ def agent_assist_summary_from_items(
         "missing_evidence_count": open_action_counts["missing_evidence"],
         "qualification_decision_count": open_action_counts["confirm_qualification_decision"],
         "technical_review_count": open_action_counts["review_technical_response"],
+        "llm_advice_count": llm_advice_count,
         "suggested_actions": suggested_actions,
     }
 
 
 _summary_from_items = agent_assist_summary_from_items
+
+
+def _run_matrix_review_step(ctx: StepContext) -> list[AgentReviewItem]:
+    return _add_matrix_review_items(
+        ctx.db,
+        project=ctx.project,
+        section=ctx.section,
+        items=ctx.items,
+        evidence_counts=ctx.evidence_counts,
+        run_key=ctx.run_key,
+        async_task_id=ctx.async_task_id,
+        actor_user_id=ctx.actor_user_id,
+        policy=ctx.policy,
+        auto_pass_confidence=ctx.auto_pass_confidence,
+    )
+
+
+def _run_evidence_binding_step(ctx: StepContext) -> list[AgentReviewItem]:
+    return _add_evidence_review_items(
+        ctx.db,
+        project=ctx.project,
+        section=ctx.section,
+        items=ctx.items,
+        evidence_counts=ctx.evidence_counts,
+        run_key=ctx.run_key,
+        async_task_id=ctx.async_task_id,
+        actor_user_id=ctx.actor_user_id,
+        policy=ctx.policy,
+    )
+
+
+def _run_qualification_technical_step(ctx: StepContext) -> list[AgentReviewItem]:
+    return _add_qualification_technical_review_items(
+        ctx.db,
+        project=ctx.project,
+        section=ctx.section,
+        items=ctx.items,
+        run_key=ctx.run_key,
+        async_task_id=ctx.async_task_id,
+        actor_user_id=ctx.actor_user_id,
+        policy=ctx.policy,
+    )
+
+
+def default_assist_plan() -> AssistPlan:
+    return AssistPlan(
+        steps=(
+            AssistStepDefinition(
+                step="matrix_review",
+                when_to_use="条款例外审阅与低风险自动核验",
+                runner=_run_matrix_review_step,
+                progress_start=20,
+                progress_end=45,
+                auto_pass_confidence=AUTO_PASS_CONFIDENCE,
+            ),
+            AssistStepDefinition(
+                step="evidence_binding",
+                when_to_use="缺证据暴露与候选证据建议",
+                runner=_run_evidence_binding_step,
+                progress_start=45,
+                progress_end=70,
+            ),
+            AssistStepDefinition(
+                step="qualification_technical",
+                when_to_use="资格/技术/草稿人工拍板项",
+                runner=_run_qualification_technical_step,
+                progress_start=70,
+                progress_end=90,
+            ),
+        )
+    )
 
 
 def execute_agent_assist_task(db: Session, task_id: uuid.UUID | str) -> dict[str, Any]:
@@ -940,8 +991,8 @@ def execute_agent_assist_task(db: Session, task_id: uuid.UUID | str) -> dict[str
     now = datetime.now(UTC)
     task.status = "running"
     task.started_at = task.started_at or now
-    task.progress = 5
-    db.commit()
+    reporter = ProgressReporter(db, task)
+    reporter.report(percent=5, step=None, activity="Agent 推进任务已开始", commit=True)
     run_key = str((task.input_json or {}).get("run_key") or f"assist-{task.id}")
 
     try:
@@ -950,11 +1001,21 @@ def execute_agent_assist_task(db: Session, task_id: uuid.UUID | str) -> dict[str
         if project is None or section is None:
             raise AgentAssistError("项目或标段不存在", code="PROJECT_OR_SECTION_NOT_FOUND")
 
+        requested_steps = (task.input_json or {}).get("steps")
+        requested_step_names = requested_steps if isinstance(requested_steps, list) else None
+        plan = default_assist_plan()
+        enabled_steps = plan.enabled_steps(requested_step_names)
+        if not enabled_steps:
+            raise AgentAssistError("Agent 推进任务没有可执行步骤", code="ASSIST_PLAN_EMPTY")
+        enabled_step_names = [step.step for step in enabled_steps]
+
+        reporter.report(percent=10, step="load_context", activity="加载项目、标段和历史待办")
         superseded_count = _supersede_previous_open_items(
             db,
             tenant_id=task.tenant_id,
             project_id=project.id,
             section_id=section.id,
+            steps=enabled_step_names,
         )
         items = list(
             db.scalars(
@@ -970,53 +1031,44 @@ def execute_agent_assist_task(db: Session, task_id: uuid.UUID | str) -> dict[str
         )
         evidence_counts = _active_evidence_counts(db, task.tenant_id, [item.id for item in items])
 
-        task.progress = 20
-        db.flush()
+        reporter.report(
+            percent=15,
+            step="load_context",
+            activity=f"已加载 {len(items)} 条合规条款，准备执行 {len(enabled_steps)} 个步骤",
+            current=0,
+            total=len(enabled_steps),
+        )
         created_items: list[AgentReviewItem] = []
-        created_items.extend(
-            _add_matrix_review_items(
-                db,
-                project=project,
-                section=section,
-                items=items,
-                evidence_counts=evidence_counts,
-                run_key=run_key,
-                async_task_id=task.id,
-                actor_user_id=task.created_by,
-            )
+        base_ctx = base_step_context(
+            db=db,
+            project=project,
+            section=section,
+            items=items,
+            evidence_counts=evidence_counts,
+            run_key=run_key,
+            async_task_id=task.id,
+            actor_user_id=task.created_by,
+            reporter=reporter,
+            policy=DEFAULT_ACTION_POLICY,
         )
-        db.flush()
-
-        task.progress = 50
-        db.flush()
-        created_items.extend(
-            _add_evidence_review_items(
-                db,
-                project=project,
-                section=section,
-                items=items,
-                evidence_counts=evidence_counts,
-                run_key=run_key,
-                async_task_id=task.id,
-                actor_user_id=task.created_by,
+        for index, step in enumerate(enabled_steps, start=1):
+            reporter.report(
+                percent=step.progress_start,
+                step=step.step,
+                activity=step.when_to_use,
+                current=index - 1,
+                total=len(enabled_steps),
             )
-        )
-        db.flush()
-
-        task.progress = 80
-        db.flush()
-        created_items.extend(
-            _add_qualification_technical_review_items(
-                db,
-                project=project,
-                section=section,
-                items=items,
-                run_key=run_key,
-                async_task_id=task.id,
-                actor_user_id=task.created_by,
+            step_items = step.runner(base_ctx.for_step(step))
+            created_items.extend(step_items)
+            db.flush()
+            reporter.report(
+                percent=step.progress_end,
+                step=step.step,
+                activity=f"{step.when_to_use}完成，新增 {len(step_items)} 条待办/记录",
+                current=index,
+                total=len(enabled_steps),
             )
-        )
-        db.flush()
 
         summary = _summary_from_items(
             project_id=project.id,
@@ -1040,7 +1092,14 @@ def execute_agent_assist_task(db: Session, task_id: uuid.UUID | str) -> dict[str
             severity="warning" if summary["open_count"] else "info",
         )
         task.status = "succeeded"
-        task.progress = 100
+        final_progress = reporter.report(
+            percent=100,
+            step="finished",
+            activity="Agent 推进完成",
+            current=len(enabled_steps),
+            total=len(enabled_steps),
+        )
+        summary["progress"] = final_progress
         task.output_json = summary
         task.finished_at = datetime.now(UTC)
         db.commit()
@@ -1068,6 +1127,16 @@ def execute_agent_assist_task(db: Session, task_id: uuid.UUID | str) -> dict[str
         task.progress = 100
         task.error_code = code
         task.error_message = str(exc)
+        task.output_json = {
+            **(task.output_json or {}),
+            "status": "failed",
+            "progress": {
+                "percent": 100,
+                "step": "failed",
+                "activity": "Agent 推进失败，已撤回本轮未完成清单",
+                "updated_at": failed_at.isoformat(),
+            },
+        }
         task.finished_at = failed_at
         db.commit()
         return {"status": "failed", "error_code": code, "error_message": str(exc)}
@@ -1097,7 +1166,7 @@ def _load_open_review_item(
 
 
 def _confirmation_requires_source_verified(item: ComplianceItem) -> bool:
-    return item.risk_level == "high" or item.is_mandatory or item.item_type == "qualification"
+    return policy_confirmation_requires_source_verified(item)
 
 
 def _refresh_batch_confirm_guard(item: ComplianceItem) -> None:
@@ -1401,6 +1470,24 @@ def accept_agent_review_item(
             after_json={"review_item_id": str(review_item.id), "action": review_item.action},
             reason=reason,
             severity="warning",
+        )
+    elif review_item.action in {"ack_llm_technical_advice", "ack_llm_draft_advice"}:
+        _add_user_audit(
+            db,
+            tenant_id=review_item.tenant_id,
+            project_id=review_item.project_id,
+            section_id=review_item.section_id,
+            actor_user_id=actor_user_id,
+            action="agent.llm_advice_acknowledged",
+            object_type="agent_review_item",
+            object_id=review_item.id,
+            before_json=None,
+            after_json={
+                "review_item_id": str(review_item.id),
+                "action": review_item.action,
+                "business_effect": "ack_only",
+            },
+            reason=reason,
         )
     else:
         raise AgentAssistError("该 Agent 待办不支持采纳", code="REVIEW_ITEM_ACTION_UNSUPPORTED")

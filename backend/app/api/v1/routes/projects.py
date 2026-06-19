@@ -139,6 +139,9 @@ from app.services.agent_assist import (
     dismiss_agent_review_item,
     execute_agent_assist_task,
 )
+from app.services.agent.policy import (
+    confirmation_requires_source_verified as policy_confirmation_requires_source_verified,
+)
 from app.services.business_draft import (
     BusinessDraftError,
     export_business_draft_word,
@@ -787,7 +790,7 @@ def read_items(db: Session, items: list[ComplianceItem]) -> list[ComplianceItemR
 
 
 def confirmation_requires_source_verified(item: ComplianceItem) -> bool:
-    return item.risk_level == "high" or item.is_mandatory or item.item_type == "qualification"
+    return policy_confirmation_requires_source_verified(item)
 
 
 def enterprise_evidence_not_required(item: ComplianceItem) -> bool:

@@ -772,6 +772,42 @@ def test_agent_assist_summary_suggested_actions_only_count_open_items() -> None:
     assert summary["suggested_actions"] == ["当前没有需要人工拍板的 Agent 例外项"]
 
 
+def test_agent_assist_summary_counts_llm_readonly_advice() -> None:
+    project_id = uuid4()
+    section_id = uuid4()
+    run_key = f"agent-summary-test:{uuid4().hex[:8]}"
+    item = AgentReviewItem(
+        tenant_id=uuid4(),
+        project_id=project_id,
+        section_id=section_id,
+        run_key=run_key,
+        step="qualification_technical",
+        action="ack_llm_technical_advice",
+        status="open",
+        severity="medium",
+        title="LLM 只读建议",
+        detail="建议人工查看",
+        object_type="compliance_item",
+        object_id=uuid4(),
+        confidence_score=Decimal("0.7000"),
+        requires_human=True,
+        triggered_by=uuid4(),
+    )
+
+    summary = agent_assist_service.agent_assist_summary_from_items(
+        project_id=project_id,
+        section_id=section_id,
+        run_key=run_key,
+        task_id=None,
+        items=[item],
+    )
+
+    assert summary["open_count"] == 1
+    assert summary["llm_advice_count"] == 1
+    assert summary["technical_review_count"] == 0
+    assert summary["suggested_actions"] == ["查看 1 条 LLM 只读建议"]
+
+
 def test_agent_review_accept_matrix_item_requires_source_verification() -> None:
     settings.run_tasks_inline = True
     client = TestClient(app)

@@ -126,6 +126,8 @@ flowchart TD
 | `confirm_qualification_decision` | 确认 Go/No-Go 参标建议 |
 | `review_draft_block` | 将草稿 block 标记为 `approved` |
 | `missing_evidence` | 确认已知晓缺证据风险，不自动补资料 |
+| `ack_llm_technical_advice` | 仅关闭只读技术建议并写审计，不确认技术响应 |
+| `ack_llm_draft_advice` | 仅关闭只读草稿建议并写审计，不批准草稿 block |
 
 高风险、强制项或资格项在确认前必须传入 `source_verified=true`，否则返回 409。这一点前端也做了二次确认弹窗。
 

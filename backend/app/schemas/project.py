@@ -258,6 +258,7 @@ class AgentAssistSummaryRead(BaseModel):
     missing_evidence_count: int = 0
     qualification_decision_count: int = 0
     technical_review_count: int = 0
+    llm_advice_count: int = 0
     suggested_actions: list[str] = Field(default_factory=list)
 
 

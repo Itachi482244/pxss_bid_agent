@@ -619,6 +619,7 @@ export type AgentAssistSummary = {
   missing_evidence_count: number;
   qualification_decision_count: number;
   technical_review_count: number;
+  llm_advice_count: number;
   suggested_actions: string[];
 };
 
