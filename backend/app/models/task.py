@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import text
 from sqlalchemy import UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -18,7 +19,8 @@ class AsyncTask(Base):
         CheckConstraint(
             "task_type IN ('file_acquisition', 'document_parse', 'matrix_generate', "
             "'excel_export', 'document_section_plan', 'section_compliance_extract', "
-            "'business_draft_generate', 'history_material_extract', 'matrix_auto_resolve')",
+            "'business_draft_generate', 'history_material_extract', 'matrix_auto_resolve', "
+            "'agent_assist')",
             name="async_task_type_allowed",
         ),
         CheckConstraint(
@@ -30,6 +32,16 @@ class AsyncTask(Base):
         CheckConstraint("max_retries >= 0", name="async_task_max_retries_non_negative"),
         UniqueConstraint("tenant_id", "task_type", "idempotency_key"),
         Index("idx_async_tasks_type_status", "tenant_id", "task_type", "status", "created_at"),
+        Index(
+            "uq_async_tasks_agent_assist_active_section",
+            "tenant_id",
+            "project_id",
+            "section_id",
+            unique=True,
+            postgresql_where=text(
+                "task_type = 'agent_assist' AND status IN ('pending', 'running', 'retrying')"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

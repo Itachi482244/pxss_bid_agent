@@ -18,6 +18,7 @@ from app.models import (
     ComplianceItem,
     EnterpriseMaterial,
     Project,
+    QualificationDecision,
     QualificationEvaluation,
 )
 
@@ -55,6 +56,39 @@ class EvaluationOutcome:
     reason: str
     evidence_text: str | None
     missing_materials: list[str] | None
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _uuid_text(value: uuid.UUID | None) -> str | None:
+    return str(value) if value else None
+
+
+def _evaluation_result_changed(
+    evaluation: QualificationEvaluation,
+    *,
+    requirement_text: str,
+    outcome: EvaluationOutcome,
+) -> bool:
+    return any(
+        (
+            evaluation.requirement_text != requirement_text,
+            evaluation.requirement_type != outcome.requirement_type,
+            _canonical_json(evaluation.extracted_requirement) != _canonical_json(outcome.extracted_requirement),
+            evaluation.evaluation_status != outcome.evaluation_status,
+            evaluation.risk_level != outcome.risk_level,
+            evaluation.is_blocking != outcome.is_blocking,
+            _uuid_text(evaluation.matched_material_id) != _uuid_text(outcome.matched_material_id),
+            evaluation.matched_material_name != outcome.matched_material_name,
+            evaluation.matched_rule_code != outcome.matched_rule_code,
+            evaluation.rule_version != outcome.rule_version,
+            evaluation.reason != outcome.reason,
+            evaluation.evidence_text != outcome.evidence_text,
+            _canonical_json(evaluation.missing_materials) != _canonical_json(outcome.missing_materials),
+        )
+    )
 
 
 def load_qualification_rules() -> dict[str, Any]:
@@ -612,6 +646,11 @@ def run_qualification_evaluation(
             )
             db.add(evaluation)
         else:
+            confirmation_stale = evaluation.confirmed_by is not None and _evaluation_result_changed(
+                evaluation,
+                requirement_text=item.requirement_text,
+                outcome=outcome,
+            )
             evaluation.updated_by = actor_user_id
             evaluation.requirement_text = item.requirement_text
             evaluation.requirement_type = outcome.requirement_type
@@ -626,9 +665,10 @@ def run_qualification_evaluation(
             evaluation.reason = outcome.reason
             evaluation.evidence_text = outcome.evidence_text
             evaluation.missing_materials = outcome.missing_materials
-            evaluation.confirmed_by = None
-            evaluation.confirmed_at = None
-            evaluation.confirm_reason = None
+            if confirmation_stale:
+                evaluation.confirmed_by = None
+                evaluation.confirmed_at = None
+                evaluation.confirm_reason = None
         counts[outcome.evaluation_status] += 1
         results.append(evaluation)
     db.flush()
@@ -648,3 +688,54 @@ def run_qualification_evaluation(
         )
     )
     return results
+
+
+def refresh_qualification_after_evidence_change(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    actor_type: str = "user",
+) -> dict[str, int]:
+    evaluations = run_qualification_evaluation(
+        db,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        actor_user_id=actor_user_id,
+    )
+    active_decisions = list(
+        db.scalars(
+            select(QualificationDecision).where(
+                QualificationDecision.tenant_id == tenant_id,
+                QualificationDecision.project_id == project_id,
+                QualificationDecision.section_id == section_id,
+                QualificationDecision.status != "superseded",
+            )
+        ).all()
+    )
+    for decision in active_decisions:
+        decision.status = "superseded"
+    if active_decisions:
+        db.add(
+            AuditLog(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                section_id=section_id,
+                actor_user_id=actor_user_id,
+                actor_type=actor_type,
+                action="qualification.decision_invalidated",
+                object_type="qualification_decision",
+                object_id=None,
+                before_json={"decision_ids": [str(item.id) for item in active_decisions]},
+                after_json={"reason": "enterprise_evidence_changed"},
+                reason="企业资料证据发生变化，原参标建议已失效",
+                severity="warning",
+            )
+        )
+    return {
+        "evaluation_count": len(evaluations),
+        "invalidated_decision_count": len(active_decisions),
+    }

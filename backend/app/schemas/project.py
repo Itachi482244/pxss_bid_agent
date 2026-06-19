@@ -235,6 +235,71 @@ class ComplianceMatrixAutoResolveRequest(BaseModel):
     async_processing: bool = True
 
 
+class AgentAssistRunRequest(BaseModel):
+    async_processing: bool = False
+    force: bool = True
+
+
+class AgentAssistSummaryRead(BaseModel):
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    task_id: uuid.UUID | None = None
+    run_key: str
+    total_count: int = 0
+    open_count: int = 0
+    auto_passed_count: int = 0
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
+    matrix_review_count: int = 0
+    evidence_binding_count: int = 0
+    qualification_technical_count: int = 0
+    missing_evidence_count: int = 0
+    qualification_decision_count: int = 0
+    technical_review_count: int = 0
+    suggested_actions: list[str] = Field(default_factory=list)
+
+
+class AgentReviewItemRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    async_task_id: uuid.UUID | None
+    run_key: str
+    step: str
+    action: str
+    status: str
+    severity: str
+    title: str
+    detail: str | None
+    object_type: str
+    object_id: uuid.UUID | None
+    compliance_item_id: uuid.UUID | None
+    enterprise_material_id: uuid.UUID | None
+    qualification_evaluation_id: uuid.UUID | None
+    qualification_decision_id: uuid.UUID | None
+    draft_block_id: uuid.UUID | None
+    confidence_score: Decimal | None
+    requires_human: bool
+    escalation_reasons: list[str] | None
+    recommendation_json: dict[str, Any] | None
+    source_ref_json: dict[str, Any] | None
+    triggered_by: uuid.UUID | None
+    decided_by: uuid.UUID | None
+    decided_at: datetime | None
+    decision_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentReviewItemDecisionRequest(BaseModel):
+    reason: str = Field(min_length=2, max_length=1000)
+    source_verified: bool = False
+
+
 class PreflightCheckItem(BaseModel):
     code: str
     title: str

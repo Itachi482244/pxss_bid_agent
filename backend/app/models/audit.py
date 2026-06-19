@@ -15,7 +15,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (
         CheckConstraint(
-            "actor_type IN ('user', 'system', 'worker')",
+            "actor_type IN ('user', 'system', 'worker', 'agent')",
             name="audit_log_actor_type_allowed",
         ),
         CheckConstraint(

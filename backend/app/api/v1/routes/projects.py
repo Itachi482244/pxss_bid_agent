@@ -12,6 +12,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import Select, case, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
 from app.api.deps import RequestContext, get_request_context
@@ -19,6 +20,7 @@ from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.models import (
     AsyncTask,
+    AgentReviewItem,
     AuditLog,
     ApprovalTask,
     BidSection,
@@ -48,6 +50,9 @@ from app.schemas.document import AsyncTaskRead, ComplianceMatrixExportRequest, E
 from app.schemas.enterprise import EnterpriseMaterialSearchResult
 from app.schemas.project import (
     AuditLogRead,
+    AgentAssistRunRequest,
+    AgentReviewItemDecisionRequest,
+    AgentReviewItemRead,
     ApprovalTaskCreateRequest,
     ApprovalTaskDecisionRequest,
     ApprovalTaskRead,
@@ -98,6 +103,7 @@ from app.schemas.project import (
     MatrixReviewStats,
     MatrixReviewUncoveredChunkRead,
     ModelInvocationLogRead,
+    AgentAssistSummaryRead,
     PreflightCheckItem,
     PreflightCheckRead,
     ProjectCreateRequest,
@@ -125,6 +131,14 @@ from app.schemas.project import (
     TextDiffSegment,
 )
 from app.schemas.document import DocumentChunkRead
+from app.services.agent_assist import (
+    AGENT_ASSIST_TASK_TYPE,
+    AgentAssistError,
+    accept_agent_review_item,
+    agent_assist_summary_from_items,
+    dismiss_agent_review_item,
+    execute_agent_assist_task,
+)
 from app.services.business_draft import (
     BusinessDraftError,
     export_business_draft_word,
@@ -169,7 +183,11 @@ from app.services.project_import import (
     confirm_import_draft,
     execute_import_processing_background,
 )
-from app.services.qualification_evaluation import evaluation_snapshot, run_qualification_evaluation
+from app.services.qualification_evaluation import (
+    evaluation_snapshot,
+    refresh_qualification_after_evidence_change,
+    run_qualification_evaluation,
+)
 from app.services.storage import get_object_bytes
 from app.services.task_dispatch import TaskDispatchError, enqueue_celery_task
 from app.services.word_review import (
@@ -428,55 +446,6 @@ def enterprise_evidence_summary_for_item(
     if len(names) > 2:
         summary = f"{summary} 等 {len(names)} 项"
     return len(names), summary
-
-
-def refresh_qualification_after_evidence_change(
-    db: Session,
-    ctx: RequestContext,
-    *,
-    project_id: uuid.UUID,
-    section_id: uuid.UUID,
-) -> dict[str, int]:
-    evaluations = run_qualification_evaluation(
-        db,
-        tenant_id=ctx.tenant_id,
-        project_id=project_id,
-        section_id=section_id,
-        actor_user_id=ctx.user_id,
-    )
-    active_decisions = list(
-        db.scalars(
-            select(QualificationDecision).where(
-                QualificationDecision.tenant_id == ctx.tenant_id,
-                QualificationDecision.project_id == project_id,
-                QualificationDecision.section_id == section_id,
-                QualificationDecision.status != "superseded",
-            )
-        ).all()
-    )
-    for decision in active_decisions:
-        decision.status = "superseded"
-    if active_decisions:
-        db.add(
-            AuditLog(
-                tenant_id=ctx.tenant_id,
-                project_id=project_id,
-                section_id=section_id,
-                actor_user_id=ctx.user_id,
-                actor_type="user",
-                action="qualification.decision_invalidated",
-                object_type="qualification_decision",
-                object_id=None,
-                before_json={"decision_ids": [str(item.id) for item in active_decisions]},
-                after_json={"reason": "enterprise_evidence_changed"},
-                reason="企业资料证据发生变化，原参标建议已失效",
-                severity="warning",
-            )
-        )
-    return {
-        "evaluation_count": len(evaluations),
-        "invalidated_decision_count": len(active_decisions),
-    }
 
 
 REVIEW_SIGNAL_KEYWORDS = (
@@ -2305,6 +2274,319 @@ def create_compliance_matrix_auto_resolve_task(
 def _execute_matrix_auto_resolve_background(task_id: uuid.UUID) -> None:
     with SessionLocal() as db:
         execute_matrix_auto_resolve_task(db, task_id)
+
+
+def _execute_agent_assist_background(task_id: uuid.UUID) -> None:
+    with SessionLocal() as db:
+        execute_agent_assist_task(db, task_id)
+
+
+def _agent_assist_http_error(exc: AgentAssistError) -> HTTPException:
+    conflict_codes = {
+        "REVIEW_ITEM_NOT_OPEN",
+        "SOURCE_VERIFICATION_REQUIRED",
+        "COMPLIANCE_ITEM_SOURCE_MISSING",
+        "MATERIAL_NOT_BINDABLE",
+        "MATERIAL_DATA_LEVEL_BLOCKED",
+        "EQUIVALENT_MATERIAL_ALREADY_BOUND",
+        "REVIEW_ITEM_ACTION_UNSUPPORTED",
+    }
+    not_found_codes = {
+        "REVIEW_ITEM_NOT_FOUND",
+        "COMPLIANCE_ITEM_NOT_FOUND",
+        "ENTERPRISE_MATERIAL_NOT_FOUND",
+        "QUALIFICATION_EVALUATION_NOT_FOUND",
+        "QUALIFICATION_DECISION_NOT_FOUND",
+        "DRAFT_BLOCK_NOT_FOUND",
+    }
+    status_code = status.HTTP_409_CONFLICT if exc.code in conflict_codes else status.HTTP_400_BAD_REQUEST
+    if exc.code in not_found_codes:
+        status_code = status.HTTP_404_NOT_FOUND
+    return HTTPException(status_code=status_code, detail=str(exc))
+
+
+def _find_inflight_agent_assist_task(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+) -> AsyncTask | None:
+    return db.scalar(
+        select(AsyncTask)
+        .where(
+            AsyncTask.tenant_id == tenant_id,
+            AsyncTask.project_id == project_id,
+            AsyncTask.section_id == section_id,
+            AsyncTask.task_type == AGENT_ASSIST_TASK_TYPE,
+            AsyncTask.status.in_(["pending", "running", "retrying"]),
+        )
+        .order_by(AsyncTask.created_at.desc())
+        .limit(1)
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/assist",
+    response_model=AsyncTaskRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_agent_assist_task(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: AgentAssistRunRequest,
+    background_tasks: BackgroundTasks,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> AsyncTaskRead:
+    """让 Agent 半自主推进 4/5/6 步，产出统一待拍板清单。"""
+    get_section_or_404(db, ctx, project_id, section_id)
+    inflight_task = _find_inflight_agent_assist_task(
+        db,
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+    )
+    if inflight_task is not None:
+        return AsyncTaskRead.model_validate(inflight_task)
+
+    steps = ["matrix_review", "evidence_binding", "qualification_technical"]
+    run_key = f"agent-assist:{section_id}:{uuid.uuid4().hex[:12]}"
+    input_payload = {
+        "run_key": run_key,
+        "force": payload.force,
+        "scope": "section",
+        "steps": steps,
+    }
+    idempotency_seed = run_key if payload.force else f"section:{section_id}:steps:{','.join(steps)}"
+    idempotency_key = "agent-assist:" + hashlib.sha256(
+        idempotency_seed.encode("utf-8")
+    ).hexdigest()
+    existing_task = db.scalar(
+        select(AsyncTask).where(
+            AsyncTask.tenant_id == ctx.tenant_id,
+            AsyncTask.task_type == AGENT_ASSIST_TASK_TYPE,
+            AsyncTask.idempotency_key == idempotency_key,
+        )
+    )
+    if existing_task is not None:
+        return AsyncTaskRead.model_validate(existing_task)
+
+    task = AsyncTask(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        task_type=AGENT_ASSIST_TASK_TYPE,
+        status="pending",
+        idempotency_key=idempotency_key,
+        progress=0,
+        input_json=input_payload,
+        retry_count=0,
+        max_retries=0,
+        created_by=ctx.user_id,
+    )
+    db.add(task)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        inflight_task = _find_inflight_agent_assist_task(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+        )
+        if inflight_task is None:
+            existing_task = db.scalar(
+                select(AsyncTask).where(
+                    AsyncTask.tenant_id == ctx.tenant_id,
+                    AsyncTask.task_type == AGENT_ASSIST_TASK_TYPE,
+                    AsyncTask.idempotency_key == idempotency_key,
+                )
+            )
+            if existing_task is None:
+                raise
+            return AsyncTaskRead.model_validate(existing_task)
+        return AsyncTaskRead.model_validate(inflight_task)
+    db.add(
+        AuditLog(
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=ctx.user_id,
+            actor_type="user",
+            action="agent.assist_requested",
+            object_type="async_task",
+            object_id=task.id,
+            after_json=task.input_json,
+            reason="用户请求 Agent 半自主推进条款审阅、证据绑定和资格/技术待办",
+            severity="info",
+        )
+    )
+    db.commit()
+    db.refresh(task)
+
+    if payload.async_processing and settings.run_tasks_inline:
+        background_tasks.add_task(_execute_agent_assist_background, task.id)
+    elif settings.run_tasks_inline:
+        execute_agent_assist_task(db, task.id)
+        db.refresh(task)
+    else:
+        from app.worker import run_agent_assist_task
+
+        try:
+            enqueue_celery_task(
+                db,
+                task,
+                lambda: run_agent_assist_task.delay(str(task.id)),
+            )
+        except TaskDispatchError as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+        db.refresh(task)
+    return AsyncTaskRead.model_validate(task)
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/agent-review-items/summary",
+    response_model=AgentAssistSummaryRead,
+)
+def get_agent_review_summary(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    run_key: str | None = Query(default=None),
+) -> AgentAssistSummaryRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    stmt = select(AgentReviewItem).where(
+        AgentReviewItem.tenant_id == ctx.tenant_id,
+        AgentReviewItem.project_id == project_id,
+        AgentReviewItem.section_id == section_id,
+    )
+    if run_key:
+        stmt = stmt.where(AgentReviewItem.run_key == run_key)
+    else:
+        latest_run_key = db.scalar(
+            select(AgentReviewItem.run_key)
+            .where(
+                AgentReviewItem.tenant_id == ctx.tenant_id,
+                AgentReviewItem.project_id == project_id,
+                AgentReviewItem.section_id == section_id,
+            )
+            .order_by(AgentReviewItem.created_at.desc())
+            .limit(1)
+        )
+        if latest_run_key:
+            stmt = stmt.where(AgentReviewItem.run_key == latest_run_key)
+            run_key = latest_run_key
+    items = list(db.scalars(stmt).all())
+    summary = agent_assist_summary_from_items(
+        project_id=project_id,
+        section_id=section_id,
+        run_key=run_key or "",
+        task_id=items[0].async_task_id if items else None,
+        items=items,
+    )
+    return AgentAssistSummaryRead.model_validate(summary)
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/agent-review-items",
+    response_model=list[AgentReviewItemRead],
+)
+def list_agent_review_items(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+    step: str | None = None,
+    run_key: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> list[AgentReviewItemRead]:
+    get_section_or_404(db, ctx, project_id, section_id)
+    stmt = select(AgentReviewItem).where(
+        AgentReviewItem.tenant_id == ctx.tenant_id,
+        AgentReviewItem.project_id == project_id,
+        AgentReviewItem.section_id == section_id,
+    )
+    if status_filter:
+        stmt = stmt.where(AgentReviewItem.status == status_filter)
+    if step:
+        stmt = stmt.where(AgentReviewItem.step == step)
+    if run_key:
+        stmt = stmt.where(AgentReviewItem.run_key == run_key)
+    stmt = stmt.order_by(
+        case(
+            (AgentReviewItem.severity == "critical", 0),
+            (AgentReviewItem.severity == "high", 1),
+            (AgentReviewItem.severity == "medium", 2),
+            else_=3,
+        ),
+        AgentReviewItem.created_at.desc(),
+    ).limit(limit)
+    return [AgentReviewItemRead.model_validate(item) for item in db.scalars(stmt).all()]
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/agent-review-items/{review_item_id}/accept",
+    response_model=AgentReviewItemRead,
+)
+def accept_agent_review_item_endpoint(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    review_item_id: uuid.UUID,
+    payload: AgentReviewItemDecisionRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> AgentReviewItemRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        item = accept_agent_review_item(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            review_item_id=review_item_id,
+            actor_user_id=ctx.user_id,
+            reason=payload.reason.strip(),
+            source_verified=payload.source_verified,
+        )
+    except AgentAssistError as exc:
+        raise _agent_assist_http_error(exc) from exc
+    db.commit()
+    db.refresh(item)
+    return AgentReviewItemRead.model_validate(item)
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/agent-review-items/{review_item_id}/dismiss",
+    response_model=AgentReviewItemRead,
+)
+def dismiss_agent_review_item_endpoint(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    review_item_id: uuid.UUID,
+    payload: AgentReviewItemDecisionRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> AgentReviewItemRead:
+    get_section_or_404(db, ctx, project_id, section_id)
+    try:
+        item = dismiss_agent_review_item(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            review_item_id=review_item_id,
+            actor_user_id=ctx.user_id,
+            reason=payload.reason.strip(),
+        )
+    except AgentAssistError as exc:
+        raise _agent_assist_http_error(exc) from exc
+    db.commit()
+    db.refresh(item)
+    return AgentReviewItemRead.model_validate(item)
 
 
 @router.post(
@@ -4754,9 +5036,10 @@ def waive_compliance_evidence_requirement(
         db.flush()
         qualification_refresh = refresh_qualification_after_evidence_change(
             db,
-            ctx,
+            tenant_id=ctx.tenant_id,
             project_id=project_id,
             section_id=section_id,
+            actor_user_id=ctx.user_id,
         )
     add_matrix_audit_log(
         db,
@@ -4877,9 +5160,10 @@ def bind_compliance_evidence(
     if item.item_type == "qualification":
         qualification_refresh = refresh_qualification_after_evidence_change(
             db,
-            ctx,
+            tenant_id=ctx.tenant_id,
             project_id=project_id,
             section_id=section_id,
+            actor_user_id=ctx.user_id,
         )
     after = {
         "item": compliance_item_snapshot(item),
@@ -4940,9 +5224,10 @@ def unbind_compliance_evidence(
     if item.item_type == "qualification":
         qualification_refresh = refresh_qualification_after_evidence_change(
             db,
-            ctx,
+            tenant_id=ctx.tenant_id,
             project_id=project_id,
             section_id=section_id,
+            actor_user_id=ctx.user_id,
         )
     add_matrix_audit_log(
         db,

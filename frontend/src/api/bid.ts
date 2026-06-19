@@ -601,6 +601,59 @@ export type AsyncTask = {
   updated_at: string;
 };
 
+export type AgentAssistSummary = {
+  project_id: string;
+  section_id: string;
+  task_id: string | null;
+  run_key: string;
+  total_count: number;
+  open_count: number;
+  auto_passed_count: number;
+  critical_count: number;
+  high_count: number;
+  medium_count: number;
+  low_count: number;
+  matrix_review_count: number;
+  evidence_binding_count: number;
+  qualification_technical_count: number;
+  missing_evidence_count: number;
+  qualification_decision_count: number;
+  technical_review_count: number;
+  suggested_actions: string[];
+};
+
+export type AgentReviewItem = {
+  id: string;
+  project_id: string;
+  section_id: string;
+  async_task_id: string | null;
+  run_key: string;
+  step: "matrix_review" | "evidence_binding" | "qualification_technical" | string;
+  action: string;
+  status: "open" | "accepted" | "dismissed" | "superseded" | "auto_passed" | string;
+  severity: "low" | "medium" | "high" | "critical" | string;
+  title: string;
+  detail: string | null;
+  object_type: string;
+  object_id: string | null;
+  compliance_item_id: string | null;
+  enterprise_material_id: string | null;
+  qualification_evaluation_id: string | null;
+  qualification_decision_id: string | null;
+  draft_block_id: string | null;
+  confidence_score: string | null;
+  requires_human: boolean;
+  escalation_reasons: string[] | null;
+  recommendation_json: Record<string, unknown> | null;
+  source_ref_json: Record<string, unknown> | null;
+  triggered_by: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type ParseTask = {
   id: string;
   task: AsyncTask;
@@ -2001,6 +2054,78 @@ export async function autoResolveComplianceMatrix(
     `/projects/${projectId}/sections/${sectionId}/compliance-items/auto-resolve`,
     payload ?? {},
     { timeout: 1500000 }
+  );
+  return response.data;
+}
+
+export async function createAgentAssistTask(
+  projectId: string,
+  sectionId: string,
+  payload?: {
+    async_processing?: boolean;
+    force?: boolean;
+  }
+) {
+  const response = await apiClient.post<AsyncTask>(
+    `/projects/${projectId}/sections/${sectionId}/assist`,
+    payload ?? {},
+    { timeout: 1500000 }
+  );
+  return response.data;
+}
+
+export async function listAgentReviewItems(
+  projectId: string,
+  sectionId: string,
+  params?: {
+    status?: string;
+    step?: string;
+    run_key?: string;
+    limit?: number;
+  }
+) {
+  const response = await apiClient.get<AgentReviewItem[]>(
+    `/projects/${projectId}/sections/${sectionId}/agent-review-items`,
+    { params }
+  );
+  return response.data;
+}
+
+export async function getAgentReviewSummary(projectId: string, sectionId: string, runKey?: string) {
+  const response = await apiClient.get<AgentAssistSummary>(
+    `/projects/${projectId}/sections/${sectionId}/agent-review-items/summary`,
+    { params: runKey ? { run_key: runKey } : undefined }
+  );
+  return response.data;
+}
+
+export async function acceptAgentReviewItem(
+  projectId: string,
+  sectionId: string,
+  reviewItemId: string,
+  payload: {
+    reason: string;
+    source_verified?: boolean;
+  }
+) {
+  const response = await apiClient.post<AgentReviewItem>(
+    `/projects/${projectId}/sections/${sectionId}/agent-review-items/${reviewItemId}/accept`,
+    payload
+  );
+  return response.data;
+}
+
+export async function dismissAgentReviewItem(
+  projectId: string,
+  sectionId: string,
+  reviewItemId: string,
+  payload: {
+    reason: string;
+  }
+) {
+  const response = await apiClient.post<AgentReviewItem>(
+    `/projects/${projectId}/sections/${sectionId}/agent-review-items/${reviewItemId}/dismiss`,
+    payload
   );
   return response.data;
 }

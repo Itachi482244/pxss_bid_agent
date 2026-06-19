@@ -18,21 +18,29 @@ from docx.shared import Inches, Pt, RGBColor
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.main import app
 from app.models import (
+    AgentReviewItem,
+    AsyncTask,
     AuditLog,
     BidSection,
+    ComplianceEvidenceBinding,
     ComplianceItem,
     Document,
     DocumentChunk,
     DocumentVersion,
+    EnterpriseMaterial,
     Project,
     ProjectMember,
+    QualificationDecision,
+    QualificationEvaluation,
     User,
 )
+from app.services import agent_assist as agent_assist_service
 from app.services.document_conversion import LegacyDocConversionError
 from app.services.file_acquisition import DownloadedFile
 from scripts.seed_dev_data import seed
@@ -52,6 +60,83 @@ def get_seed_project_and_section(client: TestClient) -> tuple[str, str]:
     project = next(item for item in projects if item["name"] == "智慧园区弱电工程投标")
     sections = client.get(f"/api/v1/projects/{project['id']}/sections").json()
     return project["id"], sections[0]["id"]
+
+
+def get_cleanroom_project_and_section(client: TestClient) -> tuple[str, str]:
+    projects = client.get("/api/v1/projects", params={"limit": 200}).json()
+    project = next(item for item in projects if item["name"] == "洁净车间净化设备采购与安装项目")
+    sections = client.get(f"/api/v1/projects/{project['id']}/sections").json()
+    return project["id"], sections[0]["id"]
+
+
+def create_agent_assist_fixture(
+    project_id: str,
+    section_id: str,
+    *,
+    token: str,
+    status: str = "needs_material",
+    risk_level: str = "medium",
+    is_mandatory: bool = True,
+) -> tuple[str, str]:
+    with SessionLocal() as db:
+        project = db.get(Project, UUID(project_id))
+        section = db.get(BidSection, UUID(section_id))
+        assert project is not None
+        assert section is not None
+        user = db.scalar(select(User).where(User.tenant_id == project.tenant_id, User.status == "active"))
+        assert user is not None
+        document = db.scalar(
+            select(Document).where(
+                Document.project_id == project.id,
+                Document.section_id == section.id,
+                Document.current_version_id.is_not(None),
+            )
+        )
+        assert document is not None
+        version = db.get(DocumentVersion, document.current_version_id)
+        assert version is not None
+        chunk = db.scalar(
+            select(DocumentChunk)
+            .where(DocumentChunk.document_version_id == version.id)
+            .order_by(DocumentChunk.chunk_index.asc())
+        )
+        assert chunk is not None
+        material = EnterpriseMaterial(
+            tenant_id=project.tenant_id,
+            material_type="license",
+            name=f"Agent测试营业执照-{token}",
+            data_level="internal",
+            verification_status="confirmed",
+            evidence_text=f"Agent测试营业执照 {token} 可证明主体资格，供 agent 证据建议测试使用。",
+            file_name=f"agent-license-{token}.pdf",
+            created_by=user.id,
+            updated_by=user.id,
+        )
+        db.add(material)
+        db.flush()
+        item = ComplianceItem(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            section_id=section.id,
+            source_document_id=document.id,
+            source_version_id=version.id,
+            source_chunk_id=chunk.id,
+            source_page_no=chunk.page_no,
+            item_type="qualification",
+            requirement_text=f"投标人须提供 Agent测试营业执照 {token}，并保证真实有效。",
+            normalized_requirement=f"agent_assist_license_{token}",
+            response_suggestion=f"绑定 Agent测试营业执照-{token} 作为资格证明。",
+            evidence_text=chunk.content_text,
+            status=status,
+            risk_level=risk_level,
+            is_mandatory=is_mandatory,
+            is_batch_confirm_allowed=False,
+            confidence_score=Decimal("0.9300"),
+            created_by=user.id,
+        )
+        db.add(item)
+        db.commit()
+        return str(item.id), str(material.id)
 
 
 def test_project_read_api_returns_seeded_workspace() -> None:
@@ -133,6 +218,612 @@ def test_cleanroom_demo_sample_is_seeded_for_mvp1_hardening() -> None:
     assert search_response.status_code == 200
     results = search_response.json()
     assert any(item["material_type"] == "test_report" and item["recommend_reason"] for item in results)
+
+
+def test_agent_assist_creates_exception_review_items() -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_cleanroom_project_and_section(client)
+    with SessionLocal() as db:
+        active_decisions = db.scalars(
+            select(QualificationDecision).where(
+                QualificationDecision.project_id == UUID(project_id),
+                QualificationDecision.section_id == UUID(section_id),
+                QualificationDecision.status != "superseded",
+            )
+        ).all()
+        for decision in active_decisions:
+            decision.status = "superseded"
+        db.commit()
+
+    response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/assist",
+        json={"async_processing": False},
+    )
+
+    assert response.status_code == 202
+    task = response.json()
+    assert task["task_type"] == "agent_assist"
+    assert task["status"] == "succeeded"
+    assert task["output_json"]["open_count"] >= 1
+    assert task["output_json"]["matrix_review_count"] >= 1
+    assert task["output_json"]["qualification_technical_count"] >= 1
+
+    items_response = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items",
+        params={"status": "open", "run_key": task["output_json"]["run_key"]},
+    )
+    assert items_response.status_code == 200
+    review_items = items_response.json()
+    actions = {item["action"] for item in review_items}
+    assert "confirm_matrix_item" in actions
+    assert "confirm_qualification_decision" in actions
+    assert "review_technical_response" in actions
+    assert any(action in actions for action in {"accept_evidence_binding", "missing_evidence"})
+    assert all(item["requires_human"] is True for item in review_items)
+
+    summary_response = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items/summary",
+        params={"run_key": task["output_json"]["run_key"]},
+    )
+    assert summary_response.status_code == 200
+    summary = summary_response.json()
+    assert summary["open_count"] == task["output_json"]["open_count"]
+    assert summary["suggested_actions"]
+
+    with SessionLocal() as db:
+        logs = db.scalars(
+            select(AuditLog).where(
+                AuditLog.project_id == UUID(project_id),
+                AuditLog.section_id == UUID(section_id),
+                AuditLog.action == "agent.assist_finished",
+            )
+        ).all()
+        assert logs
+        assert all(log.actor_type == "agent" for log in logs)
+
+
+def test_agent_assist_preserves_confirmed_qualification_decision_on_rerun() -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_cleanroom_project_and_section(client)
+
+    with SessionLocal() as db:
+        active_decisions = db.scalars(
+            select(QualificationDecision).where(
+                QualificationDecision.project_id == UUID(project_id),
+                QualificationDecision.section_id == UUID(section_id),
+                QualificationDecision.status != "superseded",
+            )
+        ).all()
+        for decision in active_decisions:
+            decision.status = "superseded"
+        db.commit()
+
+    first_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/assist",
+        json={"async_processing": False},
+    )
+    assert first_response.status_code == 202
+    first_run_key = first_response.json()["output_json"]["run_key"]
+    review_response = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items",
+        params={"status": "open", "step": "qualification_technical", "run_key": first_run_key, "limit": 500},
+    )
+    assert review_response.status_code == 200
+    decision_item = next(
+        item for item in review_response.json() if item["action"] == "confirm_qualification_decision"
+    )
+    decision_id = decision_item["qualification_decision_id"]
+
+    accept_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items/{decision_item['id']}/accept",
+        json={"reason": "测试人工确认 Go/No-Go 结论"},
+    )
+    assert accept_response.status_code == 200
+
+    second_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/assist",
+        json={"async_processing": False},
+    )
+    assert second_response.status_code == 202
+    second_run_key = second_response.json()["output_json"]["run_key"]
+
+    with SessionLocal() as db:
+        decision = db.get(QualificationDecision, UUID(decision_id))
+        assert decision is not None
+        assert decision.status == "confirmed"
+        assert decision.confirm_reason == "测试人工确认 Go/No-Go 结论"
+        open_decision_item = db.scalar(
+            select(AgentReviewItem).where(
+                AgentReviewItem.run_key == second_run_key,
+                AgentReviewItem.action == "confirm_qualification_decision",
+                AgentReviewItem.status == "open",
+            )
+        )
+        assert open_decision_item is None
+        preserved_item = db.scalar(
+            select(AgentReviewItem).where(
+                AgentReviewItem.run_key == second_run_key,
+                AgentReviewItem.action == "qualification_decision_preserved",
+                AgentReviewItem.status == "auto_passed",
+                AgentReviewItem.qualification_decision_id == UUID(decision_id),
+            )
+        )
+        assert preserved_item is not None
+
+
+def test_agent_assist_preserves_confirmed_qualification_evaluation_on_rerun() -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_cleanroom_project_and_section(client)
+
+    run_response = client.post(f"/api/v1/projects/{project_id}/sections/{section_id}/qualification-evaluations/run")
+    assert run_response.status_code == 200
+    evaluation = run_response.json()[0]
+
+    confirm_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/qualification-evaluations/{evaluation['id']}/confirm",
+        json={"reason": "测试人工确认资格评估项"},
+    )
+    assert confirm_response.status_code == 200
+    assert confirm_response.json()["confirmed_by"] is not None
+
+    assist_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/assist",
+        json={"async_processing": False},
+    )
+    assert assist_response.status_code == 202
+
+    evaluations_response = client.get(f"/api/v1/projects/{project_id}/sections/{section_id}/qualification-evaluations")
+    assert evaluations_response.status_code == 200
+    preserved = next(item for item in evaluations_response.json() if item["id"] == evaluation["id"])
+    assert preserved["confirmed_by"] is not None
+    assert preserved["confirmed_at"] is not None
+    assert preserved["confirm_reason"] == "测试人工确认资格评估项"
+    run_key = assist_response.json()["output_json"]["run_key"]
+    with SessionLocal() as db:
+        open_review = db.scalar(
+            select(AgentReviewItem).where(
+                AgentReviewItem.run_key == run_key,
+                AgentReviewItem.action == "review_qualification_evaluation",
+                AgentReviewItem.qualification_evaluation_id == UUID(evaluation["id"]),
+                AgentReviewItem.status == "open",
+            )
+        )
+        assert open_review is None
+        preserved_review = db.scalar(
+            select(AgentReviewItem).where(
+                AgentReviewItem.run_key == run_key,
+                AgentReviewItem.action == "qualification_evaluation_preserved",
+                AgentReviewItem.qualification_evaluation_id == UUID(evaluation["id"]),
+                AgentReviewItem.status == "auto_passed",
+            )
+        )
+        assert preserved_review is not None
+
+
+def test_qualification_evaluation_rerun_clears_confirmation_when_result_changes() -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_cleanroom_project_and_section(client)
+
+    run_response = client.post(f"/api/v1/projects/{project_id}/sections/{section_id}/qualification-evaluations/run")
+    assert run_response.status_code == 200
+    evaluation = run_response.json()[0]
+    confirm_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/qualification-evaluations/{evaluation['id']}/confirm",
+        json={"reason": "测试确认后结果变化要撤销"},
+    )
+    assert confirm_response.status_code == 200
+
+    with SessionLocal() as db:
+        item = db.get(ComplianceItem, UUID(evaluation["compliance_item_id"]))
+        assert item is not None
+        item.requirement_text = f"{item.requirement_text} 补充测试变更 {uuid4().hex[:6]}"
+        db.commit()
+
+    rerun_response = client.post(f"/api/v1/projects/{project_id}/sections/{section_id}/qualification-evaluations/run")
+    assert rerun_response.status_code == 200
+    with SessionLocal() as db:
+        updated = db.get(QualificationEvaluation, UUID(evaluation["id"]))
+        assert updated is not None
+        assert updated.confirmed_by is None
+        assert updated.confirmed_at is None
+        assert updated.confirm_reason is None
+
+
+def test_agent_assist_reuses_inflight_task_for_same_section() -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+
+    with SessionLocal() as db:
+        project = db.get(Project, UUID(project_id))
+        assert project is not None
+        user = db.scalar(select(User).where(User.tenant_id == project.tenant_id, User.status == "active"))
+        assert user is not None
+        active_tasks = db.scalars(
+            select(AsyncTask).where(
+                AsyncTask.tenant_id == project.tenant_id,
+                AsyncTask.project_id == UUID(project_id),
+                AsyncTask.section_id == UUID(section_id),
+                AsyncTask.task_type == "agent_assist",
+                AsyncTask.status.in_(["pending", "running", "retrying"]),
+            )
+        ).all()
+        for task in active_tasks:
+            task.status = "canceled"
+        task = AsyncTask(
+            tenant_id=project.tenant_id,
+            project_id=UUID(project_id),
+            section_id=UUID(section_id),
+            task_type="agent_assist",
+            status="running",
+            idempotency_key=f"agent-assist-inflight-test:{uuid4().hex}",
+            progress=35,
+            input_json={"run_key": f"agent-assist-inflight-test:{uuid4().hex[:8]}"},
+            retry_count=0,
+            max_retries=0,
+            created_by=user.id,
+        )
+        db.add(task)
+        db.commit()
+        task_id = str(task.id)
+
+    response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/assist",
+        json={"async_processing": False},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["id"] == task_id
+    assert payload["status"] == "running"
+    with SessionLocal() as db:
+        active_count = db.scalar(
+            select(func.count(AsyncTask.id)).where(
+                AsyncTask.project_id == UUID(project_id),
+                AsyncTask.section_id == UUID(section_id),
+                AsyncTask.task_type == "agent_assist",
+                AsyncTask.status.in_(["pending", "running", "retrying"]),
+            )
+        )
+        assert active_count == 1
+        active_task = db.get(AsyncTask, UUID(task_id))
+        assert active_task is not None
+        active_task.status = "canceled"
+        db.commit()
+
+
+def test_agent_assist_active_task_unique_index_blocks_duplicate_inflight() -> None:
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+
+    with SessionLocal() as db:
+        project = db.get(Project, UUID(project_id))
+        assert project is not None
+        user = db.scalar(select(User).where(User.tenant_id == project.tenant_id, User.status == "active"))
+        assert user is not None
+        active_tasks = db.scalars(
+            select(AsyncTask).where(
+                AsyncTask.tenant_id == project.tenant_id,
+                AsyncTask.project_id == UUID(project_id),
+                AsyncTask.section_id == UUID(section_id),
+                AsyncTask.task_type == "agent_assist",
+                AsyncTask.status.in_(["pending", "running", "retrying"]),
+            )
+        ).all()
+        for task in active_tasks:
+            task.status = "canceled"
+        first = AsyncTask(
+            tenant_id=project.tenant_id,
+            project_id=UUID(project_id),
+            section_id=UUID(section_id),
+            task_type="agent_assist",
+            status="pending",
+            idempotency_key=f"agent-assist-unique-test:{uuid4().hex}",
+            progress=0,
+            input_json={"run_key": f"agent-assist-unique-test:{uuid4().hex[:8]}"},
+            retry_count=0,
+            max_retries=0,
+            created_by=user.id,
+        )
+        db.add(first)
+        db.commit()
+        first_id = first.id
+
+    with SessionLocal() as db:
+        project = db.get(Project, UUID(project_id))
+        assert project is not None
+        user = db.scalar(select(User).where(User.tenant_id == project.tenant_id, User.status == "active"))
+        assert user is not None
+        duplicate = AsyncTask(
+            tenant_id=project.tenant_id,
+            project_id=UUID(project_id),
+            section_id=UUID(section_id),
+            task_type="agent_assist",
+            status="running",
+            idempotency_key=f"agent-assist-unique-test:{uuid4().hex}",
+            progress=10,
+            input_json={"run_key": f"agent-assist-unique-test:{uuid4().hex[:8]}"},
+            retry_count=0,
+            max_retries=0,
+            created_by=user.id,
+        )
+        db.add(duplicate)
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+
+    with SessionLocal() as db:
+        first = db.get(AsyncTask, first_id)
+        assert first is not None
+        first.status = "canceled"
+        db.commit()
+
+
+def test_agent_assist_failure_supersedes_partial_run_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    token = uuid4().hex[:8]
+    item_id, _material_id = create_agent_assist_fixture(project_id, section_id, token=token)
+    run_key = f"agent-assist-failure-test:{uuid4().hex[:8]}"
+
+    with SessionLocal() as db:
+        project = db.get(Project, UUID(project_id))
+        assert project is not None
+        user = db.scalar(select(User).where(User.tenant_id == project.tenant_id, User.status == "active"))
+        assert user is not None
+        previous_item = AgentReviewItem(
+            tenant_id=project.tenant_id,
+            project_id=UUID(project_id),
+            section_id=UUID(section_id),
+            run_key=f"agent-assist-previous-test:{uuid4().hex[:8]}",
+            step="matrix_review",
+            action="confirm_matrix_item",
+            status="open",
+            severity="high",
+            title="失败回滚前的待办",
+            detail="用于验证失败不清空旧待办",
+            object_type="compliance_item",
+            object_id=UUID(item_id),
+            compliance_item_id=UUID(item_id),
+            confidence_score=Decimal("0.5000"),
+            requires_human=True,
+            escalation_reasons=["测试旧待办"],
+            triggered_by=user.id,
+        )
+        db.add(previous_item)
+        task = AsyncTask(
+            tenant_id=project.tenant_id,
+            project_id=UUID(project_id),
+            section_id=UUID(section_id),
+            task_type="agent_assist",
+            status="pending",
+            idempotency_key=f"agent-assist-failure-test:{uuid4().hex}",
+            progress=0,
+            input_json={
+                "run_key": run_key,
+                "force": True,
+                "scope": "section",
+                "steps": ["matrix_review", "evidence_binding", "qualification_technical"],
+            },
+            retry_count=0,
+            max_retries=0,
+            created_by=user.id,
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        previous_item_id = previous_item.id
+
+    def fail_material_search(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("material search exploded")
+
+    monkeypatch.setattr(agent_assist_service, "search_material_hits", fail_material_search)
+    with SessionLocal() as db:
+        result = agent_assist_service.execute_agent_assist_task(db, task_id)
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "AGENT_ASSIST_FAILED"
+    with SessionLocal() as db:
+        task = db.get(AsyncTask, task_id)
+        assert task is not None
+        assert task.status == "failed"
+        previous_item = db.get(AgentReviewItem, previous_item_id)
+        assert previous_item is not None
+        assert previous_item.status == "open"
+        current_run_items = db.scalars(
+            select(AgentReviewItem).where(
+                AgentReviewItem.async_task_id == task_id,
+                AgentReviewItem.run_key == run_key,
+            )
+        ).all()
+        assert current_run_items == []
+
+
+def test_agent_review_accept_evidence_suggestion_binds_material() -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    token = uuid4().hex[:8]
+    item_id, material_id = create_agent_assist_fixture(project_id, section_id, token=token)
+    with SessionLocal() as db:
+        active_decisions = db.scalars(
+            select(QualificationDecision).where(
+                QualificationDecision.project_id == UUID(project_id),
+                QualificationDecision.section_id == UUID(section_id),
+                QualificationDecision.status != "superseded",
+            )
+        ).all()
+        for decision in active_decisions:
+            decision.status = "superseded"
+        db.commit()
+
+    assist_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/assist",
+        json={"async_processing": False},
+    )
+    assert assist_response.status_code == 202
+    run_key = assist_response.json()["output_json"]["run_key"]
+    with SessionLocal() as db:
+        active_decision = db.scalar(
+            select(QualificationDecision).where(
+                QualificationDecision.project_id == UUID(project_id),
+                QualificationDecision.section_id == UUID(section_id),
+                QualificationDecision.status != "superseded",
+            )
+        )
+        assert active_decision is not None
+        active_decision_id = active_decision.id
+
+    review_response = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items",
+        params={"status": "open", "step": "evidence_binding", "run_key": run_key, "limit": 500},
+    )
+    assert review_response.status_code == 200
+    suggestion = next(
+        item
+        for item in review_response.json()
+        if item["action"] == "accept_evidence_binding"
+        and item["compliance_item_id"] == item_id
+        and item["enterprise_material_id"] == material_id
+    )
+
+    accept_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items/{suggestion['id']}/accept",
+        json={"reason": "测试采纳 agent 证据建议"},
+    )
+
+    assert accept_response.status_code == 200
+    accepted = accept_response.json()
+    assert accepted["status"] == "accepted"
+    assert accepted["decided_by"]
+    with SessionLocal() as db:
+        binding = db.scalar(
+            select(ComplianceEvidenceBinding).where(
+                ComplianceEvidenceBinding.compliance_item_id == UUID(item_id),
+                ComplianceEvidenceBinding.enterprise_material_id == UUID(material_id),
+                ComplianceEvidenceBinding.status == "active",
+            )
+        )
+        assert binding is not None
+        assert "测试采纳 agent 证据建议" in binding.bind_reason
+        item = db.get(ComplianceItem, UUID(item_id))
+        assert item is not None
+        assert item.status == "pending_confirm"
+        decision = db.get(QualificationDecision, active_decision_id)
+        assert decision is not None
+        assert decision.status == "superseded"
+        evaluation = db.scalar(
+            select(QualificationEvaluation).where(
+                QualificationEvaluation.compliance_item_id == UUID(item_id),
+                QualificationEvaluation.project_id == UUID(project_id),
+                QualificationEvaluation.section_id == UUID(section_id),
+            )
+        )
+        assert evaluation is not None
+        assert evaluation.evaluation_status != "needs_material"
+        assert evaluation.matched_material_id == UUID(material_id)
+        audit = db.scalar(
+            select(AuditLog).where(
+                AuditLog.object_id == binding.id,
+                AuditLog.action == "agent.evidence_suggestion_accepted",
+            )
+        )
+        assert audit is not None
+        assert audit.actor_type == "user"
+        assert audit.after_json is not None
+        assert audit.after_json["qualification_refresh"]["invalidated_decision_count"] >= 1
+
+
+def test_agent_assist_summary_suggested_actions_only_count_open_items() -> None:
+    project_id = uuid4()
+    section_id = uuid4()
+    run_key = f"agent-summary-test:{uuid4().hex[:8]}"
+    item = AgentReviewItem(
+        tenant_id=uuid4(),
+        project_id=project_id,
+        section_id=section_id,
+        run_key=run_key,
+        step="matrix_review",
+        action="confirm_matrix_item",
+        status="accepted",
+        severity="high",
+        title="已处理条款",
+        detail="已处理",
+        object_type="compliance_item",
+        object_id=uuid4(),
+        confidence_score=Decimal("0.5000"),
+        requires_human=True,
+        triggered_by=uuid4(),
+    )
+    summary = agent_assist_service.agent_assist_summary_from_items(
+        project_id=project_id,
+        section_id=section_id,
+        run_key=run_key,
+        task_id=None,
+        items=[item],
+    )
+
+    assert summary["open_count"] == 0
+    assert summary["suggested_actions"] == ["当前没有需要人工拍板的 Agent 例外项"]
+
+
+def test_agent_review_accept_matrix_item_requires_source_verification() -> None:
+    settings.run_tasks_inline = True
+    client = TestClient(app)
+    project_id, section_id = get_seed_project_and_section(client)
+    token = uuid4().hex[:8]
+    item_id, _material_id = create_agent_assist_fixture(
+        project_id,
+        section_id,
+        token=token,
+        status="pending_confirm",
+        risk_level="high",
+        is_mandatory=True,
+    )
+
+    assist_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/assist",
+        json={"async_processing": False},
+    )
+    assert assist_response.status_code == 202
+    run_key = assist_response.json()["output_json"]["run_key"]
+
+    review_response = client.get(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items",
+        params={"status": "open", "step": "matrix_review", "run_key": run_key, "limit": 500},
+    )
+    assert review_response.status_code == 200
+    matrix_item = next(
+        item
+        for item in review_response.json()
+        if item["action"] == "confirm_matrix_item" and item["compliance_item_id"] == item_id
+    )
+
+    blocked_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items/{matrix_item['id']}/accept",
+        json={"reason": "测试不核验来源时阻断"},
+    )
+    assert blocked_response.status_code == 409
+    assert "必须核验来源" in blocked_response.json()["detail"]
+
+    accepted_response = client.post(
+        f"/api/v1/projects/{project_id}/sections/{section_id}/agent-review-items/{matrix_item['id']}/accept",
+        json={"reason": "测试人工核验来源后确认", "source_verified": True},
+    )
+    assert accepted_response.status_code == 200
+    assert accepted_response.json()["status"] == "accepted"
+    with SessionLocal() as db:
+        item = db.get(ComplianceItem, UUID(item_id))
+        assert item is not None
+        assert item.status == "confirmed"
+        review_item = db.get(AgentReviewItem, UUID(matrix_item["id"]))
+        assert review_item is not None
+        assert review_item.status == "accepted"
 
 
 def test_preflight_check_detects_outdated_matrix_version() -> None:

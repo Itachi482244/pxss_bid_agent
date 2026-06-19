@@ -3,6 +3,7 @@
 Importing this module registers all models on the shared SQLAlchemy metadata.
 """
 
+from app.models.agent import AgentReviewItem
 from app.models.approval import ApprovalTask
 from app.models.audit import AuditLog
 from app.models.ai_config import AIModelConfig
@@ -36,6 +37,7 @@ from app.models.task import AsyncTask, FileAcquisitionTask, ParseTask
 
 __all__ = [
     "AsyncTask",
+    "AgentReviewItem",
     "ApprovalTask",
     "AuditLog",
     "AIModelConfig",

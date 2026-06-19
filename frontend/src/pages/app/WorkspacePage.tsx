@@ -9,6 +9,45 @@ import { TechnicalTab } from "./workspace-tabs/TechnicalTab";
 import { ChapterTab } from "./workspace-tabs/ChapterTab";
 import { ApprovalTab } from "./workspace-tabs/ApprovalTab";
 import type { BidAppController, WorkflowStepKey } from "../../features/bid/useBidAppController";
+import {
+  acceptAgentReviewItem,
+  createAgentAssistTask,
+  dismissAgentReviewItem,
+  getAgentReviewSummary,
+  listAgentReviewItems,
+  type AgentAssistSummary,
+  type AgentReviewItem,
+  type AsyncTask
+} from "../../api/bid";
+
+const agentStepLabels: Record<string, string> = {
+  matrix_review: "条款审阅",
+  evidence_binding: "绑定资料",
+  qualification_technical: "资格/技术"
+};
+
+const agentActionLabels: Record<string, string> = {
+  confirm_matrix_item: "确认条款",
+  accept_evidence_binding: "采纳证据",
+  missing_evidence: "补证据",
+  review_qualification_evaluation: "确认资格项",
+  qualification_evaluation_preserved: "已确认资格项",
+  confirm_qualification_decision: "确认参标建议",
+  qualification_decision_preserved: "已确认参标建议",
+  review_technical_response: "确认技术响应",
+  review_draft_block: "审阅草稿",
+  agent_matrix_low_risk_pass: "自动核验"
+};
+
+const agentSourceVerificationActions = new Set(["confirm_matrix_item", "review_technical_response"]);
+const agentAssistAutoStepKeys = new Set<WorkflowStepKey>(["review", "evidence", "qualification", "technical"]);
+
+function agentSeverityColor(severity: string) {
+  if (severity === "critical") return "red";
+  if (severity === "high") return "volcano";
+  if (severity === "medium") return "orange";
+  return "green";
+}
 
 export function WorkspacePage({ app }: { app: BidAppController }) {
   const {
@@ -819,6 +858,246 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
   } = app;
 
   const [commandDetailsOpen, setCommandDetailsOpen] = useState(false);
+  const [agentReviewItems, setAgentReviewItems] = useState<AgentReviewItem[]>([]);
+  const [agentReviewSummary, setAgentReviewSummary] = useState<AgentAssistSummary | null>(null);
+  const [agentReviewLoaded, setAgentReviewLoaded] = useState(false);
+  const [agentAssistTask, setAgentAssistTask] = useState<AsyncTask | null>(null);
+  const [agentAssistLoading, setAgentAssistLoading] = useState(false);
+  const [agentDecisionBusyId, setAgentDecisionBusyId] = useState("");
+  const agentAutoRunKeysRef = useRef<Set<string>>(new Set());
+
+  const reloadAgentReviewItems = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId) {
+      setAgentReviewItems([]);
+      setAgentReviewSummary(null);
+      setAgentReviewLoaded(false);
+      return [];
+    }
+    const [items, summary] = await Promise.all([
+      listAgentReviewItems(selectedProjectId, selectedSectionId, {
+        status: "open",
+        limit: 200
+      }),
+      getAgentReviewSummary(selectedProjectId, selectedSectionId).catch(() => null)
+    ]);
+    setAgentReviewItems(items);
+    setAgentReviewSummary(summary);
+    setAgentReviewLoaded(true);
+    return items;
+  }, [selectedProjectId, selectedSectionId]);
+
+  useEffect(() => {
+    void reloadAgentReviewItems().catch(() => {
+      setAgentReviewItems([]);
+      setAgentReviewSummary(null);
+      setAgentReviewLoaded(true);
+    });
+  }, [reloadAgentReviewItems]);
+
+  const agentOpenItems = useMemo(
+    () => agentReviewItems.filter((item) => item.status === "open"),
+    [agentReviewItems]
+  );
+  const agentHighPriorityCount = useMemo(
+    () => agentOpenItems.filter((item) => item.severity === "critical" || item.severity === "high").length,
+    [agentOpenItems]
+  );
+  const agentAutoPassedCount = useMemo(() => {
+    const value = agentReviewSummary?.auto_passed_count ?? agentAssistTask?.output_json?.auto_passed_count;
+    return typeof value === "number" ? value : Number(value ?? 0) || 0;
+  }, [agentAssistTask, agentReviewSummary]);
+  const agentSuggestedActions = useMemo(() => {
+    const value = agentReviewSummary?.suggested_actions ?? agentAssistTask?.output_json?.suggested_actions;
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  }, [agentAssistTask, agentReviewSummary]);
+  const agentAssistStatusText = useMemo(() => {
+    if (agentAssistLoading) return "自动推进中";
+    if ((agentReviewSummary?.total_count ?? 0) > 0) return "已自动推进";
+    if (recommendedStep && agentAssistAutoStepKeys.has(recommendedStep.key)) return "即将自动推进";
+    return "等待流程到达 4-6 步";
+  }, [agentAssistLoading, agentReviewSummary, recommendedStep]);
+
+  const refreshAfterAgentDecision = useCallback(async () => {
+    await Promise.allSettled([
+      reloadAgentReviewItems(),
+      refreshAfterMatrixMutation(),
+      reloadQualificationEvaluations(),
+      reloadQualificationDecision(),
+      reloadAuditLogs(),
+      reloadPreflightCheck(),
+      reloadSectionQualitySummary({ silent: true })
+    ]);
+  }, [
+    refreshAfterMatrixMutation,
+    reloadAgentReviewItems,
+    reloadAuditLogs,
+    reloadPreflightCheck,
+    reloadQualificationDecision,
+    reloadQualificationEvaluations,
+    reloadSectionQualitySummary
+  ]);
+
+  const handleRunAgentAssist = useCallback(async (options?: { auto?: boolean }) => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    const auto = options?.auto ?? false;
+    setAgentAssistLoading(true);
+    try {
+      if (auto) {
+        appendLog("自动触发 Agent 推进 4-6 步");
+      }
+      let task = await createAgentAssistTask(selectedProjectId, selectedSectionId, {
+        async_processing: true,
+        force: true
+      });
+      setAgentAssistTask(task);
+      const deadline = Date.now() + 15 * 60 * 1000;
+      while (!isAsyncTaskTerminalStatus(task.status) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        try {
+          task = await getTask(task.id);
+          setAgentAssistTask(task);
+        } catch {
+          // 单次轮询失败忽略，下次重试
+        }
+      }
+      if (!isAsyncTaskTerminalStatus(task.status)) {
+        throw new Error("Agent 推进任务仍在运行，请稍后刷新待拍板清单。");
+      }
+      if (task.status === "failed") {
+        throw new Error(task.error_message || "Agent 推进失败");
+      }
+      if (task.status === "canceled") {
+        throw new Error("Agent 推进任务已取消");
+      }
+      setAgentAssistTask(task);
+      await reloadAgentReviewItems();
+      await Promise.allSettled([
+        reloadQualificationEvaluations(),
+        reloadQualificationDecision(),
+        reloadAuditLogs(),
+        reloadPreflightCheck(),
+        reloadSectionQualitySummary({ silent: true })
+      ]);
+      const openCount = Number(task.output_json?.open_count ?? 0) || 0;
+      const autoCount = Number(task.output_json?.auto_passed_count ?? 0) || 0;
+      notification.success({
+        message: auto ? "Agent 自动推进完成" : "Agent 推进完成",
+        description: `待拍板 ${openCount} 项，自动核验 ${autoCount} 项。`
+      });
+    } catch (error) {
+      setApiError(errorMessage(error, "Agent 推进失败"));
+    } finally {
+      setAgentAssistLoading(false);
+    }
+  }, [
+    appendLog,
+    errorMessage,
+    getTask,
+    notification,
+    isAsyncTaskTerminalStatus,
+    reloadAgentReviewItems,
+    reloadAuditLogs,
+    reloadPreflightCheck,
+    reloadQualificationDecision,
+    reloadQualificationEvaluations,
+    reloadSectionQualitySummary,
+    selectedProjectId,
+    selectedSectionId,
+    setApiError
+  ]);
+
+  useEffect(() => {
+    if (!selectedProjectId || !selectedSectionId || !recommendedStep) return;
+    if (!agentReviewLoaded || agentAssistLoading || agentOpenItems.length > 0) return;
+    if (!agentAssistAutoStepKeys.has(recommendedStep.key)) return;
+    if ((agentReviewSummary?.total_count ?? 0) > 0) return;
+    const autoRunKey = `${selectedProjectId}:${selectedSectionId}:${recommendedStep.key}`;
+    if (agentAutoRunKeysRef.current.has(autoRunKey)) return;
+    agentAutoRunKeysRef.current.add(autoRunKey);
+    void handleRunAgentAssist({ auto: true });
+  }, [
+    agentAssistLoading,
+    agentOpenItems.length,
+    agentReviewLoaded,
+    agentReviewSummary,
+    handleRunAgentAssist,
+    recommendedStep,
+    selectedProjectId,
+    selectedSectionId
+  ]);
+
+  const handleAcceptAgentReviewItem = useCallback(
+    async (item: AgentReviewItem) => {
+      if (!selectedProjectId || !selectedSectionId) return;
+      const acceptItem = async (sourceVerified: boolean) => {
+        setAgentDecisionBusyId(item.id);
+        try {
+          await acceptAgentReviewItem(selectedProjectId, selectedSectionId, item.id, {
+            reason: `人工采纳 Agent 建议：${item.title}`,
+            source_verified: sourceVerified
+          });
+          await refreshAfterAgentDecision();
+          notification.success({ message: "已采纳 Agent 建议" });
+        } catch (error) {
+          setApiError(errorMessage(error, "采纳 Agent 建议失败"));
+        } finally {
+          setAgentDecisionBusyId("");
+        }
+      };
+      if (agentSourceVerificationActions.has(item.action)) {
+        Modal.confirm({
+          title: "确认已核验原文来源",
+          content: "采纳该建议会确认条款或技术响应。请仅在已核对招标文件原文来源后继续。",
+          okText: "已核验并采纳",
+          cancelText: "取消",
+          onOk: () => acceptItem(true)
+        });
+        return;
+      }
+      await acceptItem(false);
+    },
+    [Modal, errorMessage, notification, refreshAfterAgentDecision, selectedProjectId, selectedSectionId, setApiError]
+  );
+
+  const handleDismissAgentReviewItem = useCallback(
+    async (item: AgentReviewItem) => {
+      if (!selectedProjectId || !selectedSectionId) return;
+      setAgentDecisionBusyId(item.id);
+      try {
+        await dismissAgentReviewItem(selectedProjectId, selectedSectionId, item.id, {
+          reason: `人工忽略 Agent 建议：${item.title}`
+        });
+        await reloadAgentReviewItems();
+        await reloadAuditLogs();
+        notification.success({ message: "已忽略 Agent 建议" });
+      } catch (error) {
+        setApiError(errorMessage(error, "忽略 Agent 建议失败"));
+      } finally {
+        setAgentDecisionBusyId("");
+      }
+    },
+    [errorMessage, notification, reloadAgentReviewItems, reloadAuditLogs, selectedProjectId, selectedSectionId, setApiError]
+  );
+
+  const handleLocateAgentReviewItem = useCallback(
+    (item: AgentReviewItem) => {
+      if (item.qualification_decision_id || item.qualification_evaluation_id) {
+        setActiveTab("qualification");
+        return;
+      }
+      if (item.compliance_item_id) {
+        setActiveTab(item.step === "evidence_binding" ? "evidence" : item.step === "qualification_technical" ? "technical" : "review");
+        locateMatrixRow(item.compliance_item_id);
+        return;
+      }
+      if (item.draft_block_id) {
+        setActiveTab("chapter");
+      }
+    },
+    [locateMatrixRow, setActiveTab]
+  );
+
+  const visibleAgentReviewItems = useMemo(() => agentOpenItems.slice(0, 5), [agentOpenItems]);
   // Hero 已经承载“最该做的一件事”，待办队列里去掉与它指向同一步骤的那条，避免重复。
   const heroStepKey = recommendedStep?.key ?? null;
   const commandTodoActions = useMemo(
@@ -958,53 +1237,53 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                 </Space>
               </section>
 
-              {importProcessingVisible && importProcessing && (
-                <section className="background-task-panel">
-                  <div className="background-task-overview">
-                    <div className="background-task-overview-header">
-                      <div>
-                        <Text strong>{importProcessingStageTitle}</Text>
-                        <Text type="secondary">{importProcessingStageMessage}</Text>
-                      </div>
-                      <Tag color={importProcessingFailed ? "red" : importProcessingDone ? "green" : "blue"}>
-                        {importProcessingPercent}%
-                      </Tag>
-                    </div>
-                    <Progress
-                      percent={importProcessingPercent}
-                      status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : "active"}
-                      showInfo={false}
-                    />
-                    <Text type="secondary" className="background-task-hint">
-                      {importProcessingQualityBlocked
-                        ? "系统已暂停本轮写入，上一版矩阵仍保留。请进入质量门禁页按建议处理阻断项。"
-                        : importProcessingParseFailed
-                        ? "文件解析失败，请在文件解析页重新解析；如果原文件异常，可重新上传后再生成矩阵。"
-                        : importProcessingMatrixFailed
-                        ? "矩阵生成失败，请查看矩阵任务错误后重新生成；如果被质量门禁拦截，先处理质检阻断。"
-                        : importProcessingFailed
-                        ? "解析或矩阵生成失败，请进入任务中心查看后重新解析或重新生成矩阵。"
-                        : importProcessingDone
-                        ? "文件解析和合规矩阵已刷新，可继续处理风险、证据和确认项。"
-                        : "当前不需要人工操作；这是后台异步任务，可以切换页面继续处理，完成后会自动刷新。"}
-                    </Text>
-                    {(importProcessingInProgress || importProcessingQualityBlocked || importProcessingFailed) && (
-                      <Space className="background-task-actions" wrap>
-                        <Button onClick={() => openWorkspace("tasks")}>
-                          进入任务中心
-                        </Button>
-                        {importProcessingQualityBlocked && (
-                          <Button type="primary" onClick={() => openWorkspace("quality")}>
-                            处理质量门禁
-                          </Button>
-                        )}
-                      </Space>
-                    )}
-                  </div>
-                </section>
-              )}
-
               <section className="command-center">
+                <div className="workflow-steps cc-rail" aria-label="项目简化流程">
+                  {simpleWorkflowSteps.map((step, index) => (
+                    <Tooltip
+                      key={step.key}
+                      title={
+                        <div className="workflow-step-tooltip">
+                          <div className="workflow-step-tooltip-head">
+                            <strong>{step.title}</strong>
+                            <Tag color={workflowStatusColor(step.status)}>{step.statusText}</Tag>
+                          </div>
+                          <p>{step.disabled ? step.disabledReason : step.reason}</p>
+                        </div>
+                      }
+                    >
+                      <span
+                        className="workflow-step-hitbox"
+                        title={`${step.title} · ${step.statusText}\n${step.disabled ? step.disabledReason ?? "" : step.reason}`}
+                      >
+                        <button
+                          className={[
+                            "workflow-step",
+                            `status-${step.status === "not_started" ? "not-started" : step.status}`,
+                            recommendedStep?.key &&
+                            step.activeKeys.includes(recommendedStep.key) &&
+                            step.status !== "done" &&
+                            step.status !== "not_started"
+                              ? "current-blocking"
+                              : "",
+                            step.activeKeys.includes(activeTab) ? "active" : "",
+                            recommendedStep?.key && step.activeKeys.includes(recommendedStep.key) ? "recommended" : "",
+                            step.disabled ? "disabled" : ""
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          aria-label={`${index + 1}. ${step.title}，${step.statusText}`}
+                          disabled={step.disabled}
+                          onClick={() => activateWorkflowStep(step.targetKey)}
+                        >
+                          <span className="workflow-index">{index + 1}</span>
+                          <strong>{step.title}</strong>
+                        </button>
+                      </span>
+                    </Tooltip>
+                  ))}
+                </div>
+
                 {recommendedStep && (
                   <div className={onRecommendedTab ? "next-step-bar is-current" : "next-step-bar"}>
                     <div className="next-step-main">
@@ -1048,52 +1327,6 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                     </div>
                   </div>
                 )}
-
-                <div className="workflow-steps cc-rail" aria-label="项目简化流程">
-                    {simpleWorkflowSteps.map((step, index) => (
-                      <Tooltip
-                        key={step.key}
-                        title={
-                          <div className="workflow-step-tooltip">
-                            <div className="workflow-step-tooltip-head">
-                              <strong>{step.title}</strong>
-                              <Tag color={workflowStatusColor(step.status)}>{step.statusText}</Tag>
-                            </div>
-                            <p>{step.disabled ? step.disabledReason : step.reason}</p>
-                          </div>
-                        }
-                      >
-                        <span
-                          className="workflow-step-hitbox"
-                          title={`${step.title} · ${step.statusText}\n${step.disabled ? step.disabledReason ?? "" : step.reason}`}
-                        >
-                          <button
-                            className={[
-                              "workflow-step",
-                              `status-${step.status === "not_started" ? "not-started" : step.status}`,
-                              recommendedStep?.key &&
-                              step.activeKeys.includes(recommendedStep.key) &&
-                              step.status !== "done" &&
-                              step.status !== "not_started"
-                                ? "current-blocking"
-                                : "",
-                              step.activeKeys.includes(activeTab) ? "active" : "",
-                              recommendedStep?.key && step.activeKeys.includes(recommendedStep.key) ? "recommended" : "",
-                              step.disabled ? "disabled" : ""
-                            ]
-                              .filter(Boolean)
-                              .join(" ")}
-                            aria-label={`${index + 1}. ${step.title}，${step.statusText}`}
-                            disabled={step.disabled}
-                            onClick={() => activateWorkflowStep(step.targetKey)}
-                          >
-                            <span className="workflow-index">{index + 1}</span>
-                            <strong>{step.title}</strong>
-                          </button>
-                        </span>
-                      </Tooltip>
-                    ))}
-                  </div>
 
                   <div className="cc-overview-line">
                     <div className="cc-chips">
@@ -1304,6 +1537,126 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                     </div>
                   )}
               </section>
+
+              <section className="agent-assist-panel">
+                <div className="agent-assist-head">
+                  <div>
+                    <Space size={8} wrap>
+                      <RobotOutlined />
+                      <Text strong>Agent 推进</Text>
+                      <Tag color={agentHighPriorityCount ? "red" : agentOpenItems.length ? "orange" : "green"}>
+                        待拍板 {agentOpenItems.length}
+                      </Tag>
+                      <Tag color="blue">自动核验 {agentAutoPassedCount}</Tag>
+                    </Space>
+                    {agentSuggestedActions.length > 0 && (
+                      <div className="agent-assist-actions">
+                        {agentSuggestedActions.slice(0, 3).map((action) => (
+                          <Tag key={action}>{action}</Tag>
+                        ))}
+                      </div>
+                    )}
+                    <Text type="secondary" className="agent-assist-note">
+                      自动核验仅留痕，不替代人工确认。
+                    </Text>
+                  </div>
+                  <Space wrap>
+                    <Button onClick={() => void reloadAgentReviewItems()} disabled={!selectedProjectId || !selectedSectionId}>
+                      刷新
+                    </Button>
+                    <Tag icon={<RobotOutlined />} color={agentAssistLoading ? "processing" : "blue"}>
+                      {agentAssistStatusText}
+                    </Tag>
+                  </Space>
+                </div>
+                {visibleAgentReviewItems.length ? (
+                  <div className="agent-review-list">
+                    {visibleAgentReviewItems.map((item) => (
+                      <div className="agent-review-row" key={item.id}>
+                        <button className="agent-review-main" onClick={() => handleLocateAgentReviewItem(item)}>
+                          <Space size={6} wrap>
+                            <Tag color={agentSeverityColor(item.severity)}>{item.severity}</Tag>
+                            <Tag>{agentStepLabels[item.step] ?? item.step}</Tag>
+                            <Tag color="processing">{agentActionLabels[item.action] ?? item.action}</Tag>
+                          </Space>
+                          <span>{item.title}</span>
+                          {item.detail && <Text type="secondary">{item.detail}</Text>}
+                        </button>
+                        <Space size={6}>
+                          <Tooltip title="采纳并执行对应业务动作">
+                            <Button
+                              size="small"
+                              type="primary"
+                              loading={agentDecisionBusyId === item.id}
+                              onClick={() => handleAcceptAgentReviewItem(item)}
+                            >
+                              采纳
+                            </Button>
+                          </Tooltip>
+                          <Button
+                            size="small"
+                            loading={agentDecisionBusyId === item.id}
+                            onClick={() => handleDismissAgentReviewItem(item)}
+                          >
+                            忽略
+                          </Button>
+                        </Space>
+                      </div>
+                    ))}
+                    {agentOpenItems.length > visibleAgentReviewItems.length && (
+                      <Text type="secondary">还有 {agentOpenItems.length - visibleAgentReviewItems.length} 项在清单中</Text>
+                    )}
+                  </div>
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无 Agent 待拍板项" />
+                )}
+              </section>
+
+              {importProcessingVisible && importProcessing && (
+                <section className="background-task-panel">
+                  <div className="background-task-overview">
+                    <div className="background-task-overview-header">
+                      <div>
+                        <Text strong>{importProcessingStageTitle}</Text>
+                        <Text type="secondary">{importProcessingStageMessage}</Text>
+                      </div>
+                      <Tag color={importProcessingFailed ? "red" : importProcessingDone ? "green" : "blue"}>
+                        {importProcessingPercent}%
+                      </Tag>
+                    </div>
+                    <Progress
+                      percent={importProcessingPercent}
+                      status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : "active"}
+                      showInfo={false}
+                    />
+                    <Text type="secondary" className="background-task-hint">
+                      {importProcessingQualityBlocked
+                        ? "系统已暂停本轮写入，上一版矩阵仍保留。请进入质量门禁页按建议处理阻断项。"
+                        : importProcessingParseFailed
+                        ? "文件解析失败，请在文件解析页重新解析；如果原文件异常，可重新上传后再生成矩阵。"
+                        : importProcessingMatrixFailed
+                        ? "矩阵生成失败，请查看矩阵任务错误后重新生成；如果被质量门禁拦截，先处理质检阻断。"
+                        : importProcessingFailed
+                        ? "解析或矩阵生成失败，请进入任务中心查看后重新解析或重新生成矩阵。"
+                        : importProcessingDone
+                        ? "文件解析和合规矩阵已刷新，可继续处理风险、证据和确认项。"
+                        : "当前不需要人工操作；这是后台异步任务，可以切换页面继续处理，完成后会自动刷新。"}
+                    </Text>
+                    {(importProcessingInProgress || importProcessingQualityBlocked || importProcessingFailed) && (
+                      <Space className="background-task-actions" wrap>
+                        <Button onClick={() => openWorkspace("tasks")}>
+                          进入任务中心
+                        </Button>
+                        {importProcessingQualityBlocked && (
+                          <Button type="primary" onClick={() => openWorkspace("quality")}>
+                            处理质量门禁
+                          </Button>
+                        )}
+                      </Space>
+                    )}
+                  </div>
+                </section>
+              )}
 
               <Tabs
                 className="workspace-tabs"
