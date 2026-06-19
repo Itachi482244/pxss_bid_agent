@@ -36,7 +36,7 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 
 ---
 
-## 2. 八条已对齐的设计决策
+## 2. 十三条关键设计决策
 
 ### 决策 1：数据缺口 = 行内阻塞，不做前置完整度检查
 - 放弃"先评估企业资料库够不够"的抽象前置，改为**把缺口挂在具体要求上**：
@@ -54,16 +54,18 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 - 这样"最后人工审核能发现误判"从**碰运气**变成**结构保证**。
 
 ### 决策 3：证据自动绑定的边界
-- **硬门槛（任何档位都先过，沿用现有代码）**：只绑 `confirmed` 材料、数据级别允许、非过期 / 非冲突、等价材料去重。
+- **硬门槛（任何档位都最先过，含废标级，沿用现有代码）**：只绑 `confirmed` 材料、数据级别允许、非过期 / 非冲突、等价材料去重。不合规候选不参与任何推荐（对应 7.9 (3) 的前置步骤 **F0**）。
 - **按要求风险分流**：
 
-  | 要求类型 | 绑定行为 | 归档 |
+  | 要求类型 / 匹配情形 | 绑定行为 | 归档 |
   |---|---|---|
-  | 废标级要求的证据 | **乙：只推荐候选，人主动采纳才生效**（建议≠生效） | 🔴 红牌区 |
-  | 低风险要求的证据 | **唯一强匹配 + 已核验 + 有效 → 静默绑定** | ⚪ 已自动完成 |
-  | 多候选 / 弱匹配 / 材料有瑕疵 | 不自动绑，降级为**阻塞**让人选 | 🔴 红牌区 |
+  | 废标级要求的证据 | **乙：只推荐候选，人主动采纳才生效**（建议≠生效），无论匹配多强 | 🔴 红牌区 |
+  | 低风险 + **唯一强匹配**（强匹配且无有效竞争者）+ 已核验 + 有效 | 静默绑定（推进时即时生效） | ⚪ 已自动完成 |
+  | 低风险 + **明显最优但非唯一**（强匹配、有有效次优但已拉开足够差距） | 默认勾选候选，**confirm-lock 时才生效**（可改） | 🟡 预采纳区 |
+  | **近邻歧义**（次优有效且差距过小）/ 弱匹配（最优都不够强）/ 材料瑕疵 | 不自动绑，降级为**阻塞**让人选 | 🔴 红牌区 |
 
-- 原则：**唯一强匹配才敢自动；一旦歧义（多个都像）就交给人，绝不替人猜。**
+- 原则：**唯一强匹配才敢即时自动；"明显最优但非唯一"可进黄区延迟生效；一旦歧义（多个都像、差距小）就交给人，绝不替人猜。**
+- 上表为直觉版；**可执行的严格优先级判定（B0/F0/P0–P4、`STRONG_SIM`/`VALID_SIM`/`DELTA_SIM` 量化口径）以 7.9 (3) 为准**，起步从严、用真实数据回归后定值。
 
 ### 决策 4：粒度与触发
 - 粒度 = **按标段**各确认一次。
@@ -120,7 +122,7 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 ### 决策 10：🟡 预采纳区的定义与行为
 - **归类**：
   - 低风险 + 完美（满足决策 9 全部）→ ⚪ 静默；
-  - 低风险 + 有瑕疵但不致命（置信中等 / 证据强匹配但非唯一 / 来源略弱，且非硬缺口硬歧义）→ 🟡 预采纳；
+  - 低风险 + 有瑕疵但不致命（置信中等 / 证据候选满足 **7.9 (3) P4**（明显最优但非唯一）/ 来源略弱，且非硬缺口硬歧义）→ 🟡 预采纳；
   - 废标级 / 硬缺口 / 歧义 → 🔴 红牌。
 - **行为**：Agent 已做决定，默认勾选"已采纳"；最终页**默认折叠、可见**，人可展开抽查 / 单条改 / 批量保持。
 - **可见但不强制看**：人不动它，随「确认锁定」一并生效；**不设独立确认闸**（与确认锁定重复），**不阻塞确认**（只有红牌阻塞）。
@@ -129,7 +131,7 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 - **后台不阻塞**：点「开始推进」后是后台任务（复用 `AsyncTask`/Celery），人可离开 / 关页面，完成后回来。
 - **防重复**：一个标段同时只允许一个推进任务（active 唯一索引兜底）。
 - **进度展示 = 甲（详细实时）**：当前步骤 + 已处理 N / 总 M 条 + 当前在判条款，让人看得到 Agent 在干活（符合"人主导"体感）。
-- **完成**：应用内通知 + 标段状态置"待最终确认" + 预览数字（如"🔴 8 项"）+ 一键进入最终确认页。
+- **完成**：应用内通知 + 置 `assist_stage=awaiting_confirm`（**不动 `BidSection.status`**，见 7.1）+ 预览数字（如"🔴 8 项"）+ 一键进入最终确认页。
 - **失败**：整体回滚到推进前（不留半成品），给原因，可重试。
 - 邮件 / IM 通知以后再说，先做应用内。
 
@@ -158,10 +160,15 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 ## 4. 与现有系统 / 改造方案的对应
 
 - 本方案是把 `agent_assist` 从"生成清单、人逐项处理"升级为"Agent 自动处理 + 绑定，产出单一提交前总确认"。
-- 三档分流（静默 / 预采纳 / 必须拍板）直接对应 `docs/投标Agent 改造方案.md` 的 **`ActionPolicy`（auto / human / deny）**：
-  - 🔴 红牌区 = `automation: human`（废标级 `requires_source_verified`）。
-  - 🟡 预采纳 = `auto` + `pre_accepted`（可撤销）。
-  - ⚪ 已自动完成 = `auto`（静默）。
+- 三档分流扩展自 `docs/投标Agent 改造方案.md` 的 `ActionPolicy`。**必须区分两层概念、实现时分两列，勿混**：
+  - `tier` = **分类**，落库到 `agent_review_items.tier`，取值 `silent` / `pre_accepted` / `blocking`。
+  - `effect` = **生效时点**（automation 维度，**不落 tier 列**，由 orchestrator 按 tier 决定）；不能都映射成现有 `auto`（`auto` 在现有代码里=推进时立即生效，会误导）。
+
+  | 区 | `tier`（落库值） | `effect`（生效时点） | 说明 |
+  |---|---|---|---|
+  | 🔴 红牌区 | `blocking` | `human`（永不自动生效） | 人工拍板；废标级 `requires_source_verified` |
+  | 🟡 预采纳 | `pre_accepted` | `deferred_auto`（confirm-lock 批量生效，`auto_applied` false→true） | 默认勾选草稿、可撤销 |
+  | ⚪ 已自动完成 | `silent` | `immediate`（advancing 即时生效） | 需满足决策 9 极严 6 条 |
 - 复用现有件：`AgentReviewItem`（产物）、`AsyncTask`（推进任务）、`QualificationEvaluation`、证据绑定硬门槛、`enterprise_evidence_not_required`（"无需证据"出路）、`confirmation_stale`（决策 5 丙的实现基础）。
 
 ---
@@ -170,7 +177,7 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 
 1. **责任人 / 权限**：⏸ 暂不处理——先企业内部使用，商业化分角色时再说。
 2. **阈值数值细化**：什么算"唯一强匹配"、低风险静默放行置信线的具体取值、各类条款落 A/B/C 的完整判定表（结构已定，数值待用真实数据调）。
-3. **代码映射**：`ActionPolicy` / 三区聚合 / 定向重评 的具体实现与金标准回归测试。
+3. **实现细节与测试用例**：`ActionPolicy`(tier/effect) / 三区聚合 / 定向重评 的代码落地与金标准回归测试（方向已定，见 §7；待补具体用例与边界数据）。
 4. **抽取 → 结构化要求**的质量：LLM 抽取的人工校验环节如何接入主流程。
 
 ---
@@ -222,13 +229,16 @@ not_started → advancing → awaiting_confirm → confirmed → generated
 
 | 表 | 变更 | 对应决策 |
 |---|---|---|
-| `bid_sections` | 新增 `assist_stage`（状态机）；新增 `bid_deadline`（可空，空则继承项目） | 4 / 13 |
-| `projects` | 确认/新增项目级 `bid_deadline` 作为标段默认 | 13 |
-| `agent_review_items` | 新增 `tier`（`silent`/`pre_accepted`/`blocking` ↔ ⚪/🟡/🔴）、`is_disqualifying`（废标级）、`conclusion_changed`（丙：结论变化待复核）、`auto_applied`（静默/预采纳是否已生效） | 2/3/5/9/10 |
+| `bid_sections` | 新增 `assist_stage`（状态机）；**截止时间沿用已有 `bid_deadline_at`**（空则继承项目，无需新列） | 4 / 13 |
+| `projects` | 截止时间**沿用已有 `bid_deadline_at`** 作为标段默认（已存在，无需新增） | 13 |
+| `agent_review_items` | 新增 `tier`（`silent`/`pre_accepted`/`blocking` ↔ ⚪/🟡/🔴）、`is_disqualifying`（废标级）、`conclusion_changed`（丙：结论变化待复核）、`auto_applied`（预采纳是否已在 confirm-lock 生效） | 2/3/5/9/10 |
 | `agent_review_items` | 放宽 `step` CHECK 以容纳新步骤（如 `coverage`/`pricing`），或保持现三步 | — |
 | 新表 `section_confirmation`（可选） | 记录「确认锁定」事件：confirm 时间、快照、是否已撤回，用于可逆 + 留痕 | 6 |
 
-> 证据绑定无需新表：低风险静默绑 = Agent 直接建 `compliance_evidence_binding(status=active)`；废标级 = 只产 `agent_review_item(action=accept_evidence_binding)`，沿用现有人工采纳路径（决策 3）。
+> 证据绑定无需新表：
+> - ⚪ 低风险静默绑 = Agent 直接建 `compliance_evidence_binding(status=active)`（advancing 即时生效）。
+> - 🟡 预采纳候选 = 暂存在 `agent_review_item.recommendation_json` / `source_ref_json`（`auto_applied=false`），**不预先建 binding**；`confirm-lock` 时读取该候选并创建正式 `compliance_evidence_binding(status=active)`、置 `auto_applied=true`。
+> - 🔴 废标级 = 只产 `agent_review_item(action=accept_evidence_binding)`，沿用现有人工采纳路径（决策 3）。
 
 ### 7.3 后端组件
 
@@ -237,13 +247,19 @@ backend/app/services/agent/
   policy.py            # ActionPolicy + 三档分流 + 静默放行6条 + 预采纳准入(决策 2/3/9/10)
   classifier.py        # 单条要求/证据 → tier + is_disqualifying + reasons
   orchestrator.py      # 替代/包裹 execute_agent_assist_task：跑步骤→分档→
-                       #   静默&预采纳自动生效、废标级产建议、发进度(决策 4/11)
+                       #   ⚪静默即时生效 / 🟡预采纳只建草稿 / 🔴红牌产建议、发进度(决策 4/11)
   reeval.py            # 定向重评：单要求 + 直接汇总(资格Go/No-Go)，不全量(决策 5)
   final_review.py      # 聚合三区 payload（红/黄/白 + 就绪度）(决策 6)
+  readiness.py         # 单一就绪度函数：preflight 与 final-review 共用同口径(见 7.9)
   progress.py          # ProgressReporter：步骤+已处理N/总M+当前条款(决策 11)
 ```
 
 - **分类引擎 `classifier`** 是核心：吃一条 `ComplianceItem`/证据候选，输出 `(tier, is_disqualifying, reasons, confidence)`。复用现有 `_matrix_escalation_reasons`/`_severity_for_item`/`_is_technical_item`/`requires_enterprise_evidence` 的信号，按决策 2/9/10 重组为三档。
+- **生效时点必须分清三档（关键，勿混）**：
+  - ⚪ **静默 `silent`**：`advancing` 推进时**即时生效**（直接写业务状态/绑定），仅当满足决策 9 的极严 6 条。
+  - 🟡 **预采纳 `pre_accepted`**：`advancing` 时**只生成"默认勾选的决策草稿"**（`auto_applied=false`），不改业务状态；**`confirm-lock` 时才批量生效**（决策 10）。
+  - 🔴 **红牌 `blocking`**：永不自动生效，必须人工 accept/resolve。
+  - ⚠️ 之前 7.3 旧稿写"静默&预采纳自动生效"是表述错误，以本条为准。
 - **LLM 接入点**（决策 8）：仅在 `classifier` 里作为"加保险"——可把某条从 `silent`/`pre_accepted` **上调**到 `blocking`，**禁止下调**;以及抽取阶段与 L4 润色。代码层加断言：LLM 输出只能提升 tier，不能降低。
 - **定向重评 `reeval`**：被"补救型"动作（补材料/标记无需/选候选）调用，只重算该要求及其资格汇总；"拍板型"动作只改 `agent_review_item.status=accepted` 并冻结。
 
@@ -269,20 +285,41 @@ backend/app/services/agent/
 - **推进进度视图**（决策 11 甲）：当前步骤 + N/M + 当前条款，应用内通知。
 - **旧 tab 降级**（决策 7 乙）：`MatrixTab/QualificationTab/TechnicalTab/ReviewTab` 等从必经步骤改为"下钻详情"入口（只读为主），不再主导流程。
 
-### 7.6 任务拆解（分阶段，先测试后改造）
+### 7.6 落地顺序（三段递进，先测试后改造）
 
-| 阶段 | 内容 | 关键产出 | 风险 |
+> 经评审收紧：**不一步到位**，按"先体验、再保守生效、最后全量语义"三段走。核心原则——**改生效语义的步骤越靠后越安全**。
+
+**第一段：只读分档 + 聚合页（不改任何生效语义，最快解体验阻塞）**
+
+| 步 | 内容 | 关键产出 | 风险 |
 |---|---|---|---|
-| **0** | 金标准测试固化现有 `agent_assist` 产物 | `test_agent_assist_golden.py` | 零 |
-| **1** | `policy.py` + `classifier.py`：三档分流 + 静默6条 + 预采纳准入 + 废标级标记 | tier/disqualifying 落到 `AgentReviewItem` | 低 |
-| **2** | `orchestrator` 重构：静默/预采纳自动生效、废标级产建议、低风险证据静默绑 | 产物兼容(金标准不变) | 中 |
-| **3** | 数据模型迁移：`assist_stage`、`bid_deadline`、`agent_review_items` 新列 | Alembic 迁移 | 中 |
-| **4** | API：`final-review` 聚合、`confirm-lock`/`unlock`、`resolve`+定向重评、`sections-overview` | 端点 + 测试 | 中 |
-| **5** | 前端：多标段汇总首屏 + 最终确认页三区 + 进度视图 | 主线四态跑通 | 中 |
-| **6** | 旧 tab 降级为下钻详情；进度实时(决策11甲) | 体验收口 | 低 |
-| **7**(后) | LLM 加保险接入 classifier（只升不降）+ 抽取校验 | 可解释判断增强 | 中 |
+| 0 | 金标准测试固化现有 `agent_assist` 产物 | `test_agent_assist_golden.py` | 零 |
+| 0.5 | **最小迁移**：给 `agent_review_items` 加 `tier`/`is_disqualifying` 两列（nullable，无默认生效语义）；其余新列（`assist_stage`/`auto_applied`/`conclusion_changed`/`section_confirmation`）留到第三段 | Alembic 迁移（最小） | 低 |
+| 1 | `readiness.py` 抽取：把 `projects.py:1246+` 现有预检逻辑**原样**提成 `compute_section_readiness()`，preflight 改为调它（**不改判定结果**，纯重构 + 测试钉死） | 单一就绪度函数 | 低 |
+| 2 | `classifier` **只读分档**：给每条算 `tier`/`is_disqualifying` 并落上面两列，先复用现有 `severity=critical` 当红牌，**不触发任何自动生效** | tier 落到 `AgentReviewItem` | 低 |
+| 3 | `final-review.py` 聚合（**复用 `readiness.py`**）+ 前端确认页三区（🔴/🟡/⚪），把"220 条待核对"变成"红牌 N 项必须处理"；仍走现有逐项 accept | 聚合页可用 | 低 |
 
-主干 0–6 不依赖 LLM；阶段 7 按需。
+> ⚠️ 第一段不是"零分类"：必须先有最小 `tier`（故含 0.5 最小迁移）才能分红/黄/白，但**只读、不自动生效**，所以语义零风险。
+> ⚠️ `readiness.py` 必须**先于** `final-review`（步 1 在步 3 前），保证聚合页与 preflight 从第一天就是同一口径（见 7.9 (1)）。
+
+**第二段：极保守白区静默（首次引入自动生效，门槛拉满）**
+
+| 步 | 内容 | 关键产出 | 风险 |
+|---|---|---|---|
+| 4 | `policy` 三档化 + 静默 6 条（决策 9）：仅"非高风险·非强制·非资格·非技术·有来源·证据闭合·高置信"才 ⚪ 静默生效 | 白区静默绑/放行 | 中 |
+| 5 | 低风险证据唯一强匹配静默绑（决策 3）；金标准回归保证废标级零误放 | 产物兼容 | 中 |
+
+**第三段：完整推进闭环（assist_stage + 单次确认 + 预采纳批量生效 + 定向重评 + 多标段）**
+
+| 步 | 内容 | 关键产出 | 风险 |
+|---|---|---|---|
+| 6 | 数据模型迁移（其余列）：`assist_stage`、`agent_review_items` 的 `auto_applied`/`conclusion_changed`、`section_confirmation`（`tier`/`is_disqualifying` 已在步 0.5 完成） | Alembic 迁移 | 中 |
+| 7 | `assist_stage` 状态机 + `confirm-lock`/`unlock`；🟡预采纳在 confirm-lock **批量生效**（决策 10） | 单次确认闭环 | 中 |
+| 8 | `resolve` + 定向重评（决策 5）；`final-review` 接 `readiness.py`（步 1 已建）做确认/生成守卫 | 推进闭环 | 中 |
+| 9 | 多标段汇总首屏 + 进度实时（决策 11/12）；旧 tab 降级为下钻 | 体验收口 | 低 |
+| 10(后) | LLM 加保险接入 classifier（只升不降）+ 抽取校验 | 可解释判断增强 | 中 |
+
+主干第一~三段不依赖 LLM；第 10 步按需。
 
 ### 7.7 复用与迁移
 
@@ -297,3 +334,79 @@ backend/app/services/agent/
 3. **LLM 越权下调 tier**：在 classifier 出口加断言 + 测试，LLM 只能提升 tier。
 4. **撤回后重生成**：`unlock` 必须使旧 docx 失效/标记过期，避免提交到旧版本。
 5. **多标段并发推进**：沿用 active 唯一索引，按标段隔离。
+
+### 7.9 工程收紧项（评审补充，落地前必须钉死）
+
+> 这一节回应代码评审提出的 4 个关键缺口；不补齐则文档只能当蓝图、不能开工。
+
+**(1) 预检 / final-review 口径必须统一为单一就绪度函数**
+
+现状：预检逻辑硬编码在 `projects.py:1246+`（`high_risk_unconfirmed_count` / `mandatory_missing_evidence_count` / `missing_evidence_count` / `technical_pending_count` / 资格待确认 …），独立计算。
+
+风险：若 `final-review` 另算一套，会出现"**确认页显示可生成、导出仍被 preflight 拦**"的体验断裂。
+
+收紧：**在第一段步 1 就**抽出 `readiness.py::compute_section_readiness(section) -> Readiness`（先原样提取现有预检逻辑、不改判定），作为**唯一真相源**：
+
+- `final-review` 聚合页、`confirm-lock` 守卫、`format-docx` 导出前置 **全部调它**。
+- `Readiness` 至少含：`blocking_items`（红牌清单）、`can_confirm`（红牌清零）、`can_generate`（已 confirmed 且未过期）、`reasons`（人类可读阻塞原因）。
+- 现有 `projects.py:1246+` 的硬条件改为**调用同一函数**，不再各自 inline，避免双口径漂移。
+
+**(2) 失败回滚的事务边界**
+
+决策 11 只说"失败回滚"，未定边界。落地时区分两类，**事务范围不同**：
+
+| 类别 | 内容 | 失败时 |
+|---|---|---|
+| 审计/进度 | `AsyncTask` 状态、`progress`、`audit log` | **保留**（用于复盘，不回滚） |
+| 业务产物 | `AgentReviewItem` 生效、`evidence_binding`、状态写入 | **回滚**（同一事务，失败整体撤销） |
+
+实现要点：业务产物写入用单独事务/savepoint；进度与审计用独立连接或在业务事务回滚后补写"失败"终态，确保失败现场可追溯。
+
+**(3) 三档判定表（决策 2/9/10 的可执行版）**
+
+**执行顺序（关键，先证据后条款）**：classifier 对一条要求定档时，**必须先求 `evidence_outcome ∈ {bound_active, pre_accept_candidate, blocked}`，再由"通用条款定档表"消费这个结果**——通用表里的"证据是否闭合"不能再用 `evidence_count>0` 朴素判断（预采纳候选此刻 `evidence_count=0` 但并非缺证据），而要看 `evidence_outcome`。否则会把所有待绑定候选误打成红牌、P3/P4 永远进不去。
+
+求 `evidence_outcome` 的分支（**先看已有绑定，再跑候选**）：
+
+1. **B0（已有有效绑定优先，最前置）**：若该要求已存在**通过硬门槛校验的 active `compliance_evidence_binding`**，直接 `evidence_outcome=bound_active`，**跳过 F0/P0–P4 候选定档**（不会因"此刻候选集为空"而误判 `blocked`）。
+2. **无需证据的要求**：`evidence_outcome=bound_active`（视为闭合）。
+3. 否则（无有效 active binding 的需证据要求）：进入下方 **F0 → P0–P4** 候选定档。
+
+`classifier` 出口规则（自上而下命中即定档；**红牌优先级最高**）：
+
+| 优先级 | 命中条件 | 档位 |
+|---|---|---|
+| 1 | `is_disqualifying`（废标级：资格/截止/强制+高风险等）命中 | 🔴 blocking（强制，忽略置信度） |
+| 2 | `risk_level=high` 或 `is_mandatory` 或 `item_type∈{qualification,deadline}` | 🔴 blocking |
+| 3 | 技术/评分项（`is_technical_item`）未确认 | 🔴 blocking |
+| 4 | 缺来源（`source_chunk_id is None`）/ **需证据但 `evidence_outcome=blocked`**（既无 active binding，也无通过证据候选定档的可用候选） | 🔴 blocking |
+| 5 | 低风险 + 仅轻微瑕疵（非致命，含 `evidence_outcome=pre_accept_candidate`）+ 有来源 | 🟡 pre_accepted |
+| 6 | 决策 9 全部 6 条同时满足（非高风险·非强制·非资格·非技术·有来源·**证据闭合 = 已有 active binding 或 `evidence_outcome=bound_active`**·置信≥阈值） | ⚪ silent |
+| 兜底 | 其余 | 🔴 blocking（偏严起步） |
+
+> 口径：`evidence_count=0` **不再**等同"缺证据"；只有 `evidence_outcome=blocked`（无 binding 且无可用候选）才算缺证据进红牌。无需证据的要求 `evidence_outcome` 视为 `bound_active`（闭合）。
+
+**证据候选定档（决策 3 可执行版，严格优先级——自上而下首个命中即定档，互斥不重叠）**
+
+记号：`sim` = 候选与要求的匹配相似度；`top1/top2` = **F0 过滤后的合规候选集**上相似度排序的前两名（未过硬门槛的候选已剔除，不参与排序）；`STRONG_SIM` = 强匹配下限；`VALID_SIM` = **"有效第二候选"下限**（低于此的次优候选视为噪声、不算竞争者，`VALID_SIM < STRONG_SIM`）；`DELTA_SIM` = 与次优的最小拉开差。`evidence_outcome` = 本表输出（`bound_active`=⚪ / `pre_accept_candidate`=🟡 / `blocked`=🔴），供通用条款表 (3) 消费。
+
+> 下表仅在 **B0 未命中**（即没有有效 active binding）时才跑；已有有效绑定的要求已在 B0 直接判 `bound_active`、不进本表。
+
+**F0（前置硬门槛过滤，所有档位都先过，含废标级）**：先剔除未过硬门槛的候选——只保留 `confirmed` 材料、数据级别允许、非过期 / 非冲突、无瑕疵、等价去重（沿用现有代码）。**不合规候选不参与任何推荐**（连废标级也不推荐它）。**过滤后无候选剩余 → 直接 `blocked`（🔴）**，不进入 P0–P4。F0 之后的 `top1/top2` 均在合规候选集上排序。
+
+| 优先级 | 命中条件（F0 之后；前序均不命中时才判本行） | 绑定行为 | 档位 |
+|---|---|---|---|
+| P0 | 要求为**废标级**（候选已过 F0） | 只推荐合规候选，人采纳才生效（忽略匹配多强） | 🔴 blocking |
+| P1 | `top1 < STRONG_SIM`（弱匹配，最优都不够强） | 阻塞让人选 | 🔴 blocking |
+| P2 | 存在有效次优（`top2 ≥ VALID_SIM`）**且** `top1 − top2 < DELTA_SIM`（近邻歧义） | 阻塞让人选 | 🔴 blocking |
+| P3 | `top2 < VALID_SIM`（无有效竞争者 = 唯一强匹配；**合规候选只有一个、`top2` 不存在时，按 `top2 < VALID_SIM` 处理**） | 静默即时绑定 | ⚪ silent |
+| P4 | 兜底（`top2 ≥ VALID_SIM` 且 `top1 − top2 ≥ DELTA_SIM`，明显最优非唯一） | 默认勾选候选，confirm-lock 生效 | 🟡 pre_accepted |
+
+> 顺序保证：**F0 硬门槛对所有档位（含废标级）最先生效**，杜绝未核验/过期/冲突材料被推荐；F0 通过后才按 P0–P4 定档。经 F0+P0–P2 过滤后必有 `top1 ≥ STRONG_SIM` 且非近邻歧义；P3/P4 仅以"是否存在有效次优"二分，⚪ 与 🟡 互斥，⚪ 与 🔴 也不再重叠。
+> 阈值常量（`AUTO_PASS_CONFIDENCE`、`STRONG_SIM`、`VALID_SIM`、`DELTA_SIM`）先参数化、起步从严，用真实数据回归"人工推翻率"后再定值。
+
+**(4) 当前代码差距确认（评审佐证）**
+
+- `agent/policy.py` 现仅 `auto/human/deny` 三态，**无** `silent/pre_accepted/blocking`，需按 (3) 扩展。
+- `agent_assist.py` 现为"跑步骤→产 `AgentReviewItem`→统计 open/auto_passed"的**待办模式**，尚未"推进到可生成"，正是本方案要补的半步。
+- `projects.py:1246+` 预检按硬条件阻塞，需按 (1) 收敛到统一函数。
