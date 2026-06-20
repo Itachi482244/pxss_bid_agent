@@ -452,7 +452,6 @@ export function TasksTab({ app }: { app: BidAppController }) {
     primaryBlockingPreflightTarget,
     prioritySortEnabled,
     profileDraft,
-    Progress,
     projectCreateMode,
     projectDeleteTargets,
     projectDetail,
@@ -827,13 +826,6 @@ export function TasksTab({ app }: { app: BidAppController }) {
                               {currentImportProcessing ? `${importProcessingPercent}%` : "空闲"}
                             </Tag>
                           </div>
-                          {currentImportProcessing && (
-                            <Progress
-                              percent={importProcessingPercent}
-                              status={importProcessingFailed ? "exception" : importProcessingDone ? "success" : importProcessingOpenTask ? "active" : "normal"}
-                              showInfo={false}
-                            />
-                          )}
                           <div className="task-center-actions">
                             {importProcessingQualityBlocked ? (
                               <Button type="primary" icon={<WarningOutlined />} onClick={() => activateWorkflowStep("quality")}>

@@ -825,21 +825,6 @@ export function QualificationTab({ app }: { app: BidAppController }) {
                             <Tag color="gold">
                               待确认 {qualificationEvaluations.filter((item) => item.evaluation_status === "pending_confirm").length}
                             </Tag>
-                            <Button
-                              type="primary"
-                              icon={<RobotOutlined />}
-                              loading={evaluatingQualification}
-                              onClick={handleRunQualificationEvaluation}
-                            >
-                              重新评估
-                            </Button>
-                            <Button
-                              icon={<SafetyCertificateOutlined />}
-                              loading={generatingDecision}
-                              onClick={handleGenerateQualificationDecision}
-                            >
-                              生成参标建议
-                            </Button>
                           </Space>
                         </div>
                         <div className="decision-card">
@@ -883,7 +868,7 @@ export function QualificationTab({ app }: { app: BidAppController }) {
                               type="info"
                               showIcon
                               message="尚未生成参标建议"
-                              description="点「生成参标建议」即可一步得出 Go/No-Go 结论（会自动跑资格预评估并创建确认审批任务）。想先逐条核对规则表，可先点「运行资格预评估」预览，不产生审批任务。"
+                              description="点「生成参标建议」即可一步得出 Go/No-Go 结论，并创建确认审批任务。"
                             />
                           )}
                         </div>
@@ -926,25 +911,16 @@ export function QualificationTab({ app }: { app: BidAppController }) {
                             <>
                               <div>
                                 <Text strong>下一步：生成参标建议</Text>
-                                <p>直接汇总为 Go/No-Go 参标建议，并创建资格确认审批任务；系统会自动先做一次资格预评估。想先逐条核对规则表，可改用「运行资格预评估」预览。</p>
+                                <p>直接汇总为 Go/No-Go 参标建议，并创建资格确认审批任务；系统会自动先做一次资格预评估。</p>
                               </div>
-                              <Space wrap>
-                                <Button
-                                  type="primary"
-                                  icon={<SafetyCertificateOutlined />}
-                                  loading={generatingDecision}
-                                  onClick={handleGenerateQualificationDecision}
-                                >
-                                  生成参标建议
-                                </Button>
-                                <Button
-                                  icon={<RobotOutlined />}
-                                  loading={evaluatingQualification}
-                                  onClick={handleRunQualificationEvaluation}
-                                >
-                                  运行资格预评估
-                                </Button>
-                              </Space>
+                              <Button
+                                type="primary"
+                                icon={<SafetyCertificateOutlined />}
+                                loading={generatingDecision}
+                                onClick={handleGenerateQualificationDecision}
+                              >
+                                生成参标建议
+                              </Button>
                             </>
                           ) : !qualificationDecision ? (
                             <>

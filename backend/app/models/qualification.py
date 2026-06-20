@@ -68,6 +68,7 @@ class QualificationEvaluation(Base):
     )
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     confirm_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confirmed_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
     )

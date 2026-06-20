@@ -56,8 +56,14 @@ class BidSection(Base):
             "'need_materials', 'confirmed', 'exported', 'archived')",
             name="bid_section_status_allowed",
         ),
+        CheckConstraint(
+            "assist_stage IN ('not_started', 'advancing', 'awaiting_confirm', "
+            "'confirmed', 'generated')",
+            name="bid_section_assist_stage_allowed",
+        ),
         Index("idx_bid_sections_tenant_project", "tenant_id", "project_id"),
         Index("idx_bid_sections_tenant_status", "tenant_id", "status"),
+        Index("idx_bid_sections_tenant_assist_stage", "tenant_id", "assist_stage"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -71,6 +77,7 @@ class BidSection(Base):
     name: Mapped[str] = mapped_column(String(300), nullable=False)
     budget_amount: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    assist_stage: Mapped[str] = mapped_column(String(32), nullable=False, default="not_started")
     bid_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False

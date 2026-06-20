@@ -1,7 +1,7 @@
 # 投标 Agent：半自主推进 + 单次确认 方案
 
-> 更新时间：2026-06-19
-> 状态：产品方案已对齐（待转工程设计 / 代码改造）
+> 更新时间：2026-06-20
+> 状态：工程主链路已落地（待真实数据校准阈值 / 权限商业化细化）
 > 背景：现有工作台是 7 步多阶段流水，每步都要人盯、人点，体验"阻塞"。本方案把人的介入压缩到**每个标段提交前的一次集中确认**，其余前置工作由 Agent 半自主完成。
 > 关联：`docs/投标Agent 标书内容打磨主轴设计.md`、`docs/投标Agent 改造方案.md`、`backend/app/services/agent_assist.py`
 
@@ -85,7 +85,7 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 │    缺材料 / 缺证据阻塞 · 废标级待拍板           │
 │    废标级证据候选（待采纳）· ⚠结论已变化请复核  │
 │ 🟡 预采纳区（默认折叠，可展开抽查 / 批量改）     │
-│    中风险条款、已预采纳项                       │
+│    低风险瑕疵项、已预采纳项                     │
 │ ⚪ 已自动完成（只读摘要 + 数量，可逐条下钻）     │
 │    低风险放行 N 条 · 静默绑定 M 份              │
 │            [ 确认锁定 ] → [ 生成标书 ]          │
@@ -112,7 +112,7 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 "属于低风险类别"≠"能静默放行"。一条低风险条款必须**同时满足以下全部 6 条**才允许 ⚪ 静默：
 1. 类别属于低风险（非废标级）；
 2. 有明确原文来源（能定位招标原文，不凭空判定）；
-3. 非强制 + 非高风险（`is_mandatory=false` 且 `risk_level≠high`）；
+3. 低风险 + 非强制（`risk_level=low` 且 `is_mandatory=false`）；
 4. 证据条件已闭合（需证据则已绑有效证据；不需证据则直接可放）；
 5. 抽取阶段未标"需人工复核"；
 6. 置信度 ≥ 阈值（初始沿用 `AUTO_PASS_CONFIDENCE ≈ 0.88`）。
@@ -173,12 +173,11 @@ Agent 半自主推进(条款判断 / 缺口暴露 / 低风险放行 / 证据推�
 
 ---
 
-## 5. 仍待决（进入工程设计前需补）
+## 5. 后续待细化
 
 1. **责任人 / 权限**：⏸ 暂不处理——先企业内部使用，商业化分角色时再说。
 2. **阈值数值细化**：什么算"唯一强匹配"、低风险静默放行置信线的具体取值、各类条款落 A/B/C 的完整判定表（结构已定，数值待用真实数据调）。
-3. **实现细节与测试用例**：`ActionPolicy`(tier/effect) / 三区聚合 / 定向重评 的代码落地与金标准回归测试（方向已定，见 §7；待补具体用例与边界数据）。
-4. **抽取 → 结构化要求**的质量：LLM 抽取的人工校验环节如何接入主流程。
+3. **抽取 → 结构化要求**的质量：LLM 抽取的人工校验环节如何接入主流程。
 
 ---
 
@@ -221,9 +220,9 @@ not_started → advancing → awaiting_confirm → confirmed → generated
 - `awaiting_confirm`：推进完成，进最终确认页（决策 6）。
 - `confirmed`：人已「确认锁定」，预采纳一并生效（决策 10）。
 - `generated`：已生成标书 docx。
-- 撤回：`confirmed → awaiting_confirm`（生成前后均可，重新编辑后再确认）。
+- 撤回：`confirmed/generated → awaiting_confirm`（生成后撤回必须标记旧 docx 失效 / 需重生成）。
 
-转换守卫：`awaiting_confirm → confirmed` 仅当**红牌区清零**（决策 6）。
+转换守卫：`awaiting_confirm → confirmed` 仅当**红牌区清零 + 提交前核验无 block 项**（决策 6）。
 
 ### 7.2 数据模型变更
 
@@ -306,7 +305,7 @@ backend/app/services/agent/
 
 | 步 | 内容 | 关键产出 | 风险 |
 |---|---|---|---|
-| 4 | `policy` 三档化 + 静默 6 条（决策 9）：仅"非高风险·非强制·非资格·非技术·有来源·证据闭合·高置信"才 ⚪ 静默生效 | 白区静默绑/放行 | 中 |
+| 4 | `policy` 三档化 + 静默 6 条（决策 9）：仅"`risk_level=low`·非强制·非资格·非技术·有来源·证据闭合·高置信"才 ⚪ 静默生效 | 白区静默绑/放行 | 中 |
 | 5 | 低风险证据唯一强匹配静默绑（决策 3）；金标准回归保证废标级零误放 | 产物兼容 | 中 |
 
 **第三段：完整推进闭环（assist_stage + 单次确认 + 预采纳批量生效 + 定向重评 + 多标段）**
@@ -381,7 +380,7 @@ backend/app/services/agent/
 | 3 | 技术/评分项（`is_technical_item`）未确认 | 🔴 blocking |
 | 4 | 缺来源（`source_chunk_id is None`）/ **需证据但 `evidence_outcome=blocked`**（既无 active binding，也无通过证据候选定档的可用候选） | 🔴 blocking |
 | 5 | 低风险 + 仅轻微瑕疵（非致命，含 `evidence_outcome=pre_accept_candidate`）+ 有来源 | 🟡 pre_accepted |
-| 6 | 决策 9 全部 6 条同时满足（非高风险·非强制·非资格·非技术·有来源·**证据闭合 = 已有 active binding 或 `evidence_outcome=bound_active`**·置信≥阈值） | ⚪ silent |
+| 6 | 决策 9 全部 6 条同时满足（`risk_level=low`·非强制·非资格·非技术·有来源·**证据闭合 = 已有 active binding 或 `evidence_outcome=bound_active`**·置信≥阈值） | ⚪ silent |
 | 兜底 | 其余 | 🔴 blocking（偏严起步） |
 
 > 口径：`evidence_count=0` **不再**等同"缺证据"；只有 `evidence_outcome=blocked`（无 binding 且无可用候选）才算缺证据进红牌。无需证据的要求 `evidence_outcome` 视为 `bound_active`（闭合）。
@@ -405,8 +404,9 @@ backend/app/services/agent/
 > 顺序保证：**F0 硬门槛对所有档位（含废标级）最先生效**，杜绝未核验/过期/冲突材料被推荐；F0 通过后才按 P0–P4 定档。经 F0+P0–P2 过滤后必有 `top1 ≥ STRONG_SIM` 且非近邻歧义；P3/P4 仅以"是否存在有效次优"二分，⚪ 与 🟡 互斥，⚪ 与 🔴 也不再重叠。
 > 阈值常量（`AUTO_PASS_CONFIDENCE`、`STRONG_SIM`、`VALID_SIM`、`DELTA_SIM`）先参数化、起步从严，用真实数据回归"人工推翻率"后再定值。
 
-**(4) 当前代码差距确认（评审佐证）**
+**(4) 当前落地状态确认（评审佐证）**
 
-- `agent/policy.py` 现仅 `auto/human/deny` 三态，**无** `silent/pre_accepted/blocking`，需按 (3) 扩展。
-- `agent_assist.py` 现为"跑步骤→产 `AgentReviewItem`→统计 open/auto_passed"的**待办模式**，尚未"推进到可生成"，正是本方案要补的半步。
-- `projects.py:1246+` 预检按硬条件阻塞，需按 (1) 收敛到统一函数。
+- `agent/policy.py` 已扩展 `ReviewTier` / `DecisionEffect`，并保留原 `auto/human/deny` 兼容层。
+- `agent_assist.py` 已按 `silent/pre_accepted/blocking` 产出三区待办，支持低风险静默即时生效、预采纳 confirm-lock 生效、红牌人工处理。
+- `readiness.py` 已作为 preflight / final-review / confirm-lock / format-docx 导出前置的统一就绪度口径。
+- `final_review.py`、`confirm-lock`、`unlock`、`sections-overview`、定向重评和旧入口刷新已落地，并由金标准与 API 回归测试覆盖。

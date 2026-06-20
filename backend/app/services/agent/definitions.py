@@ -53,6 +53,7 @@ class StepContext:
     actor_user_id: uuid.UUID
     policy: AgentActionPolicy
     reporter: "ProgressReporter"
+    preaccepted_evidence_item_ids: set[uuid.UUID]
     step_definition: AssistStepDefinition | None = None
 
     def for_step(self, step_definition: AssistStepDefinition) -> "StepContext":
@@ -77,6 +78,7 @@ def base_step_context(
     actor_user_id: uuid.UUID,
     reporter: "ProgressReporter",
     policy: AgentActionPolicy = DEFAULT_ACTION_POLICY,
+    preaccepted_evidence_item_ids: set[uuid.UUID] | None = None,
 ) -> StepContext:
     return StepContext(
         db=db,
@@ -84,10 +86,12 @@ def base_step_context(
         section=section,
         items=items,
         evidence_counts=evidence_counts,
+        preaccepted_evidence_item_ids=preaccepted_evidence_item_ids
+        if preaccepted_evidence_item_ids is not None
+        else set(),
         run_key=run_key,
         async_task_id=async_task_id,
         actor_user_id=actor_user_id,
         policy=policy,
         reporter=reporter,
     )
-

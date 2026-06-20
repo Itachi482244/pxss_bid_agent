@@ -1495,6 +1495,7 @@ export function useBidAppController() {
   const autoResolveAutoAttemptsRef = useRef<Record<string, number>>({});
   // 记录上一次的推荐（当前阻塞）步骤 key，用于「步骤通过后自动前进到下一个阻塞步骤」。
   const prevRecommendedStepKeyRef = useRef<string | null>(null);
+  const suppressNextWorkflowAdvanceFromRef = useRef<WorkflowStepKey | null>(null);
   const [revisionDrawerOpen, setRevisionDrawerOpen] = useState(false);
   const [revisionDocument, setRevisionDocument] = useState<ProjectDocument | null>(null);
   const [revisionChunks, setRevisionChunks] = useState<DocumentChunk[]>([]);
@@ -1861,6 +1862,22 @@ export function useBidAppController() {
 
   const currentProject = projectDetail ?? projects.find((project) => project.id === selectedProjectId);
   const currentSection = sections.find((section) => section.id === selectedSectionId);
+  const sectionLockedForEdit =
+    currentSection?.assist_stage === "confirmed" || currentSection?.assist_stage === "generated";
+  const sectionEditLockReason = sectionLockedForEdit
+    ? "该标段已确认锁定或已生成标书。需要修改矩阵、证据、资格或草稿时，请先在最终确认页撤回。"
+    : "";
+  const warnSectionLockedForEdit = useCallback(() => {
+    if (!sectionLockedForEdit) return false;
+    Modal.warning({
+      title: "需先撤回确认",
+      content: sectionEditLockReason
+    });
+    return true;
+  }, [sectionEditLockReason, sectionLockedForEdit]);
+  const dispatchAgentReviewRefresh = useCallback(() => {
+    window.dispatchEvent(new Event("pxss-agent-review-refresh"));
+  }, []);
   const matrixRows = useMemo(() => complianceItems.map(mapMatrixRow), [complianceItems]);
   const technicalRows = useMemo(
     () =>
@@ -3594,6 +3611,7 @@ export function useBidAppController() {
   const handleBindEvidence = useCallback(
     async (material: EnterpriseMaterialSearchResult) => {
       if (!selectedProjectId || !selectedSectionId || !evidenceDrawer) return;
+      if (warnSectionLockedForEdit()) return;
       if (bindingMaterialId) return;
       if (material.verification_status === "conflict" || material.verification_status === "expired") {
         Modal.warning({ title: "该资料暂不可绑定", content: "冲突或过期资料不能作为响应证据绑定。" });
@@ -3647,6 +3665,7 @@ export function useBidAppController() {
           await Promise.all([reloadEvidenceBindings(), refreshAfterMatrixMutation()]);
         }
         await reloadEvidenceCandidates().catch(() => undefined);
+        dispatchAgentReviewRefresh();
       } catch (error) {
         const message = error instanceof Error ? error.message : "证据绑定失败";
         if (message.includes("already bound") || message.includes("409")) {
@@ -3662,6 +3681,7 @@ export function useBidAppController() {
     [
       appendLog,
       bindingMaterialId,
+      dispatchAgentReviewRefresh,
       evidenceDrawer,
       evidenceBindings,
       generateQualificationDecision,
@@ -3677,13 +3697,15 @@ export function useBidAppController() {
       reloadPreflightCheck,
       reloadQualificationEvaluations,
       selectedProjectId,
-      selectedSectionId
+      selectedSectionId,
+      warnSectionLockedForEdit
     ]
   );
 
   const handleRejectEvidenceCandidate = useCallback(
     (material: EnterpriseMaterialSearchResult) => {
       if (!selectedProjectId || !selectedSectionId || !evidenceDrawer || rejectingCandidateId) return;
+      if (warnSectionLockedForEdit()) return;
       let reason = material.verification_status === "confirmed"
         ? "候选证据与当前条款不匹配"
         : "候选资料尚未确认或存在风险，暂不采用";
@@ -3745,13 +3767,15 @@ export function useBidAppController() {
       reloadAuditLogs,
       reloadEvidenceQualityReports,
       selectedProjectId,
-      selectedSectionId
+      selectedSectionId,
+      warnSectionLockedForEdit
     ]
   );
 
   const handleWaiveEvidenceRequirement = useCallback(
     (row: MatrixRow) => {
       if (!selectedProjectId || !selectedSectionId) return;
+      if (warnSectionLockedForEdit()) return;
       let reason = row.enterpriseEvidenceNotRequiredReason || "人工判定该条款无需绑定企业资料证据";
       Modal.confirm({
         title: "标记为无需绑定证据",
@@ -3797,6 +3821,7 @@ export function useBidAppController() {
               if (isHttpNotFoundError(error)) return;
               appendLog(error instanceof Error ? "后台刷新工作台摘要失败，证据豁免结果已保存" : "后台刷新工作台摘要失败");
             });
+            dispatchAgentReviewRefresh();
           } catch (error) {
             setApiError(error instanceof Error ? error.message : "标记无需绑定证据失败");
             throw error;
@@ -3809,18 +3834,21 @@ export function useBidAppController() {
     [
       appendLog,
       activeTab,
+      dispatchAgentReviewRefresh,
       evidenceDrawer?.key,
       refreshMatrixRelatedPanels,
       reloadMatrix,
       reloadMatrixReview,
       selectedProjectId,
       selectedSectionId,
+      warnSectionLockedForEdit,
       waiveComplianceEvidenceRequirement
     ]
   );
 
   const handleUnbindEvidence = useCallback(
     (binding: ComplianceEvidenceBinding) => {
+      if (warnSectionLockedForEdit()) return;
       let reason = "解除企业资料证据绑定";
       Modal.confirm({
         title: "解除证据绑定",
@@ -3854,6 +3882,7 @@ export function useBidAppController() {
             );
             appendLog(`解除企业资料证据：${truncateText(binding.material_name ?? "企业资料", 18)}`);
             await Promise.all([reloadEvidenceBindings(), refreshAfterMatrixMutation()]);
+            dispatchAgentReviewRefresh();
           } catch (error) {
             setApiError(error instanceof Error ? error.message : "解除证据绑定失败");
             throw error;
@@ -3865,11 +3894,13 @@ export function useBidAppController() {
     },
     [
       appendLog,
+      dispatchAgentReviewRefresh,
       evidenceDrawer,
       refreshAfterMatrixMutation,
       reloadEvidenceBindings,
       selectedProjectId,
-      selectedSectionId
+      selectedSectionId,
+      warnSectionLockedForEdit
     ]
   );
 
@@ -4181,6 +4212,7 @@ export function useBidAppController() {
 
   const handleCreateSourceItem = async () => {
     if (!selectedProjectId || !selectedSectionId || !sourceSelectionDraft) return;
+    if (warnSectionLockedForEdit()) return;
     if (!sourceSelectionDraft.selectedText.trim() || !sourceSelectionDraft.reason.trim()) {
       Modal.warning({ title: "请补充选中文本和新增原因" });
       return;
@@ -4236,6 +4268,7 @@ export function useBidAppController() {
 
   const handleApplySimilarCandidates = async () => {
     if (!selectedProjectId || !selectedSectionId || !similarBaseRow) return;
+    if (warnSectionLockedForEdit()) return;
     const selectedCandidates = similarCandidates
       .filter((candidate) => (similarActions[candidate.candidate_key] ?? "skip") !== "skip")
       .map((candidate) => ({
@@ -4268,6 +4301,7 @@ export function useBidAppController() {
 
   const handleConfirmDuplicateGroup = async (row: MatrixRow) => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     let reason = "人工确认这些条目为同一合规要求，启用状态级联";
     Modal.confirm({
       title: "确认重复关联组",
@@ -4291,6 +4325,7 @@ export function useBidAppController() {
 
   const handleUnlinkDuplicateGroup = async (row: MatrixRow) => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     await unlinkDuplicateGroupItem(selectedProjectId, selectedSectionId, row.key, {
       reason: "人工判断该条与关联组存在差异，解除联动"
     });
@@ -4300,6 +4335,7 @@ export function useBidAppController() {
 
   const handleSplitDuplicateGroup = async (row: MatrixRow) => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     await splitDuplicateGroupItem(selectedProjectId, selectedSectionId, row.key, {
       reason: "人工拆分为独立关联组"
     });
@@ -4333,6 +4369,7 @@ export function useBidAppController() {
   };
 
   const confirmDraftGeneration = () => {
+    if (warnSectionLockedForEdit()) return;
     Modal.confirm({
       title: "生成章节草稿",
       content: "草稿将基于当前合规矩阵和已绑定证据生成，生成结果需要人工复核后才能进入正式标书版本。",
@@ -4539,6 +4576,7 @@ export function useBidAppController() {
   const handleApplyDirectives = async (directives: AuthorDirectiveInput[]) => {
     setDirectiveEditorOpen(false);
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     // When a pack is already confirmed, editing directives triggers a lightweight rebuild.
     if (activeContextPack) {
       setLoadingContextPack(true);
@@ -4570,12 +4608,14 @@ export function useBidAppController() {
   };
 
   const handleResetDirectives = () => {
+    if (warnSectionLockedForEdit()) return;
     setEditedDirectives(null);
     appendLog("已清空暂存的生成指令");
   };
 
   const handleCreateContextPack = async () => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     if (!qualificationDecisionConfirmed) {
       Modal.warning({
         title: "请先确认参标建议",
@@ -4610,6 +4650,7 @@ export function useBidAppController() {
 
   const openContextPackDraftGenerationConfirm = () => {
     if (!activeContextPack || !selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     const isBlocked = activeContextPack.readiness_status === "block" || qualificationDecisionIsNoGo;
     Modal.confirm({
       title: isBlocked ? "生成内部草稿" : "按投标素材包生成草稿",
@@ -4663,6 +4704,7 @@ export function useBidAppController() {
 
   const handleRunContextPackCoverageReview = async () => {
     if (!activeContextPack || !selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     setLoadingContextPack(true);
     setApiError("");
     try {
@@ -4687,6 +4729,7 @@ export function useBidAppController() {
     contentText?: string
   ) => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     setSavingBusinessDraft(true);
     setApiError("");
     try {
@@ -4899,6 +4942,7 @@ export function useBidAppController() {
 
   const handleSaveKeyInfo = async () => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     if (!keyInfoDraft.projectName.trim() || !keyInfoDraft.sectionName.trim() || !keyInfoDraft.reason.trim()) {
       Modal.warning({ title: "请填写项目名称、标段名称和修改原因" });
       return;
@@ -4941,6 +4985,7 @@ export function useBidAppController() {
   };
 
   const confirmSubmit = () => {
+    if (warnSectionLockedForEdit()) return;
     let riskAcceptanceReason = "";
     const hasBlocker = preflightCheck?.status === "block";
     Modal.confirm({
@@ -4987,6 +5032,7 @@ export function useBidAppController() {
 
   const handleGenerateMatrix = (source?: ProjectDocument | null) => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     const version = source?.current_version;
     Modal.confirm({
       title: "生成合规矩阵",
@@ -5050,6 +5096,7 @@ export function useBidAppController() {
 
   const handleRunQualificationEvaluation = async () => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     setEvaluatingQualification(true);
     try {
       const data = await runQualificationEvaluation(selectedProjectId, selectedSectionId);
@@ -5067,9 +5114,11 @@ export function useBidAppController() {
 
   const handleGenerateQualificationDecision = async () => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     setGeneratingDecision(true);
     try {
       const decision = await generateQualificationDecision(selectedProjectId, selectedSectionId);
+      suppressNextWorkflowAdvanceFromRef.current = "qualification";
       setQualificationDecision(decision);
       setContextPackPreview(null);
       setContextPackPreviewOpen(false);
@@ -5230,6 +5279,7 @@ export function useBidAppController() {
 
   const handleConfirmQualificationDecision = () => {
     if (!selectedProjectId || !selectedSectionId || !qualificationDecision) return;
+    if (warnSectionLockedForEdit()) return;
     let reason = "人工确认参标建议";
     Modal.confirm({
       title: "确认参标建议",
@@ -5269,6 +5319,7 @@ export function useBidAppController() {
   };
 
   const handleConfirmQualificationEvaluation = (evaluation: QualificationEvaluation) => {
+    if (warnSectionLockedForEdit()) return;
     let reason = "人工确认资格预评估结果";
     Modal.confirm({
       title: "确认评估结果",
@@ -5309,6 +5360,7 @@ export function useBidAppController() {
 
   const handleSaveBusinessDraftChapter = () => {
     if (!selectedProjectId || !selectedSectionId || !selectedDraftChapter) return;
+    if (warnSectionLockedForEdit()) return;
     let reason = "人工编辑商务标章节草稿";
     Modal.confirm({
       title: "保存章节修改",
@@ -5357,6 +5409,7 @@ export function useBidAppController() {
 
   const handleRunDraftFactCheck = async () => {
     if (!selectedProjectId || !selectedSectionId || !selectedDraftChapter) return;
+    if (warnSectionLockedForEdit()) return;
     setSavingBusinessDraft(true);
     try {
       const updated = await runBusinessDraftFactChecks(selectedProjectId, selectedSectionId, selectedDraftChapter.id);
@@ -5604,6 +5657,7 @@ export function useBidAppController() {
 
   const handleDecideApprovalTask = (task: ApprovalTask, action: "approve" | "reject") => {
     if (!selectedProjectId || !selectedSectionId) return;
+    if (warnSectionLockedForEdit()) return;
     let reason = action === "approve" ? "人工复核通过" : "退回补充修改";
     const blockers = blockingSummary(task.evidence_snapshot_json);
     Modal.confirm({
@@ -5719,6 +5773,7 @@ export function useBidAppController() {
   };
 
   const handleConfirmItem = (row: MatrixRow) => {
+    if (warnSectionLockedForEdit()) return;
     let reason = "人工逐条确认合规矩阵项";
     let sourceVerified = false;
     const needsSourceVerified = row.riskCode === "high" || row.mandatory || row.raw.item_type === "qualification";
@@ -5813,6 +5868,7 @@ export function useBidAppController() {
   };
 
   const handleAssignItem = (row: MatrixRow) => {
+    if (warnSectionLockedForEdit()) return;
     let reason = "指派给当前用户处理";
     Modal.confirm({
       title: "指派责任人",
@@ -5844,6 +5900,7 @@ export function useBidAppController() {
   };
 
   const openEditDraft = (row: MatrixRow) => {
+    if (warnSectionLockedForEdit()) return;
     setEditDraft({
       row,
       status: row.statusCode === "confirmed" ? "pending_confirm" : row.statusCode,
@@ -5856,6 +5913,7 @@ export function useBidAppController() {
 
   const handleSaveEditDraft = async () => {
     if (!selectedProjectId || !selectedSectionId || !editDraft) return;
+    if (warnSectionLockedForEdit()) return;
     if (!editDraft.reason.trim()) {
       Modal.warning({ title: "需要填写修改原因" });
       return;
@@ -6005,6 +6063,7 @@ export function useBidAppController() {
   };
 
   const handleBatchConfirm = () => {
+    if (warnSectionLockedForEdit()) return;
     const selectedRows = matrixRows.filter((row) => selectedRowKeys.includes(row.key));
     if (selectedRows.some((row) => !row.raw.is_batch_confirm_allowed)) {
       Modal.warning({
@@ -6424,7 +6483,16 @@ export function useBidAppController() {
     const prevKey = prevRecommendedStepKeyRef.current;
     const nextKey = recommendedStep?.key ?? null;
     prevRecommendedStepKeyRef.current = nextKey;
-    if (!nextKey || !prevKey || prevKey === nextKey) return;
+    if (!nextKey || !prevKey || prevKey === nextKey) {
+      if (suppressNextWorkflowAdvanceFromRef.current === prevKey) {
+        suppressNextWorkflowAdvanceFromRef.current = null;
+      }
+      return;
+    }
+    if (suppressNextWorkflowAdvanceFromRef.current === prevKey) {
+      suppressNextWorkflowAdvanceFromRef.current = null;
+      return;
+    }
     // Agent 自动处理进行中时不抢跳，等其完成（完成后会重算推荐步骤再前进）。
     if (autoResolveActive || autoResolveInFlightRef.current) return;
     if (activeTab !== prevKey || activeTab === nextKey) return;

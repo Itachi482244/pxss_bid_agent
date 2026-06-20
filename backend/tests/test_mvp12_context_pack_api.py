@@ -25,6 +25,7 @@ from app.models import (
     EnterpriseMaterial,
     Project,
     ProjectMember,
+    QualificationDecision,
     Tenant,
     User,
 )
@@ -268,6 +269,7 @@ def _add_isolated_quality_project() -> tuple[dict[str, str], str, str]:
             name="质量体检测试标段",
             budget_amount=None,
             status="pending_confirm",
+            assist_stage="confirmed",
             created_by=user.id,
         )
         db.add(section)
@@ -280,6 +282,25 @@ def _add_isolated_quality_project() -> tuple[dict[str, str], str, str]:
                 role_code="owner",
                 status="active",
                 created_by=user.id,
+            )
+        )
+        db.add(
+            QualificationDecision(
+                tenant_id=tenant.id,
+                project_id=project.id,
+                section_id=section.id,
+                recommendation="go",
+                status="confirmed",
+                summary="测试参标建议已确认。",
+                satisfied_count=0,
+                blocking_count=0,
+                missing_count=0,
+                pending_count=0,
+                reasons_json={},
+                created_by=user.id,
+                confirmed_by=user.id,
+                confirmed_at=now,
+                confirm_reason="测试确认",
             )
         )
         doc = Document(
@@ -400,6 +421,7 @@ def _add_isolated_format_export_project() -> tuple[dict[str, str], str, str]:
             name="格式装配测试标段",
             budget_amount="1000000",
             status="pending_confirm",
+            assist_stage="confirmed",
             created_by=user.id,
         )
         db.add(section)
@@ -412,6 +434,25 @@ def _add_isolated_format_export_project() -> tuple[dict[str, str], str, str]:
                 role_code="owner",
                 status="active",
                 created_by=user.id,
+            )
+        )
+        db.add(
+            QualificationDecision(
+                tenant_id=tenant.id,
+                project_id=project.id,
+                section_id=section.id,
+                recommendation="go",
+                status="confirmed",
+                summary="测试参标建议已确认。",
+                satisfied_count=0,
+                blocking_count=0,
+                missing_count=0,
+                pending_count=0,
+                reasons_json={},
+                created_by=user.id,
+                confirmed_by=user.id,
+                confirmed_at=now,
+                confirm_reason="测试确认",
             )
         )
         doc = Document(
@@ -664,6 +705,10 @@ def test_tender_format_docx_export_supports_review_and_submission_modes(monkeypa
     assert len(review_doc.inline_shapes) >= 1
     assert review_body["source_snapshot_json"]["assembler_diag"]["embedded_materials"]
     assert review_body["source_snapshot_json"]["material_image_diag"]["material_image_candidate_count"] >= 1
+    with SessionLocal() as db:
+        section = db.get(BidSection, UUID(section_id))
+        assert section is not None
+        assert section.assist_stage == "generated"
 
     submission = client.post(base, json={"export_mode": "submission"}, headers=headers)
     assert submission.status_code == 200, submission.text

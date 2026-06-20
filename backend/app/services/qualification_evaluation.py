@@ -91,6 +91,59 @@ def _evaluation_result_changed(
     )
 
 
+def qualification_evaluation_result_snapshot(evaluation: QualificationEvaluation) -> dict[str, Any]:
+    return {
+        "requirement_text": evaluation.requirement_text,
+        "requirement_type": evaluation.requirement_type,
+        "extracted_requirement": evaluation.extracted_requirement,
+        "evaluation_status": evaluation.evaluation_status,
+        "risk_level": evaluation.risk_level,
+        "is_blocking": evaluation.is_blocking,
+        "matched_material_id": _uuid_text(evaluation.matched_material_id),
+        "matched_material_name": evaluation.matched_material_name,
+        "matched_rule_code": evaluation.matched_rule_code,
+        "rule_version": evaluation.rule_version,
+        "reason": evaluation.reason,
+        "evidence_text": evaluation.evidence_text,
+        "missing_materials": evaluation.missing_materials,
+    }
+
+
+def _outcome_result_snapshot(
+    *,
+    requirement_text: str,
+    outcome: EvaluationOutcome,
+) -> dict[str, Any]:
+    return {
+        "requirement_text": requirement_text,
+        "requirement_type": outcome.requirement_type,
+        "extracted_requirement": outcome.extracted_requirement,
+        "evaluation_status": outcome.evaluation_status,
+        "risk_level": outcome.risk_level,
+        "is_blocking": outcome.is_blocking,
+        "matched_material_id": _uuid_text(outcome.matched_material_id),
+        "matched_material_name": outcome.matched_material_name,
+        "matched_rule_code": outcome.matched_rule_code,
+        "rule_version": outcome.rule_version,
+        "reason": outcome.reason,
+        "evidence_text": outcome.evidence_text,
+        "missing_materials": outcome.missing_materials,
+    }
+
+
+def _snapshot_result_changed(
+    snapshot: dict[str, Any],
+    *,
+    requirement_text: str,
+    outcome: EvaluationOutcome,
+) -> bool:
+    current = _outcome_result_snapshot(requirement_text=requirement_text, outcome=outcome)
+    return any(
+        _canonical_json(snapshot.get(key)) != _canonical_json(value)
+        for key, value in current.items()
+    )
+
+
 def load_qualification_rules() -> dict[str, Any]:
     if not RULES_PATH.exists():
         return DEFAULT_RULES
@@ -645,11 +698,38 @@ def run_qualification_evaluation(
                 missing_materials=outcome.missing_materials,
             )
             db.add(evaluation)
+            setattr(evaluation, "_confirmation_stale", False)
+            setattr(evaluation, "_previous_evaluation_snapshot", None)
         else:
-            confirmation_stale = evaluation.confirmed_by is not None and _evaluation_result_changed(
-                evaluation,
-                requirement_text=item.requirement_text,
-                outcome=outcome,
+            confirmed_result_snapshot = (
+                evaluation.confirmed_snapshot_json
+                or qualification_evaluation_result_snapshot(evaluation)
+            )
+            if evaluation.confirmed_by is not None and evaluation.confirmed_snapshot_json:
+                confirmation_stale = _snapshot_result_changed(
+                    evaluation.confirmed_snapshot_json,
+                    requirement_text=item.requirement_text,
+                    outcome=outcome,
+                )
+            else:
+                confirmation_stale = evaluation.confirmed_by is not None and _evaluation_result_changed(
+                    evaluation,
+                    requirement_text=item.requirement_text,
+                    outcome=outcome,
+                )
+            previous_snapshot = (
+                {
+                    **confirmed_result_snapshot,
+                    "confirmed_by": str(evaluation.confirmed_by)
+                    if evaluation.confirmed_by
+                    else None,
+                    "confirmed_at": evaluation.confirmed_at.isoformat()
+                    if evaluation.confirmed_at
+                    else None,
+                    "confirm_reason": evaluation.confirm_reason,
+                }
+                if confirmation_stale
+                else None
             )
             evaluation.updated_by = actor_user_id
             evaluation.requirement_text = item.requirement_text
@@ -665,10 +745,16 @@ def run_qualification_evaluation(
             evaluation.reason = outcome.reason
             evaluation.evidence_text = outcome.evidence_text
             evaluation.missing_materials = outcome.missing_materials
-            if confirmation_stale:
-                evaluation.confirmed_by = None
-                evaluation.confirmed_at = None
-                evaluation.confirm_reason = None
+            if (
+                evaluation.confirmed_by is not None
+                and confirmation_stale
+                and evaluation.confirmed_snapshot_json is None
+            ):
+                evaluation.confirmed_snapshot_json = confirmed_result_snapshot
+            elif evaluation.confirmed_by is not None and not confirmation_stale:
+                evaluation.confirmed_snapshot_json = qualification_evaluation_result_snapshot(evaluation)
+            setattr(evaluation, "_confirmation_stale", confirmation_stale)
+            setattr(evaluation, "_previous_evaluation_snapshot", previous_snapshot)
         counts[outcome.evaluation_status] += 1
         results.append(evaluation)
     db.flush()

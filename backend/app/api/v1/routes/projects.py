@@ -43,6 +43,7 @@ from app.models import (
     ModelInvocationLog,
     QualificationDecision,
     QualificationEvaluation,
+    SectionConfirmation,
     User,
     EnterpriseProfile,
 )
@@ -53,6 +54,7 @@ from app.schemas.project import (
     AgentAssistRunRequest,
     AgentReviewItemDecisionRequest,
     AgentReviewItemRead,
+    AgentReviewItemResolveRequest,
     ApprovalTaskCreateRequest,
     ApprovalTaskDecisionRequest,
     ApprovalTaskRead,
@@ -104,8 +106,9 @@ from app.schemas.project import (
     MatrixReviewUncoveredChunkRead,
     ModelInvocationLogRead,
     AgentAssistSummaryRead,
-    PreflightCheckItem,
     PreflightCheckRead,
+    ProjectSectionOverviewItem,
+    ProjectSectionsOverviewRead,
     ProjectCreateRequest,
     ProjectDetail,
     ProjectImportConfirmRead,
@@ -122,8 +125,11 @@ from app.schemas.project import (
     QualificationEvaluationRead,
     ProjectSummary,
     SectionCreateRequest,
+    SectionConfirmLockRequest,
+    SectionFinalReviewRead,
     SectionQualitySummaryRead,
     SectionSummary,
+    SectionUnlockRequest,
     SectionUpdateRequest,
     SimilarCandidateApplyRequest,
     SimilarCandidateRead,
@@ -138,9 +144,17 @@ from app.services.agent_assist import (
     agent_assist_summary_from_items,
     dismiss_agent_review_item,
     execute_agent_assist_task,
+    refresh_agent_review_for_compliance_item,
+    resolve_agent_review_item,
 )
 from app.services.agent.policy import (
     confirmation_requires_source_verified as policy_confirmation_requires_source_verified,
+)
+from app.services.agent.final_review import build_section_final_review, effective_review_items
+from app.services.agent.readiness import (
+    build_preflight_check as build_section_preflight_check,
+    compute_section_readiness,
+    draft_block_review_summary,
 )
 from app.services.business_draft import (
     BusinessDraftError,
@@ -172,7 +186,6 @@ from app.services.evidence_policy import (
 from app.services.evidence_policy import (
     enterprise_evidence_not_required_reason as policy_enterprise_evidence_not_required_reason,
 )
-from app.services.evidence_policy import requires_enterprise_evidence
 from app.services.export_excel import execute_compliance_matrix_excel_export_task
 from app.services.file_acquisition import FileAcquisitionError
 from app.services.material_identity import enterprise_material_identity_key, material_snapshot_identity_key
@@ -188,6 +201,7 @@ from app.services.project_import import (
 )
 from app.services.qualification_evaluation import (
     evaluation_snapshot,
+    qualification_evaluation_result_snapshot,
     refresh_qualification_after_evidence_change,
     run_qualification_evaluation,
 )
@@ -248,6 +262,17 @@ def get_section_or_404(
     if section is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Section not found")
     return section
+
+
+LOCKED_ASSIST_STAGES = {"confirmed", "generated"}
+
+
+def assert_section_unlocked_for_edit(section: BidSection) -> None:
+    if section.assist_stage in LOCKED_ASSIST_STAGES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="标段已确认或已生成，修改前请先撤回确认。",
+        )
 
 
 def get_compliance_item_or_404(
@@ -1057,6 +1082,7 @@ def section_summary_for_section(
         name=section.name,
         budget_amount=section.budget_amount,
         status=section.status,
+        assist_stage=section.assist_stage,
         bid_deadline_at=section.bid_deadline_at,
         document_count=document_count,
         compliance_item_count=compliance_item_count,
@@ -1126,36 +1152,6 @@ def draft_coverage_review_read(review: DraftCoverageReview) -> DraftCoverageRevi
     return DraftCoverageReviewRead.model_validate(review)
 
 
-def draft_block_review_summary(
-    db: Session,
-    *,
-    tenant_id: uuid.UUID,
-    project_id: uuid.UUID,
-    section_id: uuid.UUID,
-) -> dict[str, int | list[str]]:
-    blocks = db.scalars(
-        select(DraftBlock).where(
-            DraftBlock.tenant_id == tenant_id,
-            DraftBlock.project_id == project_id,
-            DraftBlock.section_id == section_id,
-        )
-    ).all()
-    status_counts: dict[str, int] = {}
-    for block in blocks:
-        status_counts[block.review_status] = status_counts.get(block.review_status, 0) + 1
-    unresolved_statuses = sorted(status for status in status_counts if status != "approved")
-    return {
-        "total": len(blocks),
-        "approved": status_counts.get("approved", 0),
-        "unresolved": sum(count for status, count in status_counts.items() if status != "approved"),
-        "unresolved_statuses": unresolved_statuses,
-        "needs_evidence": status_counts.get("needs_evidence", 0),
-        "needs_fact": status_counts.get("needs_fact", 0),
-        "rejected": status_counts.get("rejected", 0),
-        "pending": status_counts.get("pending", 0) + status_counts.get("covered", 0),
-    }
-
-
 def build_preflight_check(
     db: Session,
     *,
@@ -1163,362 +1159,11 @@ def build_preflight_check(
     project: Project,
     section: BidSection,
 ) -> PreflightCheckRead:
-    documents = db.scalars(
-        select(Document)
-        .where(
-            Document.tenant_id == ctx.tenant_id,
-            Document.project_id == project.id,
-            Document.section_id == section.id,
-            Document.status != "deleted",
-        )
-        .order_by(Document.acquired_at.desc(), Document.created_at.desc())
-    ).all()
-    current_version_ids = {document.id: document.current_version_id for document in documents if document.current_version_id}
-    current_versions = {
-        version.id: version
-        for version in db.scalars(
-            select(DocumentVersion).where(
-                DocumentVersion.tenant_id == ctx.tenant_id,
-                DocumentVersion.id.in_(list(current_version_ids.values()) or [uuid.uuid4()]),
-            )
-        ).all()
-    }
-    latest_document = next((document for document in documents if document.doc_type == "tender"), documents[0] if documents else None)
-    latest_version = current_versions.get(latest_document.current_version_id) if latest_document else None
-
-    items = db.scalars(
-        select(ComplianceItem)
-        .where(
-            ComplianceItem.tenant_id == ctx.tenant_id,
-            ComplianceItem.project_id == project.id,
-            ComplianceItem.section_id == section.id,
-            ComplianceItem.deleted_at.is_(None),
-        )
-        .order_by(ComplianceItem.created_at.asc())
-    ).all()
-    evidence_counts = {
-        row.compliance_item_id: row.count
-        for row in db.execute(
-            select(
-                ComplianceEvidenceBinding.compliance_item_id,
-                func.count(ComplianceEvidenceBinding.id).label("count"),
-            )
-            .where(
-                ComplianceEvidenceBinding.tenant_id == ctx.tenant_id,
-                ComplianceEvidenceBinding.project_id == project.id,
-                ComplianceEvidenceBinding.section_id == section.id,
-                ComplianceEvidenceBinding.status == "active",
-            )
-            .group_by(ComplianceEvidenceBinding.compliance_item_id)
-        ).all()
-    }
-
-    matrix_version_ids = sorted({item.source_version_id for item in items}, key=str)
-    version_labels = {
-        version.id: version.version_label
-        for version in db.scalars(
-            select(DocumentVersion).where(
-                DocumentVersion.tenant_id == ctx.tenant_id,
-                DocumentVersion.id.in_(matrix_version_ids or [uuid.uuid4()]),
-            )
-        ).all()
-    }
-    outdated_items = [
-        item
-        for item in items
-        if current_version_ids.get(item.source_document_id)
-        and current_version_ids[item.source_document_id] != item.source_version_id
-    ]
-    unresolved_statuses = {"draft", "pending_confirm", "needs_material", "rejected"}
-    pending_qualification_count = sum(
-        1 for item in items if item.item_type == "qualification" and item.status in unresolved_statuses
-    )
-    qualification_decision = db.scalar(
-        select(QualificationDecision)
-        .where(
-            QualificationDecision.tenant_id == ctx.tenant_id,
-            QualificationDecision.project_id == project.id,
-            QualificationDecision.section_id == section.id,
-            QualificationDecision.status != "superseded",
-        )
-        .order_by(QualificationDecision.created_at.desc())
-    )
-    high_risk_unconfirmed_count = sum(
-        1 for item in items if item.risk_level == "high" and item.status != "confirmed"
-    )
-    mandatory_missing_evidence_count = sum(
-        1
-        for item in items
-        if item.is_mandatory
-        and requires_enterprise_evidence(item)
-        and evidence_counts.get(item.id, 0) == 0
-    )
-    missing_evidence_count = sum(
-        1
-        for item in items
-        if requires_enterprise_evidence(item)
-        and (item.is_mandatory or item.status == "needs_material")
-        and evidence_counts.get(item.id, 0) == 0
-    )
-    technical_signals = ("技术", "设备", "参数", "验收", "净化", "洁净")
-    technical_pending_count = sum(
-        1
-        for item in items
-        if item.status != "confirmed"
-        and (
-            item.item_type in {"technical_response", "scoring"}
-            or (item.item_type == "other" and any(signal in item.requirement_text for signal in technical_signals))
-        )
-    )
-
-    chapters = db.scalars(
-        select(BusinessDraftChapter).where(
-            BusinessDraftChapter.tenant_id == ctx.tenant_id,
-            BusinessDraftChapter.project_id == project.id,
-            BusinessDraftChapter.section_id == section.id,
-            BusinessDraftChapter.status != "superseded",
-        )
-    ).all()
-    chapter_ids = [chapter.id for chapter in chapters]
-    fact_checks = db.scalars(
-        select(DraftFactCheck).where(
-            DraftFactCheck.tenant_id == ctx.tenant_id,
-            DraftFactCheck.chapter_id.in_(chapter_ids or [uuid.uuid4()]),
-        )
-    ).all()
-    unverified_fact_count = sum(1 for check in fact_checks if check.check_status == "unverified")
-    failed_fact_count = sum(1 for check in fact_checks if check.check_status == "warning")
-    pending_fact_check_chapter_count = sum(1 for chapter in chapters if chapter.fact_check_status == "pending")
-    block_review = draft_block_review_summary(
+    return build_section_preflight_check(
         db,
         tenant_id=ctx.tenant_id,
-        project_id=project.id,
-        section_id=section.id,
-    )
-
-    approval_tasks = db.scalars(
-        select(ApprovalTask).where(
-            ApprovalTask.tenant_id == ctx.tenant_id,
-            ApprovalTask.project_id == project.id,
-            ApprovalTask.section_id == section.id,
-        )
-    ).all()
-    pending_approval_count = sum(1 for task in approval_tasks if task.status == "pending")
-    rejected_approval_count = sum(1 for task in approval_tasks if task.status == "rejected")
-
-    has_deadline_item = any(item.item_type == "deadline" for item in items)
-    missing_bid_deadline = not (section.bid_deadline_at or project.bid_deadline_at)
-    missing_deadline_item = bool(items) and not has_deadline_item
-
-    checks: list[PreflightCheckItem] = []
-
-    def add_check(
-        code: str,
-        title: str,
-        check_status: str,
-        count: int,
-        message: str,
-        action_label: str | None = None,
-        target: str | None = None,
-    ) -> None:
-        checks.append(
-            PreflightCheckItem(
-                code=code,
-                title=title,
-                status=check_status,
-                count=count,
-                message=message,
-                action_label=action_label,
-                target=target,
-            )
-        )
-
-    add_check(
-        "matrix_version",
-        "矩阵版本",
-        "block" if outdated_items else "pass",
-        len(outdated_items),
-        "矩阵已落后于最新解析版本，建议重新生成。" if outdated_items else "矩阵基于当前解析版本。",
-        "重新生成矩阵" if outdated_items else None,
-        "matrix",
-    )
-    add_check(
-        "high_risk",
-        "高风险项",
-        "block" if high_risk_unconfirmed_count else "pass",
-        high_risk_unconfirmed_count,
-        f"还有 {high_risk_unconfirmed_count} 条高风险项未确认。" if high_risk_unconfirmed_count else "高风险项已处理。",
-        "查看合规矩阵",
-        "matrix",
-    )
-    add_check(
-        "mandatory_evidence",
-        "强制项证据",
-        "block" if mandatory_missing_evidence_count else "pass",
-        mandatory_missing_evidence_count,
-        f"还有 {mandatory_missing_evidence_count} 条强制项缺少企业资料证据。"
-        if mandatory_missing_evidence_count
-        else "强制项证据已补齐。",
-        "绑定企业资料",
-        "evidence",
-    )
-    add_check(
-        "draft_facts",
-        "草稿事实",
-        "block" if unverified_fact_count else "warn" if failed_fact_count or pending_fact_check_chapter_count else "pass",
-        unverified_fact_count + failed_fact_count + pending_fact_check_chapter_count,
-        "草稿中存在无法验证或待校验事实。"
-        if unverified_fact_count or failed_fact_count or pending_fact_check_chapter_count
-        else "草稿事实校验通过。",
-        "查看商务草稿",
-        "chapter",
-    )
-    if block_review["total"]:
-        add_check(
-            "draft_block_review",
-            "结构化草稿审阅",
-            "block" if block_review["unresolved"] else "pass",
-            int(block_review["unresolved"]),
-            f"还有 {block_review['unresolved']} 个结构化草稿 block 未人工通过。"
-            if block_review["unresolved"]
-            else "结构化草稿 block 已全部人工通过。",
-            "审阅草稿 block",
-            "chapter",
-        )
-    add_check(
-        "qualification",
-        "资格项确认",
-        "warn" if pending_qualification_count else "pass",
-        pending_qualification_count,
-        f"还有 {pending_qualification_count} 条资格项待确认。" if pending_qualification_count else "资格项已确认。",
-        "查看资格预评估",
-        "qualification",
-    )
-    if qualification_decision is None:
-        qualification_decision_status = "block"
-        qualification_decision_message = "尚未生成参标建议，需先运行资格预评估并人工确认。"
-        qualification_decision_action = "运行资格预评估"
-        qualification_decision_count = 1
-    elif qualification_decision.status != "confirmed":
-        qualification_decision_status = "block"
-        qualification_decision_message = "参标建议尚未人工确认，不能进入正式 ContextPack 和草稿生成。"
-        qualification_decision_action = "确认参标建议"
-        qualification_decision_count = 1
-    elif qualification_decision.recommendation == "no_go":
-        qualification_decision_status = "block"
-        qualification_decision_message = "已确认的参标建议为 No-Go，只能在风险接受后生成内部草稿。"
-        qualification_decision_action = "查看资格结论"
-        qualification_decision_count = 1
-    elif qualification_decision.recommendation == "conditional_go":
-        qualification_decision_status = "warn"
-        qualification_decision_message = "参标建议为有条件 Go，生成草稿和提交前仍需复核缺材料/待确认事项。"
-        qualification_decision_action = "查看资格结论"
-        qualification_decision_count = 1
-    else:
-        qualification_decision_status = "pass"
-        qualification_decision_message = "参标建议已确认。"
-        qualification_decision_action = "查看资格结论"
-        qualification_decision_count = 0
-    add_check(
-        "qualification_decision",
-        "参标建议",
-        qualification_decision_status,
-        qualification_decision_count,
-        qualification_decision_message,
-        qualification_decision_action,
-        "qualification",
-    )
-    add_check(
-        "technical",
-        "技术响应",
-        "warn" if technical_pending_count else "pass",
-        technical_pending_count,
-        f"还有 {technical_pending_count} 条技术/评分项待确认。" if technical_pending_count else "技术响应项无明显阻塞。",
-        "查看技术响应",
-        "technical",
-    )
-    add_check(
-        "deadline",
-        "关键日期",
-        "warn" if missing_bid_deadline or missing_deadline_item else "pass",
-        int(missing_bid_deadline) + int(missing_deadline_item),
-        "项目截止时间或招标文件关键日期缺失，建议人工补充。"
-        if missing_bid_deadline or missing_deadline_item
-        else "关键日期已有记录。",
-        "查看项目文件",
-        "documents",
-    )
-    add_check(
-        "approvals",
-        "审批任务",
-        "warn" if pending_approval_count or rejected_approval_count else "pass",
-        pending_approval_count + rejected_approval_count,
-        f"待处理审批 {pending_approval_count} 个，退回审批 {rejected_approval_count} 个。"
-        if pending_approval_count or rejected_approval_count
-        else "审批任务无阻塞。",
-        "查看审批",
-        "approval",
-    )
-
-    if not chapters:
-        draft_message = "尚未生成商务/资格草稿。"
-        draft_action = "生成草稿"
-        draft_target = "chapter"
-        if qualification_decision is None or qualification_decision.status != "confirmed":
-            draft_message = "尚未完成资格预评估确认，先生成并确认参标建议后再生成草稿。"
-            draft_action = "运行资格预评估"
-            draft_target = "qualification"
-        add_check(
-            "draft_exists",
-            "商务草稿",
-            "warn",
-            1,
-            draft_message,
-            draft_action,
-            draft_target,
-        )
-
-    if any(item.status == "block" for item in checks):
-        overall_status = "block"
-        summary = "存在阻塞项，建议先处理版本、风险、证据或事实校验问题。"
-    elif any(item.status == "warn" for item in checks):
-        overall_status = "warn"
-        summary = "主链路可继续推进，但仍有待确认事项需要人工复核。"
-    else:
-        overall_status = "pass"
-        summary = "提交前核验通过，当前无明显阻塞项。"
-
-    suggested_actions = [
-        item.message for item in checks if item.status in {"block", "warn"}
-    ][:5]
-    if not suggested_actions:
-        suggested_actions = ["可进入审批、导出和归档流程。"]
-
-    return PreflightCheckRead(
-        project_id=project.id,
-        section_id=section.id,
-        status=overall_status,
-        summary=summary,
-        latest_document_version_id=latest_version.id if latest_version else None,
-        latest_document_version_label=latest_version.version_label if latest_version else None,
-        matrix_version_ids=matrix_version_ids,
-        matrix_version_labels=[version_labels.get(version_id, str(version_id)) for version_id in matrix_version_ids],
-        matrix_outdated=bool(outdated_items),
-        outdated_item_count=len(outdated_items),
-        pending_qualification_count=pending_qualification_count,
-        high_risk_unconfirmed_count=high_risk_unconfirmed_count,
-        mandatory_missing_evidence_count=mandatory_missing_evidence_count,
-        technical_pending_count=technical_pending_count,
-        missing_evidence_count=missing_evidence_count,
-        unverified_fact_count=unverified_fact_count,
-        failed_fact_count=failed_fact_count,
-        pending_fact_check_chapter_count=pending_fact_check_chapter_count,
-        pending_approval_count=pending_approval_count,
-        rejected_approval_count=rejected_approval_count,
-        missing_bid_deadline=missing_bid_deadline,
-        missing_deadline_item=missing_deadline_item,
-        checks=checks,
-        suggested_actions=suggested_actions,
+        project=project,
+        section=section,
     )
 
 
@@ -1995,6 +1640,7 @@ def list_sections(
                 name=section.name,
                 budget_amount=section.budget_amount,
                 status=section.status,
+                assist_stage=section.assist_stage,
                 bid_deadline_at=section.bid_deadline_at,
                 document_count=document_count,
                 compliance_item_count=compliance_item_count,
@@ -2005,6 +1651,92 @@ def list_sections(
             )
         )
     return items
+
+
+def _section_overview_suggested_action(section: BidSection, red_open_count: int) -> str:
+    if section.assist_stage == "not_started":
+        return "开始推进"
+    if section.assist_stage == "advancing":
+        return "查看进度"
+    if section.assist_stage == "awaiting_confirm":
+        return f"去确认({red_open_count})"
+    if section.assist_stage == "confirmed":
+        return "生成标书"
+    if section.assist_stage == "generated":
+        return "下载/撤回"
+    return "查看标段"
+
+
+@router.get("/{project_id}/sections-overview", response_model=ProjectSectionsOverviewRead)
+def get_project_sections_overview(
+    project_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> ProjectSectionsOverviewRead:
+    project = get_project_or_404(db, ctx, project_id)
+    sections = list(
+        db.scalars(
+            select(BidSection)
+            .where(
+                BidSection.tenant_id == ctx.tenant_id,
+                BidSection.project_id == project_id,
+            )
+            .order_by(BidSection.code.asc().nulls_last(), BidSection.created_at.asc())
+        ).all()
+    )
+
+    overview_sections: list[ProjectSectionOverviewItem] = []
+    for section in sections:
+        summary = section_summary_for_section(db, tenant_id=ctx.tenant_id, section=section)
+        final_review = build_section_final_review(
+            db,
+            tenant_id=ctx.tenant_id,
+            project=project,
+            section=section,
+        )
+        effective_deadline_at = section.bid_deadline_at or project.bid_deadline_at
+        overview_sections.append(
+            ProjectSectionOverviewItem(
+                **summary.model_dump(),
+                effective_deadline_at=effective_deadline_at,
+                red_open_count=final_review.red.open_count,
+                yellow_open_count=final_review.yellow.open_count,
+                auto_completed_count=final_review.white.total_count,
+                can_confirm=final_review.can_confirm,
+                can_generate=final_review.can_generate,
+                suggested_action=_section_overview_suggested_action(
+                    section,
+                    final_review.red.open_count,
+                ),
+            )
+        )
+
+    def sort_key(item: ProjectSectionOverviewItem) -> tuple[bool, float, int, str]:
+        deadline = (
+            item.effective_deadline_at.timestamp()
+            if item.effective_deadline_at is not None
+            else float("inf")
+        )
+        return (
+            item.effective_deadline_at is None,
+            deadline,
+            -item.red_open_count,
+            item.code or item.name,
+        )
+
+    overview_sections.sort(key=sort_key)
+    deadlines = [item.effective_deadline_at for item in overview_sections if item.effective_deadline_at]
+    return ProjectSectionsOverviewRead(
+        project_id=project.id,
+        total_count=len(overview_sections),
+        awaiting_confirm_count=sum(1 for item in overview_sections if item.assist_stage == "awaiting_confirm"),
+        confirmed_count=sum(1 for item in overview_sections if item.assist_stage == "confirmed"),
+        generated_count=sum(1 for item in overview_sections if item.assist_stage == "generated"),
+        ready_count=sum(1 for item in overview_sections if item.can_confirm or item.can_generate),
+        red_open_count=sum(item.red_open_count for item in overview_sections),
+        nearest_deadline_at=min(deadlines) if deadlines else None,
+        sections=overview_sections,
+    )
 
 
 @router.post("/{project_id}/sections", response_model=SectionSummary, status_code=status.HTTP_201_CREATED)
@@ -2059,6 +1791,7 @@ def update_section(
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> SectionSummary:
     section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     before_json = {
         "code": section.code,
         "name": section.name,
@@ -2109,7 +1842,8 @@ def create_compliance_matrix_generation_task(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> AsyncTaskRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     idempotency_payload = {
         "section_id": str(section_id),
         "document_id": str(payload.document_id) if payload.document_id else None,
@@ -2208,7 +1942,8 @@ def create_compliance_matrix_auto_resolve_task(
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> AsyncTaskRead:
     """让 Agent 自动处理质量门禁阻断：自主决定定向重抽 / 重排重抽，并复检收敛。"""
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     input_payload = {
         "document_id": str(payload.document_id) if payload.document_id else None,
         "document_version_id": str(payload.document_version_id)
@@ -2289,10 +2024,13 @@ def _agent_assist_http_error(exc: AgentAssistError) -> HTTPException:
         "REVIEW_ITEM_NOT_OPEN",
         "SOURCE_VERIFICATION_REQUIRED",
         "COMPLIANCE_ITEM_SOURCE_MISSING",
+        "SECTION_ASSIST_LOCKED",
+        "REVIEW_ITEM_REQUIRES_RESOLVE",
         "MATERIAL_NOT_BINDABLE",
         "MATERIAL_DATA_LEVEL_BLOCKED",
         "EQUIVALENT_MATERIAL_ALREADY_BOUND",
         "REVIEW_ITEM_ACTION_UNSUPPORTED",
+        "QUALIFICATION_DECISION_SUPERSEDED",
     }
     not_found_codes = {
         "REVIEW_ITEM_NOT_FOUND",
@@ -2343,7 +2081,8 @@ def create_agent_assist_task(
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> AsyncTaskRead:
     """让 Agent 半自主推进 4/5/6 步，产出统一待拍板清单。"""
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     inflight_task = _find_inflight_agent_assist_task(
         db,
         tenant_id=ctx.tenant_id,
@@ -2353,7 +2092,9 @@ def create_agent_assist_task(
     if inflight_task is not None:
         return AsyncTaskRead.model_validate(inflight_task)
 
-    steps = ["matrix_review", "evidence_binding", "qualification_technical"]
+    default_steps = ["evidence_binding", "matrix_review", "qualification_technical"]
+    requested_steps = set(payload.steps or default_steps)
+    steps = [step for step in default_steps if step in requested_steps]
     run_key = f"agent-assist:{section_id}:{uuid.uuid4().hex[:12]}"
     input_payload = {
         "run_key": run_key,
@@ -2468,21 +2209,15 @@ def get_agent_review_summary(
     )
     if run_key:
         stmt = stmt.where(AgentReviewItem.run_key == run_key)
+        items = list(db.scalars(stmt).all())
     else:
-        latest_run_key = db.scalar(
-            select(AgentReviewItem.run_key)
-            .where(
-                AgentReviewItem.tenant_id == ctx.tenant_id,
-                AgentReviewItem.project_id == project_id,
-                AgentReviewItem.section_id == section_id,
-            )
-            .order_by(AgentReviewItem.created_at.desc())
-            .limit(1)
+        items = effective_review_items(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
         )
-        if latest_run_key:
-            stmt = stmt.where(AgentReviewItem.run_key == latest_run_key)
-            run_key = latest_run_key
-    items = list(db.scalars(stmt).all())
+        run_key = ",".join(sorted({item.run_key for item in items}))
     summary = agent_assist_summary_from_items(
         project_id=project_id,
         section_id=section_id,
@@ -2508,27 +2243,41 @@ def list_agent_review_items(
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
 ) -> list[AgentReviewItemRead]:
     get_section_or_404(db, ctx, project_id, section_id)
-    stmt = select(AgentReviewItem).where(
-        AgentReviewItem.tenant_id == ctx.tenant_id,
-        AgentReviewItem.project_id == project_id,
-        AgentReviewItem.section_id == section_id,
+    if run_key:
+        stmt = select(AgentReviewItem).where(
+            AgentReviewItem.tenant_id == ctx.tenant_id,
+            AgentReviewItem.project_id == project_id,
+            AgentReviewItem.section_id == section_id,
+        )
+        if status_filter:
+            stmt = stmt.where(AgentReviewItem.status == status_filter)
+        if step:
+            stmt = stmt.where(AgentReviewItem.step == step)
+        stmt = stmt.where(AgentReviewItem.run_key == run_key)
+        stmt = stmt.order_by(
+            case(
+                (AgentReviewItem.severity == "critical", 0),
+                (AgentReviewItem.severity == "high", 1),
+                (AgentReviewItem.severity == "medium", 2),
+                else_=3,
+            ),
+            AgentReviewItem.created_at.desc(),
+        ).limit(limit)
+        return [AgentReviewItemRead.model_validate(item) for item in db.scalars(stmt).all()]
+
+    items = effective_review_items(
+        db,
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        include_decided=status_filter is None,
+        limit=None,
     )
     if status_filter:
-        stmt = stmt.where(AgentReviewItem.status == status_filter)
+        items = [item for item in items if item.status == status_filter]
     if step:
-        stmt = stmt.where(AgentReviewItem.step == step)
-    if run_key:
-        stmt = stmt.where(AgentReviewItem.run_key == run_key)
-    stmt = stmt.order_by(
-        case(
-            (AgentReviewItem.severity == "critical", 0),
-            (AgentReviewItem.severity == "high", 1),
-            (AgentReviewItem.severity == "medium", 2),
-            else_=3,
-        ),
-        AgentReviewItem.created_at.desc(),
-    ).limit(limit)
-    return [AgentReviewItemRead.model_validate(item) for item in db.scalars(stmt).all()]
+        items = [item for item in items if item.step == step]
+    return [AgentReviewItemRead.model_validate(item) for item in items[:limit]]
 
 
 @router.post(
@@ -2543,7 +2292,8 @@ def accept_agent_review_item_endpoint(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> AgentReviewItemRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     try:
         item = accept_agent_review_item(
             db,
@@ -2574,7 +2324,8 @@ def dismiss_agent_review_item_endpoint(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> AgentReviewItemRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     try:
         item = dismiss_agent_review_item(
             db,
@@ -2590,6 +2341,363 @@ def dismiss_agent_review_item_endpoint(
     db.commit()
     db.refresh(item)
     return AgentReviewItemRead.model_validate(item)
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/agent-review-items/{review_item_id}/resolve",
+    response_model=AgentReviewItemRead,
+)
+def resolve_agent_review_item_endpoint(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    review_item_id: uuid.UUID,
+    payload: AgentReviewItemResolveRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> AgentReviewItemRead:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
+    try:
+        item = resolve_agent_review_item(
+            db,
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            review_item_id=review_item_id,
+            actor_user_id=ctx.user_id,
+            resolution=payload.resolution,
+            reason=payload.reason.strip(),
+            source_verified=payload.source_verified,
+            enterprise_material_id=payload.enterprise_material_id,
+            evidence_text=payload.evidence_text,
+            confidence_score=payload.confidence_score,
+        )
+    except AgentAssistError as exc:
+        raise _agent_assist_http_error(exc) from exc
+    db.commit()
+    db.refresh(item)
+    return AgentReviewItemRead.model_validate(item)
+
+
+@router.get(
+    "/{project_id}/sections/{section_id}/final-review",
+    response_model=SectionFinalReviewRead,
+)
+def get_section_final_review(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> SectionFinalReviewRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    return build_section_final_review(
+        db,
+        tenant_id=ctx.tenant_id,
+        project=project,
+        section=section,
+    )
+
+
+def _preaccepted_review_item_already_satisfied(db: Session, item: AgentReviewItem) -> bool:
+    if item.action == "pre_accept_matrix_item":
+        if item.compliance_item_id is None:
+            return False
+        compliance_item = db.get(ComplianceItem, item.compliance_item_id)
+        return (
+            compliance_item is not None
+            and compliance_item.tenant_id == item.tenant_id
+            and compliance_item.status == "confirmed"
+        )
+    if item.action == "pre_accept_evidence_binding":
+        if item.compliance_item_id is None:
+            return False
+        return (
+            db.scalar(
+                select(ComplianceEvidenceBinding.id)
+                .where(
+                    ComplianceEvidenceBinding.tenant_id == item.tenant_id,
+                    ComplianceEvidenceBinding.project_id == item.project_id,
+                    ComplianceEvidenceBinding.section_id == item.section_id,
+                    ComplianceEvidenceBinding.compliance_item_id == item.compliance_item_id,
+                    ComplianceEvidenceBinding.status == "active",
+                )
+                .limit(1)
+            )
+            is not None
+        )
+    return False
+
+
+def _close_preaccepted_review_item_as_applied(
+    item: AgentReviewItem,
+    *,
+    actor_user_id: uuid.UUID,
+    reason: str,
+) -> None:
+    item.status = "accepted"
+    item.auto_applied = True
+    item.decided_by = actor_user_id
+    item.decided_at = datetime.now(UTC)
+    item.decision_reason = f"{reason}（预采纳效果已存在，确认锁定时关闭）"
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/confirm-lock",
+    response_model=SectionFinalReviewRead,
+)
+def confirm_lock_section(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: SectionConfirmLockRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> SectionFinalReviewRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    if section.assist_stage == "generated":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="该标段已生成标书，如需重新确认请先撤回。",
+        )
+    if section.assist_stage == "confirmed":
+        return build_section_final_review(
+            db,
+            tenant_id=ctx.tenant_id,
+            project=project,
+            section=section,
+        )
+    if section.assist_stage != "awaiting_confirm":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="标段尚未完成 Agent 推进，不能确认锁定。",
+        )
+
+    final_review = build_section_final_review(
+        db,
+        tenant_id=ctx.tenant_id,
+        project=project,
+        section=section,
+    )
+    if not final_review.can_confirm:
+        blocking = final_review.red.open_count or len(
+            [item for item in final_review.readiness.checks if item.status == "block"]
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"红牌区或提交前核验仍有 {blocking} 项阻塞，不能确认锁定。",
+        )
+
+    preaccepted_item_ids = [
+        item.id for item in final_review.yellow.items if item.status == "open"
+    ]
+    preaccepted_items = (
+        list(
+            db.scalars(
+                select(AgentReviewItem).where(
+                    AgentReviewItem.tenant_id == ctx.tenant_id,
+                    AgentReviewItem.project_id == project_id,
+                    AgentReviewItem.section_id == section_id,
+                    AgentReviewItem.id.in_(preaccepted_item_ids),
+                    AgentReviewItem.tier == "pre_accepted",
+                    AgentReviewItem.status == "open",
+                )
+            ).all()
+        )
+        if preaccepted_item_ids
+        else []
+    )
+    reason = payload.reason.strip()
+    preaccepted_applied_count = 0
+    preaccepted_already_satisfied_count = 0
+    for item in preaccepted_items:
+        if _preaccepted_review_item_already_satisfied(db, item):
+            _close_preaccepted_review_item_as_applied(
+                item,
+                actor_user_id=ctx.user_id,
+                reason=reason,
+            )
+            preaccepted_already_satisfied_count += 1
+            continue
+        try:
+            accept_agent_review_item(
+                db,
+                tenant_id=ctx.tenant_id,
+                project_id=project_id,
+                section_id=section_id,
+                review_item_id=item.id,
+                actor_user_id=ctx.user_id,
+                reason=reason,
+                source_verified=False,
+            )
+            preaccepted_applied_count += 1
+        except AgentAssistError as exc:
+            if _preaccepted_review_item_already_satisfied(db, item):
+                _close_preaccepted_review_item_as_applied(
+                    item,
+                    actor_user_id=ctx.user_id,
+                    reason=reason,
+                )
+                preaccepted_already_satisfied_count += 1
+                continue
+            item_title = item.title
+            db.rollback()
+            http_exc = _agent_assist_http_error(exc)
+            http_exc.detail = f"预采纳项「{item_title}」无法自动生效：{http_exc.detail}"
+            raise http_exc from exc
+
+    active_confirmations = list(
+        db.scalars(
+            select(SectionConfirmation).where(
+                SectionConfirmation.tenant_id == ctx.tenant_id,
+                SectionConfirmation.project_id == project_id,
+                SectionConfirmation.section_id == section_id,
+                SectionConfirmation.status == "active",
+            )
+        ).all()
+    )
+    now = datetime.now(UTC)
+    for confirmation in active_confirmations:
+        confirmation.status = "withdrawn"
+        confirmation.withdrawn_by = ctx.user_id
+        confirmation.withdrawn_at = now
+        confirmation.withdraw_reason = "新的确认锁定已生成"
+
+    section.assist_stage = "confirmed"
+    snapshot = build_section_final_review(
+        db,
+        tenant_id=ctx.tenant_id,
+        project=project,
+        section=section,
+    ).model_dump(mode="json")
+    confirmation = SectionConfirmation(
+        tenant_id=ctx.tenant_id,
+        project_id=project_id,
+        section_id=section_id,
+        status="active",
+        snapshot_json=snapshot,
+        confirmed_by=ctx.user_id,
+        confirmed_at=now,
+    )
+    db.add(confirmation)
+    db.flush()
+    db.add(
+        AuditLog(
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=ctx.user_id,
+            actor_type="user",
+            action="agent.section_confirm_locked",
+            object_type="bid_section",
+            object_id=section_id,
+            after_json={
+                "assist_stage": section.assist_stage,
+                "preaccepted_applied_count": preaccepted_applied_count
+                + preaccepted_already_satisfied_count,
+                "preaccepted_already_satisfied_count": preaccepted_already_satisfied_count,
+                "confirmation_id": str(confirmation.id),
+            },
+            reason=reason,
+            severity="info",
+        )
+    )
+    db.commit()
+    db.refresh(section)
+    return build_section_final_review(
+        db,
+        tenant_id=ctx.tenant_id,
+        project=project,
+        section=section,
+    )
+
+
+@router.post(
+    "/{project_id}/sections/{section_id}/unlock",
+    response_model=SectionFinalReviewRead,
+)
+def unlock_section_confirmation(
+    project_id: uuid.UUID,
+    section_id: uuid.UUID,
+    payload: SectionUnlockRequest,
+    db: Annotated[Session, Depends(get_db)],
+    ctx: Annotated[RequestContext, Depends(get_request_context)],
+) -> SectionFinalReviewRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    if section.assist_stage not in {"confirmed", "generated"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="只有已确认或已生成的标段可以撤回确认。",
+        )
+    previous_stage = section.assist_stage
+    reason = payload.reason.strip()
+    now = datetime.now(UTC)
+    active_confirmations = list(
+        db.scalars(
+            select(SectionConfirmation).where(
+                SectionConfirmation.tenant_id == ctx.tenant_id,
+                SectionConfirmation.project_id == project_id,
+                SectionConfirmation.section_id == section_id,
+                SectionConfirmation.status == "active",
+            )
+        ).all()
+    )
+    for confirmation in active_confirmations:
+        confirmation.status = "withdrawn"
+        confirmation.withdrawn_by = ctx.user_id
+        confirmation.withdrawn_at = now
+        confirmation.withdraw_reason = reason
+    invalidated_export_count = 0
+    if previous_stage == "generated":
+        generated_exports = list(
+            db.scalars(
+                select(ExportFile).where(
+                    ExportFile.tenant_id == ctx.tenant_id,
+                    ExportFile.project_id == project_id,
+                    ExportFile.section_id == section_id,
+                    ExportFile.export_type == "tender_format_docx",
+                    ExportFile.status == "available",
+                )
+            ).all()
+        )
+        invalidated_export_count = len(generated_exports)
+        for export_file in generated_exports:
+            export_file.status = "deleted"
+            snapshot = dict(export_file.source_snapshot_json or {})
+            snapshot["invalidated_by_unlock_at"] = now.isoformat()
+            snapshot["invalidated_by_unlock_reason"] = reason
+            export_file.source_snapshot_json = snapshot
+    section.assist_stage = "awaiting_confirm"
+    db.add(
+        AuditLog(
+            tenant_id=ctx.tenant_id,
+            project_id=project_id,
+            section_id=section_id,
+            actor_user_id=ctx.user_id,
+            actor_type="user",
+            action="agent.section_confirm_unlocked",
+            object_type="bid_section",
+            object_id=section_id,
+            before_json={"assist_stage": previous_stage},
+            after_json={
+                "assist_stage": section.assist_stage,
+                "withdrawn_confirmation_count": len(active_confirmations),
+                "generated_exports_require_regeneration": previous_stage == "generated",
+                "invalidated_export_count": invalidated_export_count,
+            },
+            reason=reason,
+            severity="warning" if previous_stage == "generated" else "info",
+        )
+    )
+    db.commit()
+    db.refresh(section)
+    return build_section_final_review(
+        db,
+        tenant_id=ctx.tenant_id,
+        project=project,
+        section=section,
+    )
 
 
 @router.post(
@@ -2785,7 +2893,8 @@ def run_section_qualification_evaluation(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> list[QualificationEvaluationRead]:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     evaluations = run_qualification_evaluation(
         db,
         tenant_id=ctx.tenant_id,
@@ -2809,7 +2918,8 @@ def confirm_qualification_evaluation(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> QualificationEvaluationRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     evaluation = db.scalar(
         select(QualificationEvaluation).where(
             QualificationEvaluation.tenant_id == ctx.tenant_id,
@@ -2827,6 +2937,7 @@ def confirm_qualification_evaluation(
     evaluation.confirmed_by = ctx.user_id
     evaluation.confirmed_at = datetime.now(UTC)
     evaluation.confirm_reason = payload.reason
+    evaluation.confirmed_snapshot_json = qualification_evaluation_result_snapshot(evaluation)
     evaluation.updated_by = ctx.user_id
     db.flush()
     add_matrix_audit_log(
@@ -3016,9 +3127,9 @@ def generate_qualification_decision(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> QualificationDecisionRead:
-    get_section_or_404(db, ctx, project_id, section_id)
-    project = get_project_or_404(db, ctx, project_id)
     section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
+    project = get_project_or_404(db, ctx, project_id)
     profile = db.scalar(select(EnterpriseProfile).where(EnterpriseProfile.tenant_id == ctx.tenant_id))
     evaluations = db.scalars(
         select(QualificationEvaluation).where(
@@ -3103,7 +3214,8 @@ def confirm_qualification_decision(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> QualificationDecisionRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     decision = db.scalar(
         select(QualificationDecision).where(
             QualificationDecision.tenant_id == ctx.tenant_id,
@@ -3232,7 +3344,20 @@ def export_tender_format_docx_file(
 
     review 模式包含合规自检清单；submission 模式清除内部审阅状态，用于正式稿检查。
     """
-    get_section_or_404(db, ctx, project_id, section_id)
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    readiness = compute_section_readiness(
+        db,
+        tenant_id=ctx.tenant_id,
+        project=project,
+        section=section,
+    )
+    if not readiness.can_generate:
+        reason = "；".join(readiness.reasons[:3]) if readiness.reasons else "标段尚未确认锁定"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"标段尚不可生成标书：{reason}",
+        )
     try:
         if payload.export_mode == "submission":
             quality_summary = build_section_quality_summary(
@@ -3255,6 +3380,7 @@ def export_tender_format_docx_file(
             profile_id=payload.profile_id,
             export_mode=payload.export_mode,
         )
+        section.assist_stage = "generated"
     except TenderFormatExportError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     db.commit()
@@ -3297,7 +3423,8 @@ def create_business_draft_context_pack(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> BusinessDraftContextPackRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     try:
         context_pack = create_context_pack(
             db,
@@ -3333,7 +3460,8 @@ def update_business_draft_context_pack_directives(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> BusinessDraftContextPackRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     try:
         context_pack = update_context_pack_directives(
             db,
@@ -3363,7 +3491,8 @@ def generate_business_draft_from_context_pack(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> BusinessDraftContextPackGenerateResult:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     try:
         chapters, blocks, coverage_review = generate_draft_from_context_pack(
             db,
@@ -3414,7 +3543,8 @@ def generate_business_draft_from_context_pack_async(
     the generic ``GET /tasks/{task_id}`` poll plus the existing blocks/chapters
     and coverage-review read endpoints once the task succeeds.
     """
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     context_pack = db.get(DraftContextPack, context_pack_id)
     if (
         context_pack is None
@@ -3495,7 +3625,8 @@ def run_business_draft_context_pack_coverage_review(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> DraftCoverageReviewRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     try:
         review = create_coverage_review(
             db,
@@ -3547,7 +3678,8 @@ def update_business_draft_block(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> DraftBlockRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     block = db.scalar(
         select(DraftBlock).where(
             DraftBlock.tenant_id == ctx.tenant_id,
@@ -3624,7 +3756,8 @@ def generate_business_draft(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> list[BusinessDraftChapterRead]:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     try:
         chapters = generate_business_draft_chapters(
             db,
@@ -3668,7 +3801,8 @@ def update_business_draft_chapter(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> BusinessDraftChapterRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     chapter = db.scalar(
         select(BusinessDraftChapter).where(
             BusinessDraftChapter.tenant_id == ctx.tenant_id,
@@ -3718,7 +3852,8 @@ def rerun_business_draft_fact_checks(
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> BusinessDraftChapterRead:
     project = get_project_or_404(db, ctx, project_id)
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     chapter = db.scalar(
         select(BusinessDraftChapter).where(
             BusinessDraftChapter.tenant_id == ctx.tenant_id,
@@ -3843,6 +3978,7 @@ def create_approval_task(
 ) -> ApprovalTaskRead:
     project = get_project_or_404(db, ctx, project_id)
     section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     preflight = build_preflight_check(db, ctx=ctx, project=project, section=section)
     risk_acceptance_reason = (payload.risk_acceptance_reason or "").strip()
     if payload.task_type == "submit_confirmation" and preflight.status == "block" and not risk_acceptance_reason:
@@ -3921,7 +4057,8 @@ def decide_approval_task(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ApprovalTaskRead:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     task = db.scalar(
         select(ApprovalTask).where(
             ApprovalTask.tenant_id == ctx.tenant_id,
@@ -4271,7 +4408,8 @@ def create_compliance_item_from_source(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceItemFromSourceResult:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     chunk = db.scalar(
         select(DocumentChunk).where(
             DocumentChunk.id == payload.source_chunk_id,
@@ -4388,6 +4526,8 @@ def apply_similar_candidates(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> DuplicateGroupActionResult:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     base_item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     now = datetime.now(UTC)
     affected_items: list[ComplianceItem] = [base_item]
@@ -4511,6 +4651,8 @@ def confirm_duplicate_group(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> DuplicateGroupActionResult:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     if payload.item_ids:
         unique_ids = list(dict.fromkeys(payload.item_ids))
@@ -4578,6 +4720,8 @@ def unlink_duplicate_group_item(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> DuplicateGroupActionResult:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     before = compliance_item_snapshot(item)
     previous_group_id = item.duplicate_group_id
@@ -4620,6 +4764,8 @@ def split_duplicate_group_item(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> DuplicateGroupActionResult:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     before = compliance_item_snapshot(item)
     now = datetime.now(UTC)
@@ -4663,6 +4809,8 @@ def update_compliance_item(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceItemRead:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     fields_to_update = payload.model_fields_set - {"reason"}
     if not fields_to_update:
@@ -4725,6 +4873,8 @@ def confirm_compliance_item(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceItemRead:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     if item.source_chunk_id is None:
         raise HTTPException(
@@ -4826,6 +4976,8 @@ def assign_compliance_item(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceItemRead:
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     owner_user_id = payload.owner_user_id or ctx.user_id
     get_active_user_or_404(db, ctx, owner_user_id)
@@ -4934,6 +5086,7 @@ def reject_compliance_evidence_candidate(
 ) -> ComplianceEvidenceCandidateRejectRead:
     project = get_project_or_404(db, ctx, project_id)
     section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     material = db.scalar(
         select(EnterpriseMaterial).where(
@@ -5018,6 +5171,9 @@ def waive_compliance_evidence_requirement(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceItemRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     before = compliance_item_snapshot(item)
     now = datetime.now(UTC)
@@ -5044,6 +5200,16 @@ def waive_compliance_evidence_requirement(
             section_id=section_id,
             actor_user_id=ctx.user_id,
         )
+    agent_review_refresh = refresh_agent_review_for_compliance_item(
+        db,
+        project=project,
+        section=section,
+        item=item,
+        actor_user_id=ctx.user_id,
+        reason="人工标记无需证据后刷新 Agent 待办",
+        run_key_prefix="agent-evidence-waive",
+        force=False,
+    )
     add_matrix_audit_log(
         db,
         ctx,
@@ -5056,6 +5222,7 @@ def waive_compliance_evidence_requirement(
         after_json={
             "item": compliance_item_snapshot(item),
             "qualification_refresh": qualification_refresh,
+            "agent_review_refresh": agent_review_refresh,
         },
         reason=reason,
     )
@@ -5077,6 +5244,9 @@ def bind_compliance_evidence(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceEvidenceBindingRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     material = db.scalar(
         select(EnterpriseMaterial).where(
@@ -5168,11 +5338,22 @@ def bind_compliance_evidence(
             section_id=section_id,
             actor_user_id=ctx.user_id,
         )
+    agent_review_refresh = refresh_agent_review_for_compliance_item(
+        db,
+        project=project,
+        section=section,
+        item=item,
+        actor_user_id=ctx.user_id,
+        reason="人工绑定证据后刷新 Agent 待办",
+        run_key_prefix="agent-evidence-bind",
+        force=False,
+    )
     after = {
         "item": compliance_item_snapshot(item),
         "binding": evidence_binding_snapshot(binding),
         "material": enterprise_material_snapshot(material),
         "qualification_refresh": qualification_refresh,
+        "agent_review_refresh": agent_review_refresh,
     }
     add_matrix_audit_log(
         db,
@@ -5204,6 +5385,9 @@ def unbind_compliance_evidence(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> ComplianceEvidenceBindingRead:
+    project = get_project_or_404(db, ctx, project_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     item = get_compliance_item_or_404(db, ctx, project_id, section_id, item_id)
     binding = db.scalar(
         select(ComplianceEvidenceBinding).where(
@@ -5232,6 +5416,16 @@ def unbind_compliance_evidence(
             section_id=section_id,
             actor_user_id=ctx.user_id,
         )
+    agent_review_refresh = refresh_agent_review_for_compliance_item(
+        db,
+        project=project,
+        section=section,
+        item=item,
+        actor_user_id=ctx.user_id,
+        reason="人工解绑证据后刷新 Agent 待办",
+        run_key_prefix="agent-evidence-unbind",
+        force=False,
+    )
     add_matrix_audit_log(
         db,
         ctx,
@@ -5244,6 +5438,7 @@ def unbind_compliance_evidence(
         after_json={
             "binding": evidence_binding_snapshot(binding),
             "qualification_refresh": qualification_refresh,
+            "agent_review_refresh": agent_review_refresh,
         },
         reason=payload.reason.strip(),
     )
@@ -5263,7 +5458,8 @@ def bulk_assign_compliance_items(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> list[ComplianceItemRead]:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     owner_user_id = payload.owner_user_id or ctx.user_id
     get_active_user_or_404(db, ctx, owner_user_id)
     unique_item_ids = list(dict.fromkeys(payload.item_ids))
@@ -5317,7 +5513,8 @@ def bulk_confirm_compliance_items(
     db: Annotated[Session, Depends(get_db)],
     ctx: Annotated[RequestContext, Depends(get_request_context)],
 ) -> list[ComplianceItemRead]:
-    get_section_or_404(db, ctx, project_id, section_id)
+    section = get_section_or_404(db, ctx, project_id, section_id)
+    assert_section_unlocked_for_edit(section)
     unique_item_ids = list(dict.fromkeys(payload.item_ids))
     items = db.scalars(
         select(ComplianceItem).where(

@@ -8,6 +8,8 @@ from app.services.evidence_policy import requires_enterprise_evidence
 
 
 Automation = Literal["auto", "human", "deny"]
+ReviewTier = Literal["silent", "pre_accepted", "blocking"]
+DecisionEffect = Literal["immediate", "deferred_auto", "human", "none"]
 
 
 class CompliancePolicyItem(Protocol):
@@ -33,6 +35,8 @@ class ActionPolicy:
     action: str
     default_automation: Automation
     note: str = ""
+    tier: ReviewTier = "blocking"
+    effect: DecisionEffect = "human"
 
 
 ACTION_POLICIES: dict[str, ActionPolicy] = {
@@ -40,16 +44,43 @@ ACTION_POLICIES: dict[str, ActionPolicy] = {
         "agent_matrix_low_risk_pass",
         "auto",
         "低风险、来源明确，仅记录 Agent 自动核验，不改变业务状态。",
+        tier="silent",
+        effect="none",
+    ),
+    "agent_evidence_silent_bound": ActionPolicy(
+        "agent_evidence_silent_bound",
+        "auto",
+        "低风险唯一强匹配证据，推进时即时绑定。",
+        tier="silent",
+        effect="immediate",
+    ),
+    "pre_accept_matrix_item": ActionPolicy(
+        "pre_accept_matrix_item",
+        "auto",
+        "低风险条款默认预采纳，确认锁定时生效。",
+        tier="pre_accepted",
+        effect="deferred_auto",
+    ),
+    "pre_accept_evidence_binding": ActionPolicy(
+        "pre_accept_evidence_binding",
+        "auto",
+        "明显最优但非唯一证据候选，确认锁定时绑定。",
+        tier="pre_accepted",
+        effect="deferred_auto",
     ),
     "qualification_evaluation_preserved": ActionPolicy(
         "qualification_evaluation_preserved",
         "auto",
         "已人工确认且结果未变化的资格评估项保持确认。",
+        tier="silent",
+        effect="none",
     ),
     "qualification_decision_preserved": ActionPolicy(
         "qualification_decision_preserved",
         "auto",
         "已人工确认的 Go/No-Go 结论保持确认。",
+        tier="silent",
+        effect="none",
     ),
     "confirm_matrix_item": ActionPolicy("confirm_matrix_item", "human"),
     "review_technical_response": ActionPolicy("review_technical_response", "human"),
@@ -73,6 +104,14 @@ ACTION_POLICIES: dict[str, ActionPolicy] = {
 
 def policy_for(action: str) -> ActionPolicy:
     return ACTION_POLICIES.get(action, ActionPolicy(action, "deny", "未声明的 Agent 动作默认拒绝。"))
+
+
+def effect_for_tier(tier: ReviewTier) -> DecisionEffect:
+    if tier == "silent":
+        return "immediate"
+    if tier == "pre_accepted":
+        return "deferred_auto"
+    return "human"
 
 
 def is_technical_item(item: CompliancePolicyItem) -> bool:
@@ -156,6 +195,16 @@ class AgentActionPolicy:
         if action == "review_qualification_evaluation" and target is not None:
             return "human" if self.qualification_evaluation_requires_human(target) else "auto"
         return self.policy_for(action).default_automation
+
+    def tier_for(self, action: str, target: object | None = None) -> ReviewTier:
+        if action == "review_qualification_evaluation" and target is not None:
+            return "blocking" if self.qualification_evaluation_requires_human(target) else "silent"
+        return self.policy_for(action).tier
+
+    def effect_for(self, action: str, target: object | None = None) -> DecisionEffect:
+        if action == "review_qualification_evaluation" and target is not None:
+            return "human" if self.qualification_evaluation_requires_human(target) else "none"
+        return self.policy_for(action).effect
 
     def requires_human(self, action: str, target: object | None = None) -> bool:
         return self.automation_for(action, target) != "auto"

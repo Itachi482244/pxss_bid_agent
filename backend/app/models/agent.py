@@ -29,6 +29,10 @@ class AgentReviewItem(Base):
             name="agent_review_item_severity_allowed",
         ),
         CheckConstraint(
+            "tier IS NULL OR tier IN ('silent', 'pre_accepted', 'blocking')",
+            name="agent_review_item_tier_allowed",
+        ),
+        CheckConstraint(
             "confidence_score IS NULL OR (confidence_score >= 0 AND confidence_score <= 1)",
             name="agent_review_item_confidence_score_range",
         ),
@@ -45,6 +49,7 @@ class AgentReviewItem(Base):
         Index("idx_agent_review_object", "tenant_id", "object_type", "object_id", "status"),
         Index("idx_agent_review_compliance", "tenant_id", "compliance_item_id", "status"),
         Index("idx_agent_review_material", "tenant_id", "enterprise_material_id", "status"),
+        Index("idx_agent_review_tier", "tenant_id", "project_id", "section_id", "tier", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -65,6 +70,10 @@ class AgentReviewItem(Base):
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     severity: Mapped[str] = mapped_column(String(32), nullable=False, default="medium")
+    tier: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    is_disqualifying: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    conclusion_changed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    auto_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     object_type: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -97,6 +106,54 @@ class AgentReviewItem(Base):
     )
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SectionConfirmation(Base):
+    __tablename__ = "section_confirmations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'withdrawn')",
+            name="section_confirmation_status_allowed",
+        ),
+        Index(
+            "idx_section_confirmations_section_status",
+            "tenant_id",
+            "project_id",
+            "section_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id"), nullable=False
+    )
+    section_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bid_sections.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    confirmed_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    confirmed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    withdrawn_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    withdraw_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

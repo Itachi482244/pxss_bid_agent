@@ -115,6 +115,7 @@ export type SectionSummary = {
   name: string;
   budget_amount: string | null;
   status: string;
+  assist_stage: "not_started" | "advancing" | "awaiting_confirm" | "confirmed" | "generated" | string;
   bid_deadline_at: string | null;
   document_count: number;
   compliance_item_count: number;
@@ -122,6 +123,28 @@ export type SectionSummary = {
   pending_confirm_count: number;
   created_at: string;
   updated_at: string;
+};
+
+export type ProjectSectionOverviewItem = SectionSummary & {
+  effective_deadline_at: string | null;
+  red_open_count: number;
+  yellow_open_count: number;
+  auto_completed_count: number;
+  can_confirm: boolean;
+  can_generate: boolean;
+  suggested_action: string;
+};
+
+export type ProjectSectionsOverview = {
+  project_id: string;
+  total_count: number;
+  awaiting_confirm_count: number;
+  confirmed_count: number;
+  generated_count: number;
+  ready_count: number;
+  red_open_count: number;
+  nearest_deadline_at: string | null;
+  sections: ProjectSectionOverviewItem[];
 };
 
 export type SectionUpdatePayload = {
@@ -613,6 +636,9 @@ export type AgentAssistSummary = {
   high_count: number;
   medium_count: number;
   low_count: number;
+  blocking_count: number;
+  pre_accepted_count: number;
+  silent_count: number;
   matrix_review_count: number;
   evidence_binding_count: number;
   qualification_technical_count: number;
@@ -633,6 +659,10 @@ export type AgentReviewItem = {
   action: string;
   status: "open" | "accepted" | "dismissed" | "superseded" | "auto_passed" | string;
   severity: "low" | "medium" | "high" | "critical" | string;
+  tier: "silent" | "pre_accepted" | "blocking" | null;
+  is_disqualifying: boolean;
+  conclusion_changed: boolean;
+  auto_applied: boolean;
   title: string;
   detail: string | null;
   object_type: string;
@@ -653,6 +683,31 @@ export type AgentReviewItem = {
   decision_reason: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type FinalReviewZone = {
+  tier: "silent" | "pre_accepted" | "blocking" | string;
+  title: string;
+  description: string;
+  total_count: number;
+  open_count: number;
+  accepted_count: number;
+  dismissed_count: number;
+  auto_passed_count: number;
+  items: AgentReviewItem[];
+};
+
+export type SectionFinalReview = {
+  project_id: string;
+  section_id: string;
+  assist_stage: string;
+  can_confirm: boolean;
+  can_generate: boolean;
+  readiness: PreflightCheck;
+  red: FinalReviewZone;
+  yellow: FinalReviewZone;
+  white: FinalReviewZone;
+  suggested_actions: string[];
 };
 
 export type ParseTask = {
@@ -1428,6 +1483,13 @@ export async function listSections(projectId: string) {
   return response.data;
 }
 
+export async function getProjectSectionsOverview(projectId: string) {
+  const response = await apiClient.get<ProjectSectionsOverview>(
+    `/projects/${projectId}/sections-overview`
+  );
+  return response.data;
+}
+
 export async function listDocuments(projectId: string, sectionId: string) {
   const response = await apiClient.get<ProjectDocument[]>(
     `/projects/${projectId}/sections/${sectionId}/documents`
@@ -2065,6 +2127,7 @@ export async function createAgentAssistTask(
   payload?: {
     async_processing?: boolean;
     force?: boolean;
+    steps?: Array<"evidence_binding" | "matrix_review" | "qualification_technical">;
   }
 ) {
   const response = await apiClient.post<AsyncTask>(
@@ -2127,6 +2190,61 @@ export async function dismissAgentReviewItem(
   const response = await apiClient.post<AgentReviewItem>(
     `/projects/${projectId}/sections/${sectionId}/agent-review-items/${reviewItemId}/dismiss`,
     payload
+  );
+  return response.data;
+}
+
+export async function resolveAgentReviewItem(
+  projectId: string,
+  sectionId: string,
+  reviewItemId: string,
+  payload: {
+    resolution: "accept" | "dismiss" | "bind_evidence" | "evidence_not_required";
+    reason: string;
+    source_verified?: boolean;
+    enterprise_material_id?: string | null;
+    evidence_text?: string | null;
+    confidence_score?: string | null;
+  }
+) {
+  const response = await apiClient.post<AgentReviewItem>(
+    `/projects/${projectId}/sections/${sectionId}/agent-review-items/${reviewItemId}/resolve`,
+    payload
+  );
+  return response.data;
+}
+
+export async function getSectionFinalReview(projectId: string, sectionId: string) {
+  const response = await apiClient.get<SectionFinalReview>(
+    `/projects/${projectId}/sections/${sectionId}/final-review`
+  );
+  return response.data;
+}
+
+export async function confirmLockSection(
+  projectId: string,
+  sectionId: string,
+  payload?: {
+    reason?: string;
+  }
+) {
+  const response = await apiClient.post<SectionFinalReview>(
+    `/projects/${projectId}/sections/${sectionId}/confirm-lock`,
+    payload ?? {}
+  );
+  return response.data;
+}
+
+export async function unlockSectionConfirmation(
+  projectId: string,
+  sectionId: string,
+  payload?: {
+    reason?: string;
+  }
+) {
+  const response = await apiClient.post<SectionFinalReview>(
+    `/projects/${projectId}/sections/${sectionId}/unlock`,
+    payload ?? {}
   );
   return response.data;
 }

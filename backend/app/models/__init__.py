@@ -3,7 +3,7 @@
 Importing this module registers all models on the shared SQLAlchemy metadata.
 """
 
-from app.models.agent import AgentReviewItem
+from app.models.agent import AgentReviewItem, SectionConfirmation
 from app.models.approval import ApprovalTask
 from app.models.audit import AuditLog
 from app.models.ai_config import AIModelConfig
@@ -67,6 +67,7 @@ __all__ = [
     "ProjectMember",
     "QualificationDecision",
     "QualificationEvaluation",
+    "SectionConfirmation",
     "SourcePageImage",
     "Tenant",
     "User",

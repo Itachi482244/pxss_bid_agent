@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -135,6 +135,7 @@ class SectionSummary(BaseModel):
     name: str
     budget_amount: Decimal | None
     status: str
+    assist_stage: str = "not_started"
     bid_deadline_at: datetime | None
     document_count: int
     compliance_item_count: int
@@ -142,6 +143,28 @@ class SectionSummary(BaseModel):
     pending_confirm_count: int
     created_at: datetime
     updated_at: datetime
+
+
+class ProjectSectionOverviewItem(SectionSummary):
+    effective_deadline_at: datetime | None = None
+    red_open_count: int = 0
+    yellow_open_count: int = 0
+    auto_completed_count: int = 0
+    can_confirm: bool = False
+    can_generate: bool = False
+    suggested_action: str
+
+
+class ProjectSectionsOverviewRead(BaseModel):
+    project_id: uuid.UUID
+    total_count: int = 0
+    awaiting_confirm_count: int = 0
+    confirmed_count: int = 0
+    generated_count: int = 0
+    ready_count: int = 0
+    red_open_count: int = 0
+    nearest_deadline_at: datetime | None = None
+    sections: list[ProjectSectionOverviewItem] = Field(default_factory=list)
 
 
 class SectionCreateRequest(BaseModel):
@@ -235,9 +258,13 @@ class ComplianceMatrixAutoResolveRequest(BaseModel):
     async_processing: bool = True
 
 
+AgentAssistStepName = Literal["evidence_binding", "matrix_review", "qualification_technical"]
+
+
 class AgentAssistRunRequest(BaseModel):
     async_processing: bool = False
     force: bool = True
+    steps: list[AgentAssistStepName] | None = Field(default=None, min_length=1)
 
 
 class AgentAssistSummaryRead(BaseModel):
@@ -252,6 +279,9 @@ class AgentAssistSummaryRead(BaseModel):
     high_count: int = 0
     medium_count: int = 0
     low_count: int = 0
+    blocking_count: int = 0
+    pre_accepted_count: int = 0
+    silent_count: int = 0
     matrix_review_count: int = 0
     evidence_binding_count: int = 0
     qualification_technical_count: int = 0
@@ -274,6 +304,10 @@ class AgentReviewItemRead(BaseModel):
     action: str
     status: str
     severity: str
+    tier: str | None = None
+    is_disqualifying: bool = False
+    conclusion_changed: bool = False
+    auto_applied: bool = False
     title: str
     detail: str | None
     object_type: str
@@ -299,6 +333,65 @@ class AgentReviewItemRead(BaseModel):
 class AgentReviewItemDecisionRequest(BaseModel):
     reason: str = Field(min_length=2, max_length=1000)
     source_verified: bool = False
+
+
+class AgentReviewItemResolveRequest(BaseModel):
+    resolution: Literal["accept", "dismiss", "bind_evidence", "evidence_not_required"]
+    reason: str = Field(min_length=2, max_length=1000)
+    source_verified: bool = False
+    enterprise_material_id: uuid.UUID | None = None
+    evidence_text: str | None = Field(default=None, max_length=4000)
+    confidence_score: Decimal | None = Field(default=None, ge=0, le=1)
+
+
+class FinalReviewZoneRead(BaseModel):
+    tier: str
+    title: str
+    description: str
+    total_count: int = 0
+    open_count: int = 0
+    accepted_count: int = 0
+    dismissed_count: int = 0
+    auto_passed_count: int = 0
+    items: list[AgentReviewItemRead] = Field(default_factory=list)
+
+
+class SectionFinalReviewRead(BaseModel):
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    assist_stage: str
+    can_confirm: bool
+    can_generate: bool
+    readiness: "PreflightCheckRead"
+    red: FinalReviewZoneRead
+    yellow: FinalReviewZoneRead
+    white: FinalReviewZoneRead
+    suggested_actions: list[str] = Field(default_factory=list)
+
+
+class SectionConfirmLockRequest(BaseModel):
+    reason: str = Field(default="最终确认锁定", min_length=2, max_length=1000)
+
+
+class SectionUnlockRequest(BaseModel):
+    reason: str = Field(default="撤回最终确认，返回编辑", min_length=2, max_length=1000)
+
+
+class SectionConfirmationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    section_id: uuid.UUID
+    status: str
+    snapshot_json: dict[str, Any]
+    confirmed_by: uuid.UUID
+    confirmed_at: datetime
+    withdrawn_by: uuid.UUID | None
+    withdrawn_at: datetime | None
+    withdraw_reason: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class PreflightCheckItem(BaseModel):

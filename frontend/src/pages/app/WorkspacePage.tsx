@@ -11,13 +11,21 @@ import { ApprovalTab } from "./workspace-tabs/ApprovalTab";
 import type { BidAppController, WorkflowStepKey } from "../../features/bid/useBidAppController";
 import {
   acceptAgentReviewItem,
+  confirmLockSection,
   createAgentAssistTask,
   dismissAgentReviewItem,
   getAgentReviewSummary,
+  getProjectSectionsOverview,
+  getSectionFinalReview,
   listAgentReviewItems,
+  resolveAgentReviewItem,
+  unlockSectionConfirmation,
   type AgentAssistSummary,
   type AgentReviewItem,
-  type AsyncTask
+  type AsyncTask,
+  type ProjectSectionOverviewItem,
+  type ProjectSectionsOverview,
+  type SectionFinalReview
 } from "../../api/bid";
 
 const agentStepLabels: Record<string, string> = {
@@ -38,7 +46,10 @@ const agentActionLabels: Record<string, string> = {
   review_draft_block: "审阅草稿",
   ack_llm_technical_advice: "查看技术建议",
   ack_llm_draft_advice: "查看草稿建议",
-  agent_matrix_low_risk_pass: "自动核验"
+  agent_matrix_low_risk_pass: "自动核验",
+  agent_evidence_silent_bound: "自动绑定",
+  pre_accept_matrix_item: "预采纳条款",
+  pre_accept_evidence_binding: "预采纳证据"
 };
 
 const agentSourceVerificationActions = new Set(["confirm_matrix_item", "review_technical_response"]);
@@ -49,6 +60,45 @@ function agentSeverityColor(severity: string) {
   if (severity === "high") return "volcano";
   if (severity === "medium") return "orange";
   return "green";
+}
+
+function assistStageLabel(stage: string | null | undefined) {
+  const labels: Record<string, string> = {
+    not_started: "未开始",
+    advancing: "推进中",
+    awaiting_confirm: "待最终确认",
+    confirmed: "已确认",
+    generated: "已生成"
+  };
+  return labels[stage || ""] ?? "未开始";
+}
+
+type AgentAssistProgress = {
+  percent: number;
+  step: string | null;
+  activity: string;
+  current?: number;
+  total?: number;
+};
+
+function agentAssistProgressSnapshot(task: AsyncTask | null): AgentAssistProgress | null {
+  const raw = task?.output_json?.progress;
+  if (!raw || typeof raw !== "object") return null;
+  const progress = raw as Record<string, unknown>;
+  const percentValue = progress.percent;
+  const percent = typeof percentValue === "number" ? percentValue : task?.progress;
+  if (typeof percent !== "number") return null;
+  const step = typeof progress.step === "string" ? progress.step : null;
+  const activity = typeof progress.activity === "string" ? progress.activity : "Agent 推进中";
+  const current = typeof progress.current === "number" ? progress.current : undefined;
+  const total = typeof progress.total === "number" ? progress.total : undefined;
+  return {
+    percent: Math.max(0, Math.min(100, Math.round(percent))),
+    step,
+    activity,
+    current,
+    total
+  };
 }
 
 export function WorkspacePage({ app }: { app: BidAppController }) {
@@ -204,7 +254,6 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     editedDirectives,
     editedOutline,
     effectiveReviewHighlights,
-    Empty,
     enterpriseMaterials,
     enterpriseProfile,
     errorMessage,
@@ -862,28 +911,55 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
   const [commandDetailsOpen, setCommandDetailsOpen] = useState(false);
   const [agentReviewItems, setAgentReviewItems] = useState<AgentReviewItem[]>([]);
   const [agentReviewSummary, setAgentReviewSummary] = useState<AgentAssistSummary | null>(null);
+  const [sectionFinalReview, setSectionFinalReview] = useState<SectionFinalReview | null>(null);
+  const [projectSectionsOverview, setProjectSectionsOverview] = useState<ProjectSectionsOverview | null>(null);
+  const [projectSectionsOverviewLoading, setProjectSectionsOverviewLoading] = useState(false);
   const [agentReviewLoaded, setAgentReviewLoaded] = useState(false);
   const [agentAssistTask, setAgentAssistTask] = useState<AsyncTask | null>(null);
   const [agentAssistLoading, setAgentAssistLoading] = useState(false);
   const [agentDecisionBusyId, setAgentDecisionBusyId] = useState("");
   const agentAutoRunKeysRef = useRef<Set<string>>(new Set());
 
+  const reloadProjectSectionsOverview = useCallback(async () => {
+    if (!selectedProjectId) {
+      setProjectSectionsOverview(null);
+      return null;
+    }
+    setProjectSectionsOverviewLoading(true);
+    try {
+      const overview = await getProjectSectionsOverview(selectedProjectId);
+      setProjectSectionsOverview(overview);
+      return overview;
+    } finally {
+      setProjectSectionsOverviewLoading(false);
+    }
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    void reloadProjectSectionsOverview().catch(() => {
+      setProjectSectionsOverview(null);
+    });
+  }, [reloadProjectSectionsOverview]);
+
   const reloadAgentReviewItems = useCallback(async () => {
     if (!selectedProjectId || !selectedSectionId) {
       setAgentReviewItems([]);
       setAgentReviewSummary(null);
+      setSectionFinalReview(null);
       setAgentReviewLoaded(false);
       return [];
     }
-    const [items, summary] = await Promise.all([
+    const [items, summary, finalReview] = await Promise.all([
       listAgentReviewItems(selectedProjectId, selectedSectionId, {
         status: "open",
         limit: 200
       }),
-      getAgentReviewSummary(selectedProjectId, selectedSectionId).catch(() => null)
+      getAgentReviewSummary(selectedProjectId, selectedSectionId).catch(() => null),
+      getSectionFinalReview(selectedProjectId, selectedSectionId).catch(() => null)
     ]);
     setAgentReviewItems(items);
     setAgentReviewSummary(summary);
+    setSectionFinalReview(finalReview);
     setAgentReviewLoaded(true);
     return items;
   }, [selectedProjectId, selectedSectionId]);
@@ -892,32 +968,63 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     void reloadAgentReviewItems().catch(() => {
       setAgentReviewItems([]);
       setAgentReviewSummary(null);
+      setSectionFinalReview(null);
       setAgentReviewLoaded(true);
     });
   }, [reloadAgentReviewItems]);
+
+  useEffect(() => {
+    const handleRefreshRequest = () => {
+      void Promise.allSettled([
+        reloadAgentReviewItems(),
+        reloadProjectSectionsOverview()
+      ]);
+    };
+    window.addEventListener("pxss-agent-review-refresh", handleRefreshRequest);
+    return () => {
+      window.removeEventListener("pxss-agent-review-refresh", handleRefreshRequest);
+    };
+  }, [reloadAgentReviewItems, reloadProjectSectionsOverview]);
 
   const agentOpenItems = useMemo(
     () => agentReviewItems.filter((item) => item.status === "open"),
     [agentReviewItems]
   );
-  const agentHighPriorityCount = useMemo(
-    () => agentOpenItems.filter((item) => item.severity === "critical" || item.severity === "high").length,
-    [agentOpenItems]
-  );
-  const agentAutoPassedCount = useMemo(() => {
-    const value = agentReviewSummary?.auto_passed_count ?? agentAssistTask?.output_json?.auto_passed_count;
-    return typeof value === "number" ? value : Number(value ?? 0) || 0;
-  }, [agentAssistTask, agentReviewSummary]);
-  const agentSuggestedActions = useMemo(() => {
-    const value = agentReviewSummary?.suggested_actions ?? agentAssistTask?.output_json?.suggested_actions;
-    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-  }, [agentAssistTask, agentReviewSummary]);
   const agentAssistStatusText = useMemo(() => {
     if (agentAssistLoading) return "自动推进中";
     if ((agentReviewSummary?.total_count ?? 0) > 0) return "已自动推进";
     if (recommendedStep && agentAssistAutoStepKeys.has(recommendedStep.key)) return "即将自动推进";
     return "等待流程到达 4-6 步";
   }, [agentAssistLoading, agentReviewSummary, recommendedStep]);
+  const agentAssistProgress = useMemo(
+    () => agentAssistProgressSnapshot(agentAssistTask),
+    [agentAssistTask]
+  );
+  const agentAssistProgressDetail = useMemo(() => {
+    if (!agentAssistProgress) return "";
+    const stepLabel = agentAssistProgress.step ? agentStepLabels[agentAssistProgress.step] ?? agentAssistProgress.step : "";
+    const countLabel =
+      agentAssistProgress.current !== undefined && agentAssistProgress.total !== undefined
+        ? `${agentAssistProgress.current}/${agentAssistProgress.total}`
+        : "";
+    return [stepLabel, countLabel].filter(Boolean).join(" · ");
+  }, [agentAssistProgress]);
+  const agentRedItems = useMemo(
+    () => sectionFinalReview?.red.items.filter((item) => item.status === "open") ?? agentOpenItems.filter((item) => (item.tier ?? "blocking") === "blocking"),
+    [agentOpenItems, sectionFinalReview]
+  );
+  const agentYellowItems = useMemo(
+    () => sectionFinalReview?.yellow.items ?? [],
+    [sectionFinalReview]
+  );
+  const agentWhiteItems = useMemo(
+    () => sectionFinalReview?.white.items ?? [],
+    [sectionFinalReview]
+  );
+  const visibleRedReviewItems = useMemo(() => agentRedItems.slice(0, 5), [agentRedItems]);
+  const visibleYellowReviewItems = useMemo(() => agentYellowItems.slice(0, 5), [agentYellowItems]);
+  const visibleWhiteReviewItems = useMemo(() => agentWhiteItems.slice(0, 5), [agentWhiteItems]);
+  const hasAgentZoneContent = agentRedItems.length > 0 || agentYellowItems.length > 0 || agentWhiteItems.length > 0;
 
   const refreshAfterAgentDecision = useCallback(async () => {
     await Promise.allSettled([
@@ -927,6 +1034,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
       reloadQualificationDecision(),
       reloadAuditLogs(),
       reloadPreflightCheck(),
+      reloadProjectSectionsOverview(),
       reloadSectionQualitySummary({ silent: true })
     ]);
   }, [
@@ -934,6 +1042,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     reloadAgentReviewItems,
     reloadAuditLogs,
     reloadPreflightCheck,
+    reloadProjectSectionsOverview,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
     reloadSectionQualitySummary
@@ -978,6 +1087,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
         reloadQualificationDecision(),
         reloadAuditLogs(),
         reloadPreflightCheck(),
+        reloadProjectSectionsOverview(),
         reloadSectionQualitySummary({ silent: true })
       ]);
       const openCount = Number(task.output_json?.open_count ?? 0) || 0;
@@ -1000,6 +1110,7 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     reloadAgentReviewItems,
     reloadAuditLogs,
     reloadPreflightCheck,
+    reloadProjectSectionsOverview,
     reloadQualificationDecision,
     reloadQualificationEvaluations,
     reloadSectionQualitySummary,
@@ -1081,6 +1192,105 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     [errorMessage, notification, reloadAgentReviewItems, reloadAuditLogs, selectedProjectId, selectedSectionId, setApiError]
   );
 
+  const handleResolveEvidenceNotRequired = useCallback(
+    async (item: AgentReviewItem) => {
+      if (!selectedProjectId || !selectedSectionId) return;
+      setAgentDecisionBusyId(item.id);
+      try {
+        await resolveAgentReviewItem(selectedProjectId, selectedSectionId, item.id, {
+          resolution: "evidence_not_required",
+          reason: `人工判定无需企业资料证据：${item.title}`
+        });
+        await refreshAfterAgentDecision();
+        notification.success({ message: "已标记无需证据" });
+      } catch (error) {
+        setApiError(errorMessage(error, "标记无需证据失败"));
+      } finally {
+        setAgentDecisionBusyId("");
+      }
+    },
+    [
+      errorMessage,
+      notification,
+      refreshAfterAgentDecision,
+      selectedProjectId,
+      selectedSectionId,
+      setApiError
+    ]
+  );
+
+  const handleConfirmLockSection = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    setAgentAssistLoading(true);
+    try {
+      const finalReview = await confirmLockSection(selectedProjectId, selectedSectionId, {
+        reason: "最终确认页确认锁定"
+      });
+      setSectionFinalReview(finalReview);
+      await Promise.allSettled([
+        reloadAgentReviewItems(),
+        reloadProjects(),
+        reloadPreflightCheck(),
+        reloadProjectSectionsOverview(),
+        reloadSectionQualitySummary({ silent: true }),
+        reloadAuditLogs()
+      ]);
+      notification.success({ message: "已确认锁定" });
+    } catch (error) {
+      setApiError(errorMessage(error, "确认锁定失败"));
+    } finally {
+      setAgentAssistLoading(false);
+    }
+  }, [
+    errorMessage,
+    notification,
+    reloadAgentReviewItems,
+    reloadAuditLogs,
+    reloadPreflightCheck,
+    reloadProjectSectionsOverview,
+    reloadProjects,
+    reloadSectionQualitySummary,
+    selectedProjectId,
+    selectedSectionId,
+    setApiError
+  ]);
+
+  const handleUnlockSection = useCallback(async () => {
+    if (!selectedProjectId || !selectedSectionId) return;
+    setAgentAssistLoading(true);
+    try {
+      const finalReview = await unlockSectionConfirmation(selectedProjectId, selectedSectionId, {
+        reason: "撤回确认，返回编辑"
+      });
+      setSectionFinalReview(finalReview);
+      await Promise.allSettled([
+        reloadAgentReviewItems(),
+        reloadProjects(),
+        reloadPreflightCheck(),
+        reloadProjectSectionsOverview(),
+        reloadSectionQualitySummary({ silent: true }),
+        reloadAuditLogs()
+      ]);
+      notification.success({ message: "已撤回确认" });
+    } catch (error) {
+      setApiError(errorMessage(error, "撤回确认失败"));
+    } finally {
+      setAgentAssistLoading(false);
+    }
+  }, [
+    errorMessage,
+    notification,
+    reloadAgentReviewItems,
+    reloadAuditLogs,
+    reloadPreflightCheck,
+    reloadProjectSectionsOverview,
+    reloadProjects,
+    reloadSectionQualitySummary,
+    selectedProjectId,
+    selectedSectionId,
+    setApiError
+  ]);
+
   const handleLocateAgentReviewItem = useCallback(
     (item: AgentReviewItem) => {
       if (item.qualification_decision_id || item.qualification_evaluation_id) {
@@ -1099,7 +1309,58 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     [locateMatrixRow, setActiveTab]
   );
 
-  const visibleAgentReviewItems = useMemo(() => agentOpenItems.slice(0, 5), [agentOpenItems]);
+  const openOverviewSection = useCallback(
+    (section: ProjectSectionOverviewItem, target: WorkflowStepKey) => {
+      setSelectedSectionId(section.id);
+      setSelectedTreeKey(`section:${section.id}:${target}`);
+      setActiveTab(target);
+    },
+    [setActiveTab, setSelectedSectionId, setSelectedTreeKey]
+  );
+
+  const handleProjectSectionOverviewAction = useCallback(
+    async (section: ProjectSectionOverviewItem) => {
+      if (!selectedProjectId) return;
+      const target: WorkflowStepKey =
+        section.assist_stage === "not_started" || section.assist_stage === "advancing"
+          ? "tasks"
+          : section.assist_stage === "confirmed"
+            ? "documents"
+            : section.assist_stage === "generated"
+              ? "documents"
+              : "review";
+      openOverviewSection(section, target);
+      if (section.assist_stage !== "not_started") return;
+
+      setAgentAssistLoading(true);
+      try {
+        const task = await createAgentAssistTask(selectedProjectId, section.id, {
+          async_processing: true,
+          force: true
+        });
+        if (section.id === selectedSectionId) {
+          setAgentAssistTask(task);
+        }
+        await Promise.allSettled([reloadProjectSectionsOverview(), reloadProjects()]);
+        notification.success({ message: "已开始 Agent 推进" });
+      } catch (error) {
+        setApiError(errorMessage(error, "启动 Agent 推进失败"));
+      } finally {
+        setAgentAssistLoading(false);
+      }
+    },
+    [
+      errorMessage,
+      notification,
+      openOverviewSection,
+      reloadProjectSectionsOverview,
+      reloadProjects,
+      selectedProjectId,
+      selectedSectionId,
+      setApiError
+    ]
+  );
+
   // Hero 已经承载“最该做的一件事”，待办队列里去掉与它指向同一步骤的那条，避免重复。
   const heroStepKey = recommendedStep?.key ?? null;
   const commandTodoActions = useMemo(
@@ -1131,6 +1392,69 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
     : activeContextPack
       ? 1
       : 0;
+  const renderAgentReviewRow = (
+    item: AgentReviewItem,
+    options?: { readonly?: boolean; compact?: boolean }
+  ) => {
+    const readonly = options?.readonly ?? false;
+    const canDecide = item.status === "open" && !readonly;
+    return (
+      <div className={options?.compact ? "agent-review-row compact" : "agent-review-row"} key={item.id}>
+        <button className="agent-review-main" onClick={() => handleLocateAgentReviewItem(item)}>
+          <Space size={6} wrap>
+            <Tag color={agentSeverityColor(item.severity)}>{item.severity}</Tag>
+            {item.status !== "open" && <Tag>{item.status}</Tag>}
+            {item.conclusion_changed && <Tag color="red">结论变化</Tag>}
+            <Tag>{agentStepLabels[item.step] ?? item.step}</Tag>
+            <Tag color="processing">{agentActionLabels[item.action] ?? item.action}</Tag>
+          </Space>
+          <span>{item.title}</span>
+          {item.detail && <Text type="secondary">{item.detail}</Text>}
+        </button>
+        <Space size={6}>
+          {canDecide && item.action === "missing_evidence" ? (
+            <>
+              <Button
+                size="small"
+                type="primary"
+                loading={agentDecisionBusyId === item.id}
+                onClick={() => handleResolveEvidenceNotRequired(item)}
+              >
+                无需证据
+              </Button>
+              <Button size="small" onClick={() => handleLocateAgentReviewItem(item)}>
+                去处理
+              </Button>
+            </>
+          ) : canDecide ? (
+            <>
+              <Tooltip title="采纳并执行对应业务动作">
+                <Button
+                  size="small"
+                  type="primary"
+                  loading={agentDecisionBusyId === item.id}
+                  onClick={() => handleAcceptAgentReviewItem(item)}
+                >
+                  采纳
+                </Button>
+              </Tooltip>
+              <Button
+                size="small"
+                loading={agentDecisionBusyId === item.id}
+                onClick={() => handleDismissAgentReviewItem(item)}
+              >
+                忽略
+              </Button>
+            </>
+          ) : (
+            <Button size="small" onClick={() => handleLocateAgentReviewItem(item)}>
+              定位
+            </Button>
+          )}
+        </Space>
+      </div>
+    );
+  };
 
   return (
           <Layout className={projectNavCollapsed ? "workspace-layout project-nav-collapsed" : "workspace-layout"}>
@@ -1238,6 +1562,58 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                   </Button>
                 </Space>
               </section>
+
+              {currentProject && projectSectionsOverview && (
+                <section className="section-overview-panel">
+                  <div className="section-overview-header">
+                    <Space wrap>
+                      <Text strong>标段推进概览</Text>
+                      <Tag color="blue">共 {projectSectionsOverview.total_count} 个标段</Tag>
+                      <Tag color={projectSectionsOverview.red_open_count ? "red" : "green"}>
+                        红牌 {projectSectionsOverview.red_open_count}
+                      </Tag>
+                      <Tag color="gold">待确认 {projectSectionsOverview.awaiting_confirm_count}</Tag>
+                      <Tag color="green">可生成 {projectSectionsOverview.ready_count}</Tag>
+                    </Space>
+                    <Text type="secondary">
+                      最近截止 {formatDateTime(projectSectionsOverview.nearest_deadline_at)}
+                    </Text>
+                  </div>
+                  <Spin spinning={projectSectionsOverviewLoading}>
+                    <div className="section-overview-grid">
+                      {projectSectionsOverview.sections.map((section) => (
+                        <div
+                          key={section.id}
+                          className={section.id === selectedSectionId ? "section-overview-card active" : "section-overview-card"}
+                        >
+                          <span className="section-overview-name">
+                            {section.code ? `${section.code} · ${section.name}` : section.name}
+                          </span>
+                          <span className="section-overview-meta">
+                            {assistStageLabel(section.assist_stage)} · 截止 {formatDateTime(section.effective_deadline_at)}
+                          </span>
+                          <span className="section-overview-tags">
+                            <Tag color={section.red_open_count ? "red" : "green"}>红牌 {section.red_open_count}</Tag>
+                            <Tag color="gold">预采纳 {section.yellow_open_count}</Tag>
+                            <Tag color="blue">自动 {section.auto_completed_count}</Tag>
+                          </span>
+                          <Button
+                            size="small"
+                            type={section.can_confirm || section.assist_stage === "not_started" ? "primary" : "default"}
+                            loading={agentAssistLoading && section.id === selectedSectionId}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void handleProjectSectionOverviewAction(section);
+                            }}
+                          >
+                            {section.suggested_action}
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  </Spin>
+                </section>
+              )}
 
               <section className="command-center">
                 <div className="workflow-steps cc-rail" aria-label="项目简化流程">
@@ -1546,23 +1922,22 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                     <Space size={8} wrap>
                       <RobotOutlined />
                       <Text strong>Agent 推进</Text>
-                      <Tag color={agentHighPriorityCount ? "red" : agentOpenItems.length ? "orange" : "green"}>
-                        待拍板 {agentOpenItems.length}
-                      </Tag>
-                      <Tag color="blue">自动核验 {agentAutoPassedCount}</Tag>
                     </Space>
-                    {agentSuggestedActions.length > 0 && (
-                      <div className="agent-assist-actions">
-                        {agentSuggestedActions.slice(0, 3).map((action) => (
-                          <Tag key={action}>{action}</Tag>
-                        ))}
-                      </div>
-                    )}
-                    <Text type="secondary" className="agent-assist-note">
-                      自动核验仅留痕，不替代人工确认。
-                    </Text>
                   </div>
                   <Space wrap>
+                    <Button
+                      type="primary"
+                      onClick={() => void handleConfirmLockSection()}
+                      disabled={!sectionFinalReview?.can_confirm || sectionFinalReview.assist_stage !== "awaiting_confirm"}
+                      loading={agentAssistLoading}
+                    >
+                      确认锁定
+                    </Button>
+                    {(sectionFinalReview?.assist_stage === "confirmed" || sectionFinalReview?.assist_stage === "generated") && (
+                      <Button onClick={() => void handleUnlockSection()} loading={agentAssistLoading}>
+                        撤回
+                      </Button>
+                    )}
                     <Button onClick={() => void reloadAgentReviewItems()} disabled={!selectedProjectId || !selectedSectionId}>
                       刷新
                     </Button>
@@ -1571,46 +1946,85 @@ export function WorkspacePage({ app }: { app: BidAppController }) {
                     </Tag>
                   </Space>
                 </div>
-                {visibleAgentReviewItems.length ? (
-                  <div className="agent-review-list">
-                    {visibleAgentReviewItems.map((item) => (
-                      <div className="agent-review-row" key={item.id}>
-                        <button className="agent-review-main" onClick={() => handleLocateAgentReviewItem(item)}>
-                          <Space size={6} wrap>
-                            <Tag color={agentSeverityColor(item.severity)}>{item.severity}</Tag>
-                            <Tag>{agentStepLabels[item.step] ?? item.step}</Tag>
-                            <Tag color="processing">{agentActionLabels[item.action] ?? item.action}</Tag>
-                          </Space>
-                          <span>{item.title}</span>
-                          {item.detail && <Text type="secondary">{item.detail}</Text>}
-                        </button>
-                        <Space size={6}>
-                          <Tooltip title="采纳并执行对应业务动作">
-                            <Button
-                              size="small"
-                              type="primary"
-                              loading={agentDecisionBusyId === item.id}
-                              onClick={() => handleAcceptAgentReviewItem(item)}
-                            >
-                              采纳
-                            </Button>
-                          </Tooltip>
-                          <Button
-                            size="small"
-                            loading={agentDecisionBusyId === item.id}
-                            onClick={() => handleDismissAgentReviewItem(item)}
-                          >
-                            忽略
-                          </Button>
-                        </Space>
+                {agentAssistTask && agentAssistProgress && !isAsyncTaskTerminalStatus(agentAssistTask.status) && (
+                  <div className="agent-progress-panel">
+                    <div className="agent-progress-header">
+                      <div>
+                        <Text strong>{agentAssistProgress.activity}</Text>
+                        {agentAssistProgressDetail && (
+                          <Text type="secondary">{agentAssistProgressDetail}</Text>
+                        )}
                       </div>
-                    ))}
-                    {agentOpenItems.length > visibleAgentReviewItems.length && (
-                      <Text type="secondary">还有 {agentOpenItems.length - visibleAgentReviewItems.length} 项在清单中</Text>
+                      <Tag color={agentAssistTask.status === "failed" || agentAssistTask.status === "canceled" ? "red" : "blue"}>
+                        {agentAssistProgress.percent}%
+                      </Tag>
+                    </div>
+                    <Progress
+                      percent={agentAssistProgress.percent}
+                      status={
+                        agentAssistTask.status === "failed" || agentAssistTask.status === "canceled"
+                          ? "exception"
+                          : isAsyncTaskTerminalStatus(agentAssistTask.status)
+                            ? "success"
+                            : "active"
+                      }
+                      showInfo={false}
+                    />
+                  </div>
+                )}
+                {hasAgentZoneContent && (
+                  <div className="agent-zone-lists">
+                    {agentRedItems.length > 0 && (
+                      <section className="agent-zone-list red">
+                        <div className="agent-zone-list-head">
+                          <Space wrap>
+                            <Text strong>红牌区</Text>
+                          </Space>
+                          <Text type="secondary">必须处理</Text>
+                        </div>
+                        <div className="agent-review-list">
+                          {visibleRedReviewItems.map((item) => renderAgentReviewRow(item))}
+                          {agentRedItems.length > visibleRedReviewItems.length && (
+                            <Text type="secondary">还有 {agentRedItems.length - visibleRedReviewItems.length} 项在红牌区</Text>
+                          )}
+                        </div>
+                      </section>
+                    )}
+
+                    {agentYellowItems.length > 0 && (
+                      <details className="agent-zone-detail yellow" open={agentYellowItems.some((item) => item.status === "open")}>
+                        <summary>
+                          <Space wrap>
+                            <Text strong>预采纳区</Text>
+                            <Text type="secondary">确认锁定时生效</Text>
+                          </Space>
+                        </summary>
+                        <div className="agent-review-list">
+                          {visibleYellowReviewItems.map((item) => renderAgentReviewRow(item, { compact: true }))}
+                          {agentYellowItems.length > visibleYellowReviewItems.length && (
+                            <Text type="secondary">还有 {agentYellowItems.length - visibleYellowReviewItems.length} 项在预采纳区</Text>
+                          )}
+                        </div>
+                      </details>
+                    )}
+
+                    {agentWhiteItems.length > 0 && (
+                      <details className="agent-zone-detail white">
+                        <summary>
+                          <Space wrap>
+                            <Text strong>已自动完成</Text>
+                            <Text type="secondary">只读留痕</Text>
+                          </Space>
+                        </summary>
+                        <div className="agent-review-list">
+                          {visibleWhiteReviewItems.map((item) => renderAgentReviewRow(item, { readonly: true, compact: true }))}
+                          {agentWhiteItems.length > visibleWhiteReviewItems.length && (
+                            <Text type="secondary">还有 {agentWhiteItems.length - visibleWhiteReviewItems.length} 项自动完成记录</Text>
+                          )}
+                        </div>
+                      </details>
                     )}
                   </div>
-                ) : (
-                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无 Agent 待拍板项" />
                 )}
               </section>
 

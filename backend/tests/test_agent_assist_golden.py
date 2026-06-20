@@ -172,7 +172,7 @@ def _create_agent_golden_workspace() -> SimpleNamespace:
                 status=status,
                 risk_level=risk_level,
                 is_mandatory=is_mandatory,
-                is_batch_confirm_allowed=risk_level != "high" and not is_mandatory,
+                is_batch_confirm_allowed=risk_level != "high" and not is_mandatory and status != "needs_material",
                 owner_user_id=user.id,
                 confidence_score=confidence_score,
                 created_by=user.id,
@@ -186,6 +186,15 @@ def _create_agent_golden_workspace() -> SimpleNamespace:
             requirement_text=f"Agent golden 低风险参考信息 {token}",
             normalized_requirement="agent_golden_low",
             status="pending_confirm",
+            risk_level="low",
+            is_mandatory=False,
+            confidence_score=Decimal("0.9500"),
+        )
+        low_evidence_item = add_item(
+            item_type="other",
+            requirement_text=f"Agent golden 可绑定证据低风险证书 {token}",
+            normalized_requirement="agent_golden_low_evidence",
+            status="needs_material",
             risk_level="low",
             is_mandatory=False,
             confidence_score=Decimal("0.9500"),
@@ -242,6 +251,7 @@ def _create_agent_golden_workspace() -> SimpleNamespace:
             qualification_item_id=qualification_item.id,
             technical_item_id=technical_item.id,
             draft_block_id=draft_block.id,
+            low_evidence_item_id=low_evidence_item.id,
         )
 
 
@@ -286,7 +296,7 @@ def _patch_deterministic_agent_dependencies(
                 material=material,
                 chunk=None,
                 snippet=f"Agent golden 可绑定证据 {workspace.token}",
-                confidence_score=Decimal("0.8700"),
+                confidence_score=Decimal("0.9300"),
                 base_score=Decimal("0.8100"),
                 rerank_score=None,
                 recommend_reason="golden 语义命中",
@@ -388,6 +398,19 @@ def test_agent_assist_golden_semantic_outputs(monkeypatch: pytest.MonkeyPatch) -
         False,
         "compliance_item",
     ) in semantic
+    low_evidence_items = [item for item in items if item.compliance_item_id == workspace.low_evidence_item_id]
+    assert any(
+        item.step == "evidence_binding" and item.action == "agent_evidence_silent_bound"
+        for item in low_evidence_items
+    )
+    assert any(
+        item.step == "matrix_review" and item.action == "agent_matrix_low_risk_pass"
+        for item in low_evidence_items
+    )
+    assert not any(
+        item.step == "matrix_review" and item.action == "confirm_matrix_item"
+        for item in low_evidence_items
+    )
     assert any(
         entry[:3] == ("matrix_review", "confirm_matrix_item", "open")
         and entry[3] == "critical"
